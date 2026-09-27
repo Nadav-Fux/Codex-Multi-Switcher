@@ -468,8 +468,10 @@ PLIST
     "$HELPER" doctor > "$WORK_DIR/legacy-layout-doctor.log" 2>&1
   local canonical_bundled
   canonical_bundled="$(cd "$(dirname "$bundled")" && pwd -P)/$(basename "$bundled")"
-  grep -Fq "CLI: $canonical_bundled" "$WORK_DIR/legacy-layout-doctor.log" \
-    || fail "legacy Codex CLI layout was not discovered"
+  if ! grep -Fq "CLI: $canonical_bundled" "$WORK_DIR/legacy-layout-doctor.log"; then
+    cat "$WORK_DIR/legacy-layout-doctor.log" >&2
+    fail "legacy Codex CLI layout was not discovered (expected $canonical_bundled)"
+  fi
 }
 
 # Without this slice, an invalid app override could silently leave partial switch state behind.
