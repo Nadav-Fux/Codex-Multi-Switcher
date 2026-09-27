@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -euo pipefail
+          swift --version
+          xcodebuild -version
+
+      - name: Tests
+        run: make test
+
+      - name: Build
+        run: make build BUILD_OUT=/tmp/codex-multi-switcher-build-check
+
+      - name: Version check
+        run: |
+          set -euo pipefail
+          source version.env
+          swift_ver=$(sed -n 's/.*static let version = "\(.*\)".*/\1/p' Sources/CodexMultiSwitcherApp/AppInfo.swift | head -1)
+          if [[ "$swift_ver" != "$MARKETING_VERSION" ]]; then
+            echo "ERROR: version.env ($MARKETING_VERSION) != Sources/CodexMultiSwitcherApp/AppInfo.swift ($swift_ver)"
+            exit 1
+          fi
+          cli_ver=$(sed -n 's/.*static let version = "\(.*\)".*/\1/p' Sources/CodexProfileCLI/CodexProfileCLI.swift | head -1)
+          if [[ "$cli_ver" != "$MARKETING_VERSION" ]]; then
+            echo "ERROR: version.env ($MARKETING_VERSION) != Sources/CodexProfileCLI/CodexProfileCLI.swift ($cli_ver)"
+            exit 1
+          fi
+
+      - name: Ban exception-raising FileHandle.write(_:)
+        run: |
+          set -euo pipefail
+          # The Data-only FileHandle.write(_:) overload raises an uncatchable
+          # ObjC exception on a broken pipe (crashes the process). Use the
+          # throwing write(contentsOf:) instead. Swift files only: the rule is
+          # about a Swift API, and scanning every file made the test scripts'
+          # embedded Python (`self.wfile.write(body)`) look like a violation.
+          if grep -rnE --include='*.swift' '\.write\([a-zA-Z_][a-zA-Z0-9_.]*\)' Sources/ Tests/; then
+            echo "ERROR: Found FileHandle.write(_:) — use write(contentsOf:) (throwing) instead."
+            exit 1
+          fi

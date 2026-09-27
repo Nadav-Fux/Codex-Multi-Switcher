@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$ROOT_DIR/version.env" ]]; then
+  source "$ROOT_DIR/version.env"
+fi
+VERSION="${VERSION:-${MARKETING_VERSION:-0.1.0}}"
+RELEASE_DIR="${RELEASE_DIR:-$ROOT_DIR/.build/release}"
+DMG_PATH="${DMG_PATH:-$RELEASE_DIR/CodexMultiSwitcher-$VERSION.dmg}"
+CHECKSUM_PATH="${CHECKSUM_PATH:-$DMG_PATH.sha256}"
+CASK_OUTPUT_PATH="${CASK_OUTPUT_PATH:-$RELEASE_DIR/codex-multi-switcher.rb}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-Nadav-Fux/codex-multi-switcher}"
+TAG_NAME="${TAG_NAME:-v$VERSION}"
+CASK_TOKEN="${CASK_TOKEN:-codex-multi-switcher}"
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ -f "$CHECKSUM_PATH" ]] || fail "checksum file not found: $CHECKSUM_PATH"
+
+SHA256="$(awk '{print $1}' "$CHECKSUM_PATH")"
+[[ "$SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || fail "invalid SHA-256 in $CHECKSUM_PATH"
+
+mkdir -p "$(dirname "$CASK_OUTPUT_PATH")"
+
+cat > "$CASK_OUTPUT_PATH" <<CASK
+cask "$CASK_TOKEN" do
+  version "$VERSION"
+  sha256 "$SHA256"
+
+  url "https://github.com/$GITHUB_REPOSITORY/releases/download/v#{version}/CodexMultiSwitcher-#{version}.dmg"
+  name "Codex Multi Switcher"
+  desc "Switch OpenAI Codex accounts from the macOS menu bar"
+  homepage "https://github.com/$GITHUB_REPOSITORY"
+
+  depends_on macos: :sonoma
+
+  auto_updates true
+
+  app "CodexMultiSwitcher.app"
+  binary "#{appdir}/CodexMultiSwitcher.app/Contents/Helpers/codex-profile"
+
+  zap trash: [
+    "~/.codex-multi-switcher",
+    "~/Library/Logs/CodexMultiSwitcher",
+    "~/Library/Preferences/com.codexmultiswitcher.app.plist",
+  ]
+end
+CASK
+
+printf 'Generated Homebrew cask: %s\n' "$CASK_OUTPUT_PATH"
