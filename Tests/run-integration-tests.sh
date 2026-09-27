@@ -466,7 +466,9 @@ PLIST
     CODEX_PROFILE_TEST_ASSUME_CODEX_STOPPED=1 \
     CODEX_APP="$app" \
     "$HELPER" doctor > "$WORK_DIR/legacy-layout-doctor.log" 2>&1
-  grep -Fq "CLI: $bundled" "$WORK_DIR/legacy-layout-doctor.log" \
+  local canonical_bundled
+  canonical_bundled="$(cd "$(dirname "$bundled")" && pwd -P)/$(basename "$bundled")"
+  grep -Fq "CLI: $canonical_bundled" "$WORK_DIR/legacy-layout-doctor.log" \
     || fail "legacy Codex CLI layout was not discovered"
 }
 
