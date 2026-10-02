@@ -50,6 +50,7 @@ public struct ClaudeUsageWindow: Equatable, Sendable {
 public enum ClaudeUsageSource: String, Equatable, Sendable {
     case nativeBridge
     case legacyStatusline
+    case oauthUsage
 }
 
 public struct ClaudeUsageSnapshot: Equatable, Sendable {
@@ -59,8 +60,8 @@ public struct ClaudeUsageSnapshot: Equatable, Sendable {
     public let observedAt: Date
     public let source: ClaudeUsageSource
     public let isStale: Bool
-    /// The bridge installation identity matches current CLI auth status. The native payload
-    /// itself cannot attest the credentials held by an older same-directory session.
+    /// OAuth observations match a token-linked profile and CLI identity before/after the request.
+    /// Bridge observations match installation identity; older sessions cannot attest credentials.
     public let accountVerified: Bool
     public var accountMatched: Bool { self.accountVerified }
 

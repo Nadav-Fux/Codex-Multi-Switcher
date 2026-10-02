@@ -5,7 +5,10 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var claudeStatusItem: NSStatusItem?
+    private var codexMenuImage: NSImage?
+    private var claudeMenuImage: NSImage?
+    private var codexMenuTooltip = "Codex — usage unavailable"
+    private var claudeMenuTooltip = "Claude Code — usage unavailable"
     private var claudeStore: ClaudeProfileStore!
     private var claudeRefreshTimer: Timer?
     private var store: ProfileStore!
@@ -101,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.syncActiveProfile(force: true)
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.statusItem.autosaveName = "CodexMultiSwitcherProviders"
         self.statusItem.button?.image = IconRenderer.renderEmpty()
         self.statusItem.button?.imageScaling = .scaleNone
         #if CODEX_MULTI_SWITCHER_PREVIEW
@@ -418,7 +422,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let displayedId = self.store.liveProfileId
             ?? ((AppInfo.isPreview || AppInfo.isLocalBuild) ? self.store.config.activeProfile : nil)
         guard let displayedId else {
-            self.statusItem.button?.image = IconRenderer.renderEmpty()
+            self.codexMenuImage = IconRenderer.renderEmpty()
+            self.codexMenuTooltip = "Codex — usage unavailable"
+            self.updateCombinedIcon()
             return
         }
 
@@ -430,7 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? max(0, min(100, 100 - snap.primaryUsedPercent)) : nil
             let secondaryRemaining: Int? = snap.hasSecondaryWindow && (snap.secondaryResetAt.map { $0 > now } ?? true)
                 ? max(0, min(100, 100 - snap.secondaryUsedPercent)) : nil
-            self.statusItem.button?.image = IconRenderer.render(
+            self.codexMenuImage = IconRenderer.render(
                 primaryRemainingPercent: primaryRemaining,
                 secondaryRemainingPercent: secondaryRemaining,
                 primaryShowsUsed: UserDefaults.standard.bool(forKey: QuotaDisplayPreferences.primaryKey),
@@ -443,12 +449,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let profileState = self.store.liveProfileId == displayedId ? "Active" : "Selected"
             let primaryDescription = weeklyOnly ? "" : " · 5h: \(primaryRemaining.map { "\($0)% left" } ?? "Not reported or awaiting update")"
             let resetDescription = snap.secondaryResetAt.map { " · Weekly quota resets: \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
-            self.statusItem.button?.toolTip =
-                "\(profileState) \(profileLabel) · \(cached ? "Cached observation" : "Current usage")\(primaryDescription) · Week: \(secondaryRemaining.map { "\($0)% left" } ?? "Not reported or awaiting update")\(resetDescription) · \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
+            self.codexMenuTooltip =
+                "Codex · \(profileState) \(profileLabel) · \(cached ? "Cached observation" : "Current usage")\(primaryDescription) · Week: \(secondaryRemaining.map { "\($0)% left" } ?? "Not reported or awaiting update")\(resetDescription) · \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
         } else {
-            self.statusItem.button?.image = IconRenderer.renderEmpty()
-            self.statusItem.button?.toolTip = "Codex Multi Switcher — usage unavailable"
+            self.codexMenuImage = IconRenderer.renderEmpty()
+            self.codexMenuTooltip = "Codex Multi Switcher — usage unavailable"
         }
+        self.updateCombinedIcon()
     }
 
     @objc private func quotaDisplayChanged() {
@@ -457,31 +464,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateClaudeIcon() {
-        guard self.claudeStore != nil, self.menu != nil else { return }
+        guard self.claudeStore != nil else { return }
         let defaults = UserDefaults.standard
-        let show = defaults.object(forKey: "showClaudeInMenuBar") == nil || defaults.bool(forKey: "showClaudeInMenuBar")
-        guard show else {
-            if let item = self.claudeStatusItem { NSStatusBar.system.removeStatusItem(item) }
-            self.claudeStatusItem = nil
-            return
-        }
-        if self.claudeStatusItem == nil {
-            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-            item.button?.imageScaling = .scaleNone
-            item.menu = self.menu
-            self.claudeStatusItem = item
-        }
         let status = self.claudeStore.statuses[self.claudeStore.selectedID]
-        self.claudeStatusItem?.button?.image = ClaudeIconRenderer.render(
+        self.claudeMenuImage = ClaudeIconRenderer.render(
             snapshot: status?.usage,
             primaryShowsUsed: defaults.bool(forKey: "claudePrimaryQuotaShowsUsed"),
             secondaryShowsUsed: defaults.bool(forKey: "claudeSecondaryQuotaShowsUsed"))
         let label = self.claudeStore.profiles.first(where: { $0.id == self.claudeStore.selectedID })?.label ?? "Claude Code"
-        if let usage = status?.usage {
-            self.claudeStatusItem?.button?.toolTip = "Claude Code · \(label) · \(usage.isStale ? "Cached, out of date" : "Last observed usage") · \(usage.observedAt.formatted(date: .abbreviated, time: .shortened))"
+        if let usage = status?.usage, !usage.isStale, usage.accountVerified {
+            self.claudeMenuTooltip = "Claude Code · \(label) · Last observed usage · \(usage.observedAt.formatted(date: .abbreviated, time: .shortened))"
         } else {
-            self.claudeStatusItem?.button?.toolTip = "Claude Code · \(label) · Usage unavailable; open Settings → Claude Code to connect the status line"
+            self.claudeMenuTooltip = "Claude Code · \(label) · No current usage observed. Open Settings → Claude Code for usage details and the statusline connection."
         }
+        self.updateCombinedIcon()
+    }
+
+    private func updateCombinedIcon() {
+        guard self.statusItem != nil else { return }
+        let providers = MenuBarProviders.selection()
+        let codex = self.codexMenuImage ?? IconRenderer.renderEmpty()
+        let claude = self.claudeMenuImage ?? ClaudeIconRenderer.render(snapshot: nil,
+            primaryShowsUsed: false, secondaryShowsUsed: false)
+        self.statusItem.button?.image = MenuBarCompositeRenderer.render(codex: codex, claude: claude, providers: providers)
+        self.statusItem.button?.toolTip = [providers.showsCodex ? self.codexMenuTooltip : nil,
+            providers.showsClaude ? self.claudeMenuTooltip : nil].compactMap { $0 }.joined(separator: "\n")
     }
 
     // MARK: - Menu Construction
@@ -595,6 +602,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.menu.addItem(quitItem)
     }
 
+    private var visibleStatusButton: NSStatusBarButton? { self.statusItem?.button }
+
     private func prepareRecoveryNoticeIfNeeded() {
         guard self.canHandleRecoveryNotices else { return }
         let launchedForRecovery = ProcessInfo.processInfo.arguments.contains(
@@ -605,7 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         self.hasPendingRecoveryNotice = true
         DispatchQueue.main.async { [weak self] in
-            self?.statusItem.button?.performClick(nil)
+            self?.visibleStatusButton?.performClick(nil)
         }
     }
 
@@ -623,7 +632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if self.isMenuOpen {
             self.rebuildMenu()
         } else {
-            self.statusItem.button?.performClick(nil)
+            self.visibleStatusButton?.performClick(nil)
         }
     }
 

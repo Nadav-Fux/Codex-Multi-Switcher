@@ -19,9 +19,9 @@ enum IconRenderer {
                        cached: Bool = false, weeklyOnly: Bool = false,
                        weeklyResetAt: Date? = nil, showResetCountdown: Bool = true) -> NSImage {
         if weeklyOnly {
-            return Self.renderWeeklyOnly(remainingPercent: secondaryRemainingPercent,
+            return Self.withCodexIdentifier(Self.renderWeeklyOnly(remainingPercent: secondaryRemainingPercent,
                 showsUsed: secondaryShowsUsed, cached: cached, resetAt: weeklyResetAt,
-                showResetCountdown: showResetCountdown)
+                showResetCountdown: showResetCountdown))
         }
         let primaryValue = primaryRemainingPercent.map {
             let remaining = min(100, max(0, $0))
@@ -69,7 +69,7 @@ enum IconRenderer {
         let primaryDescription = primaryValue.map { "5 hours \($0) percent \(primaryShowsUsed ? "used" : "remaining")" } ?? "5 hours unavailable"
         let secondaryDescription = secondaryValue.map { "week \($0) percent \(secondaryShowsUsed ? "used" : "remaining")" } ?? "week unavailable"
         image.accessibilityDescription = "Codex quota: \(cached ? "cached observations, " : "")\(primaryDescription), \(secondaryDescription)"
-        return image
+        return Self.withCodexIdentifier(image)
     }
 
     private static func renderWeeklyOnly(remainingPercent: Int?, showsUsed: Bool, cached: Bool,
@@ -94,6 +94,48 @@ enum IconRenderer {
         let resetDescription = showResetCountdown ? resetAt.map { ", resets \($0.formatted(date: .complete, time: .shortened))" } ?? "" : ""
         image.accessibilityDescription = "Codex quota: \(cached ? "cached observation, " : "")\(amount)\(resetDescription)"
         return image
+    }
+
+    // Provider identifiers are drawn locally; these are not official brand artwork.
+    private static func withCodexIdentifier(_ quota: NSImage) -> NSImage {
+        let image = NSImage(size: NSSize(width: quota.size.width + 20, height: Self.iconHeight), flipped: true) { _ in
+            Self.drawCodexIdentifier(in: NSRect(x: 1, y: 4, width: 15, height: 15))
+            quota.draw(in: NSRect(x: 20, y: 0, width: quota.size.width, height: Self.iconHeight),
+                       from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = quota.accessibilityDescription
+        return image
+    }
+
+    private static func drawCodexIdentifier(in rect: NSRect) {
+        // A terminal glyph identifies Codex without depending on another installed app.
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.8)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = .zero
+        shadow.set()
+        let color = NSColor(srgbRed: 0.93, green: 0.95, blue: 0.99, alpha: 1)
+        let frame = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
+        NSColor.black.setFill()
+        frame.fill()
+        NSColor.white.setStroke()
+        frame.lineWidth = 1
+        frame.stroke()
+        color.setStroke()
+        let prompt = NSBezierPath()
+        prompt.move(to: NSPoint(x: rect.minX + 3.5, y: rect.minY + 4.5))
+        prompt.line(to: NSPoint(x: rect.minX + 6.5, y: rect.midY))
+        prompt.line(to: NSPoint(x: rect.minX + 3.5, y: rect.maxY - 4.5))
+        prompt.move(to: NSPoint(x: rect.minX + 8, y: rect.maxY - 4.5))
+        prompt.line(to: NSPoint(x: rect.maxX - 3, y: rect.maxY - 4.5))
+        prompt.lineWidth = 1.5
+        prompt.lineCapStyle = .round
+        prompt.lineJoinStyle = .round
+        prompt.stroke()
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     private static func weeklyCountdown(_ resetAt: Date?, now: Date = Date()) -> String? {

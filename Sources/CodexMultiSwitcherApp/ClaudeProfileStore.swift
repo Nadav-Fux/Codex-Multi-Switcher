@@ -17,16 +17,19 @@ final class ClaudeProfileStore: ObservableObject {
     private let cli: ClaudeCLIService
     private let installer: ClaudeBridgeInstaller
     private let scriptsRoot: URL
+    private let currentUsage: ClaudeCurrentUsageService
     private var refreshTask: Task<Void, Never>?
     private var pendingBridgeOperations: Set<String> = []
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
-         bridgeURL: URL? = Bundle.main.url(forResource: "ClaudeStatuslineBridge", withExtension: "py")) {
+         bridgeURL: URL? = Bundle.main.url(forResource: "ClaudeStatuslineBridge", withExtension: "py"),
+         currentUsageService: ClaudeCurrentUsageService? = nil) {
         let paths = AppPaths(environment: environment)
         self.registry = ClaudeProfileRegistry(paths: paths)
         self.cli = ClaudeCLIService(environment: environment, userHome: self.registry.defaultDirectory.deletingLastPathComponent())
         self.installer = ClaudeBridgeInstaller(root: self.registry.root, bridgeURL: bridgeURL)
         self.scriptsRoot = self.registry.root.appendingPathComponent("launchers", isDirectory: true)
+        self.currentUsage = currentUsageService ?? ClaudeCurrentUsageService(root: self.registry.root)
         do { self.apply(try self.registry.load()) }
         catch {
             self.profiles = [self.registry.defaultProfile]
@@ -48,6 +51,7 @@ final class ClaudeProfileStore: ObservableObject {
             self.statuses[profile.id] = status
         }
         let cli = self.cli
+        let currentUsage = self.currentUsage
         self.refreshTask = Task { [weak self] in
             // Bound CLI concurrency so a large registry cannot spawn arbitrary processes.
             await withTaskGroup(of: (String, ClaudeProfileStatus).self) { group in
@@ -60,6 +64,24 @@ final class ClaudeProfileStore: ObservableObject {
                         let usage = ClaudeUsageReader.read(profile: profile, auth: status.auth)
                         status.usage = usage.snapshot
                         if let warning = usage.warning { status.error = warning }
+                        let freshNative = status.usage?.source == .nativeBridge
+                            && status.usage?.isStale == false && status.usage?.accountMatched == true
+                        if !freshNative, currentUsage.supports(profile), let auth = status.auth,
+                           ClaudeUsageReader.accountFingerprint(auth) != nil {
+                            do {
+                                status.usage = try await currentUsage.fetch(profile: profile, authBefore: auth,
+                                    authAfter: { try cli.authStatus(profile: profile) })
+                                status.error = nil
+                            } catch {
+                                // No mismatched observation is used as current usage.
+                                if case ClaudeCurrentUsageError.accountChanged = error {
+                                    status.usage = nil
+                                } else {
+                                    status.usage = currentUsage.cached(profile: profile, auth: auth) ?? usage.snapshot
+                                }
+                                status.error = error.localizedDescription
+                            }
+                        }
                         return (profile.id, status)
                     }
                 }

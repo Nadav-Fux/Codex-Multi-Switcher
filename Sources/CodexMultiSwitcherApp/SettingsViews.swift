@@ -583,6 +583,8 @@ struct ProfilesTab: View {
 }
 
 struct GeneralTab: View {
+    @AppStorage(MenuBarProviders.key) private var menuBarProviders = ""
+    @AppStorage("showClaudeInMenuBar") private var legacyShowClaude = true
     @AppStorage("showWeeklyResetCountdown") private var showWeeklyResetCountdown = true
     let store: ProfileStore
     @ObservedObject var refreshPreferences: RefreshPreferences
@@ -648,6 +650,24 @@ struct GeneralTab: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 10) {
+                Text("MENU BAR")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Picker("Show in menu bar", selection: Binding(
+                    get: {
+                        _ = self.menuBarProviders
+                        _ = self.legacyShowClaude
+                        return MenuBarProviders.selection()
+                    },
+                    set: { MenuBarProviders.set($0) })) {
+                    ForEach(MenuBarProviders.allCases, id: \.rawValue) { provider in
+                        Text(provider.label).tag(provider)
+                    }
+                }
+                .pickerStyle(.menu)
+                Text("Both indicators stay together in one menu bar item. Hold Command and drag it to move it beside Wi-Fi or the battery. Choose the displayed Claude account in the Claude Code tab. A question mark means no current usage has been observed.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Divider()
                 Text("REFRESHING")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)

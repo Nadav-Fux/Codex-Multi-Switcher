@@ -39,3 +39,26 @@ struct QuotaDisplayControlsView: View {
         .accessibilityValue(showsUsed.wrappedValue ? "Used" : "Remaining")
     }
 }
+
+/// Visibility is one choice, so the app always leaves a way to open its menu.
+enum MenuBarProviders: String, CaseIterable {
+    case codex, claude, both
+    static let key = "menuBarProviders"
+    var showsCodex: Bool { self != .claude }
+    var showsClaude: Bool { self != .codex }
+    var label: String {
+        switch self {
+        case .codex: return "Codex only"
+        case .claude: return "Claude Code only"
+        case .both: return "Codex and Claude Code"
+        }
+    }
+    static func selection(in defaults: UserDefaults = .standard) -> Self {
+        if let value = defaults.string(forKey: self.key), let selected = Self(rawValue: value) { return selected }
+        return defaults.object(forKey: "showClaudeInMenuBar") != nil && !defaults.bool(forKey: "showClaudeInMenuBar") ? .codex : .both
+    }
+    static func set(_ selected: Self, in defaults: UserDefaults = .standard) {
+        defaults.set(selected.rawValue, forKey: self.key)
+        defaults.set(selected.showsClaude, forKey: "showClaudeInMenuBar")
+    }
+}

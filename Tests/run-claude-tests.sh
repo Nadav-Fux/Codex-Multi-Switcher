@@ -15,11 +15,13 @@ if [[ -f "$BIN_DIR/CodexProfileCore.o" ]]; then
     swiftc -parse-as-library -sdk "$SDK_PATH" -I "$BIN_DIR" \
         "$ROOT_DIR/Sources/CodexMultiSwitcherApp/ClaudeProfileStore.swift" \
         "$ROOT_DIR/Tests/ClaudeIntegrationSmoke.swift" "$BIN_DIR/CodexProfileCore.o" \
+        "$ROOT_DIR/Tests/ClaudeCurrentUsageChecks.swift" \
         -o "$WORK_DIR/claude-integration-smoke"
 else
     swiftc -parse-as-library -sdk "$SDK_PATH" -I "$BIN_DIR/Modules" \
         "$ROOT_DIR/Sources/CodexMultiSwitcherApp/ClaudeProfileStore.swift" \
         "$ROOT_DIR/Tests/ClaudeIntegrationSmoke.swift" "$BIN_DIR/CodexProfileCore.build/"*.o \
+        "$ROOT_DIR/Tests/ClaudeCurrentUsageChecks.swift" \
         -o "$WORK_DIR/claude-integration-smoke"
 fi
 "$WORK_DIR/claude-integration-smoke"
