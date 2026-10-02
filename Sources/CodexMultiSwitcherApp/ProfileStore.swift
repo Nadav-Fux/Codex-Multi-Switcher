@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CodexProfileCore
 import Combine
 import CryptoKit
@@ -33,6 +34,7 @@ final class ProfileStore: ObservableObject {
     private var cacheDirty = false
     private var keychainMigrationCoordinator: KeychainMigrationCoordinator?
     private var keychainMigrationPreview: KeychainMigrationPreview?
+    private var legacyProfileImportPayload: LegacyProfileImportPayload?
 
     private(set) var config: AppConfig
     private(set) var cache: UsageCache
@@ -222,7 +224,7 @@ final class ProfileStore: ObservableObject {
     }
 
     func authCanBeActivated(for profileId: String) -> Bool {
-        self.authStoreExists(for: profileId)
+        self.authStoreExists(for: profileId) && self.cache.renewalStates[profileId]?.renewalAction != .rejected
     }
 
     func syncSavedAuthToLive(for profileId: String) throws {
@@ -286,10 +288,11 @@ final class ProfileStore: ObservableObject {
     struct UsageAuthSource {
         let vault: AuthVault
         let liveAuthURL: URL
+        let paths: AppPaths
     }
 
     func usageAuthSource() -> UsageAuthSource {
-        UsageAuthSource(vault: self.authVault, liveAuthURL: self.codexAuthPath)
+        UsageAuthSource(vault: self.authVault, liveAuthURL: self.codexAuthPath, paths: self.paths)
     }
 
     func saveAuthDataToVault(_ data: Data, for profileId: String) throws {
@@ -298,6 +301,410 @@ final class ProfileStore: ObservableObject {
             profileID: profileId,
             profiles: self.config.profiles,
             vault: self.authVault)
+    }
+
+    private struct LegacyProfileImportPayload {
+        let preview: LegacyProfileImportPreview
+        let baseConfig: AppConfig
+        let profiles: [ProfileConfig]
+        let authBlobs: [String: Data]
+    }
+
+    private struct LegacyProfileImportBackup: Codable {
+        let formatVersion: Int
+        let createdAt: Date
+        let baselineConfig: AppConfig
+        let addedProfiles: [String: String]
+        var importedAuthFingerprints: [String: String]
+        var undoneAt: Date?
+    }
+
+    private static let originalLegacyKeychainService = "com.4lau.codex-profile-switcher.auth"
+
+    var canUndoLatestLegacyProfileImport: Bool {
+        self.latestLegacyProfileImportManifestURL() != nil
+    }
+
+    func reviewLegacyProfileImport(
+        sourceHome: URL? = nil,
+        includeCredentials: Bool = true
+    ) throws -> LegacyProfileImportPreview {
+        let legacyRoot = (sourceHome ?? self.paths.userHome)
+            .appendingPathComponent(".codex-switcher", isDirectory: true)
+        let rootPath = legacyRoot.standardizedFileURL.path
+        let currentPath = self.paths.switcherHome.standardizedFileURL.path
+        guard rootPath != currentPath,
+              !rootPath.hasPrefix(currentPath + "/"),
+              !currentPath.hasPrefix(rootPath + "/") else {
+            throw LegacyProfileImportError.unsafePath(rootPath)
+        }
+        guard !self.isSymbolicLink(at: legacyRoot) else {
+            throw LegacyProfileImportError.unsafePath(rootPath)
+        }
+        guard self.fileManager.fileExists(atPath: legacyRoot.path) else {
+            throw LegacyProfileImportError.sourceNotFound(rootPath)
+        }
+
+        var warnings: [String] = []
+        var sourceProfiles: [String: ProfileConfig] = [:]
+        let configURL = legacyRoot.appendingPathComponent("config.json")
+        if self.fileManager.fileExists(atPath: configURL.path) {
+            if self.isSymbolicLink(at: configURL) {
+                warnings.append("Skipped the old config file because it is a symbolic link.")
+            } else if let data = try? Data(contentsOf: configURL),
+                      let oldConfig = try? JSONDecoder().decode(AppConfig.self, from: data) {
+                for profile in oldConfig.profiles where Self.isValidProfileId(profile.id) {
+                    if sourceProfiles[profile.id] == nil {
+                        sourceProfiles[profile.id] = ProfileConfig(
+                            id: profile.id,
+                            label: Self.safeImportedLabel(profile.label, profileID: profile.id))
+                    }
+                }
+            } else {
+                warnings.append("The old config file could not be read. Saved auth files will still be scanned.")
+            }
+        }
+
+        var candidates: [String: [(source: String, data: Data)]] = [:]
+        let credentialDirectories = includeCredentials
+            ? [("dev-auth-store", "old development vault"), ("auth", "old auth folder")]
+            : []
+        for (directoryName, sourceName) in credentialDirectories {
+            let directory = legacyRoot.appendingPathComponent(directoryName, isDirectory: true)
+            guard self.fileManager.fileExists(atPath: directory.path) else { continue }
+            guard !self.isSymbolicLink(at: directory) else {
+                warnings.append("Skipped the old \(directoryName) folder because it is a symbolic link.")
+                continue
+            }
+            do {
+                let files = try self.fileManager.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles])
+                for file in files where file.pathExtension.lowercased() == "json" {
+                    let profileID = file.deletingPathExtension().lastPathComponent
+                    guard Self.isValidProfileId(profileID), !self.isSymbolicLink(at: file) else { continue }
+                    guard let data = try? Data(contentsOf: file), AuthBlob.isPlausibleAuthBlob(data) else {
+                        warnings.append("Skipped unreadable or invalid credentials for profile \(profileID).")
+                        continue
+                    }
+                    candidates[profileID, default: []].append((sourceName, data))
+                }
+            } catch {
+                warnings.append("Could not scan the old \(directoryName) folder: \(error.localizedDescription)")
+            }
+        }
+
+        // This reads only the original app's pre-Data-Protection Keychain
+        // service. Newer Data Protection items belong to the old signing team
+        // and cannot be queried by this app's entitlement group.
+        if includeCredentials {
+            let oldKeychain = LegacyKeychainAuthVault(
+                service: Self.originalLegacyKeychainService,
+                interactionAllowed: true)
+            do {
+                for profileID in try oldKeychain.listProfileIDs() where Self.isValidProfileId(profileID) {
+                    guard let data = try oldKeychain.loadAuthBlob(profileID: profileID),
+                          AuthBlob.isPlausibleAuthBlob(data) else { continue }
+                    candidates[profileID, default: []].append(("old macOS Keychain", data))
+                }
+            } catch {
+                warnings.append("The old app's regular Keychain items were unavailable: \(error.localizedDescription)")
+            }
+            warnings.append("Credentials held only in the original app's Data Protection Keychain cannot be transferred across its signing identity; those profiles will need a new sign-in.")
+        } else {
+            warnings.append("This preview copies profile names only. Select each profile in Profiles and click Set Up to sign in separately. Saved credentials in the original app are not read.")
+        }
+
+        let profileIDs = Set(sourceProfiles.keys).union(candidates.keys).sorted()
+        if profileIDs.isEmpty {
+            warnings.append("No valid legacy profiles or saved credentials were found.")
+        }
+        let configuredIDs = Set(self.config.profiles.map(\.id))
+        var authBlobs: [String: Data] = [:]
+        var items: [LegacyProfileImportItem] = []
+
+        for profileID in profileIDs {
+            let rawCandidates = candidates[profileID] ?? []
+            let fingerprints = Set(rawCandidates.compactMap { AuthBlob.identityFingerprint(from: $0.data) })
+            let hasConflictingCopies = fingerprints.count > 1
+            let selectedCandidate: (source: String, data: Data)? = hasConflictingCopies
+                ? nil
+                : rawCandidates.sorted { lhs, rhs in
+                    Self.legacySourcePriority(lhs.source) < Self.legacySourcePriority(rhs.source)
+                }.first
+            if let selectedCandidate {
+                authBlobs[profileID] = selectedCandidate.data
+            }
+
+            let destinationHasAuth: Bool
+            do {
+                destinationHasAuth = try self.authVault.hasAuthBlob(profileID: profileID)
+            } catch {
+                self.legacyProfileImportPayload = nil
+                throw error
+            }
+            let legacyProfile = sourceProfiles[profileID]
+            items.append(LegacyProfileImportItem(
+                id: profileID,
+                label: legacyProfile?.label ?? "Profile \(profileID)",
+                credentialState: hasConflictingCopies
+                    ? .conflictingCopies
+                    : selectedCandidate.map { .ready(source: $0.source) } ?? .unavailable,
+                destinationHasAuth: destinationHasAuth,
+                alreadyConfigured: configuredIDs.contains(profileID)))
+        }
+
+        let preview = LegacyProfileImportPreview(
+            id: UUID(),
+            sourcePath: rootPath,
+            items: items,
+            warnings: warnings)
+        self.legacyProfileImportPayload = LegacyProfileImportPayload(
+            preview: preview,
+            baseConfig: self.config,
+            profiles: profileIDs.map { sourceProfiles[$0] ?? ProfileConfig(id: $0, label: "Profile \($0)") },
+            authBlobs: authBlobs)
+        return preview
+    }
+
+    func cancelLegacyProfileImportReview() {
+        self.legacyProfileImportPayload = nil
+    }
+
+    func importLegacyProfiles(_ preview: LegacyProfileImportPreview) throws -> LegacyProfileImportResult {
+        guard let payload = self.legacyProfileImportPayload,
+              payload.preview.id == preview.id,
+              payload.preview.sourcePath == preview.sourcePath,
+              payload.baseConfig == self.config,
+              (ProfileConfigStore(paths: self.paths).loadConfig() ?? self.config) == payload.baseConfig else {
+            self.legacyProfileImportPayload = nil
+            throw LegacyProfileImportError.stalePreview
+        }
+        defer { self.legacyProfileImportPayload = nil }
+
+        let previousConfig = self.config
+        var mergedProfiles = previousConfig.profiles
+        var existingIDs = Set(mergedProfiles.map(\.id))
+        var addedProfiles: [String: String] = [:]
+        for imported in payload.profiles where existingIDs.insert(imported.id).inserted {
+            mergedProfiles.append(imported)
+            addedProfiles[imported.id] = imported.label
+        }
+
+        let backupRoot = self.paths.switcherHome.appendingPathComponent("backups", isDirectory: true)
+        guard !self.isSymbolicLink(at: backupRoot) else {
+            throw LegacyProfileImportError.unsafePath(backupRoot.path)
+        }
+        try self.fileManager.createDirectory(
+            at: backupRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try self.fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: backupRoot.path)
+        let backupDirectory = backupRoot
+            .appendingPathComponent("legacy-profile-import-\(UUID().uuidString)", isDirectory: true)
+        try AtomicFileWriter.ensurePrivateDirectory(backupDirectory, fileManager: self.fileManager)
+        try self.fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: backupDirectory.path)
+        var backup = LegacyProfileImportBackup(
+            formatVersion: 1,
+            createdAt: Date(),
+            baselineConfig: previousConfig,
+            addedProfiles: addedProfiles,
+            importedAuthFingerprints: [:],
+            undoneAt: nil)
+        let backupURL = backupDirectory.appendingPathComponent("manifest.json")
+        try self.writeLegacyImportBackup(backup, to: backupURL)
+
+        var copiedIDs: [String] = []
+        var warnings = preview.warnings
+        var skippedCredentials = 0
+        do {
+            for item in preview.items {
+                guard case .ready = item.credentialState,
+                      !item.destinationHasAuth,
+                      let data = payload.authBlobs[item.id] else { continue }
+                do {
+                    try DuplicateAwareAuthSaver.saveIfMissing(
+                        data,
+                        profileID: item.id,
+                        profiles: mergedProfiles,
+                        vault: self.authVault)
+                } catch {
+                    skippedCredentials += 1
+                    warnings.append("Profile \(item.id) credentials were not copied: \(error.localizedDescription)")
+                    continue
+                }
+                copiedIDs.append(item.id)
+                backup.importedAuthFingerprints[item.id] = Self.legacyImportFingerprint(data)
+                try self.writeLegacyImportBackup(backup, to: backupURL)
+            }
+
+            self.config.profiles = mergedProfiles
+            try self.saveConfigThrowing()
+            self.statuses = [:]
+            self.refreshStatusesFromStoredAuth()
+        } catch {
+            for profileID in copiedIDs {
+                guard let data = payload.authBlobs[profileID] else { continue }
+                _ = try? self.deleteImportedAuthIfUnchanged(
+                    profileID: profileID,
+                    expectedFingerprint: Self.legacyImportFingerprint(data))
+            }
+            self.config = previousConfig
+            try? self.fileManager.removeItem(at: backupDirectory)
+            self.refreshStatusesFromStoredAuth()
+            throw error
+        }
+
+        return LegacyProfileImportResult(
+            importedProfiles: addedProfiles.count,
+            copiedCredentials: copiedIDs.count,
+            skippedCredentials: skippedCredentials,
+            warnings: warnings)
+    }
+
+    func undoLatestLegacyProfileImport() throws -> LegacyProfileImportResult {
+        guard let manifestURL = self.latestLegacyProfileImportManifestURL() else {
+            throw LegacyProfileImportError.noUndoAvailable
+        }
+        guard let data = try? Data(contentsOf: manifestURL),
+              let decodedBackup = try? JSONDecoder().decode(LegacyProfileImportBackup.self, from: data),
+              decodedBackup.formatVersion == 1 else {
+            throw LegacyProfileImportError.corruptBackup
+        }
+        var backup = decodedBackup
+
+        let previousConfig = self.config
+        let undoResult: (removedAuth: Int, removedProfiles: Int, warnings: [String]) = try self.authVault.transact {
+            var removedAuth = 0
+            var removedProfiles = 0
+            var warnings: [String] = []
+            var deletedAuth: [String: Data] = [:]
+
+            do {
+                for (profileID, expectedFingerprint) in backup.importedAuthFingerprints {
+                    guard profileID != self.config.activeProfile, profileID != self.liveProfileId else {
+                        warnings.append("Kept credentials for active profile \(profileID).")
+                        continue
+                    }
+                    guard let current = try self.authVault.loadAuthBlob(profileID: profileID) else { continue }
+                    guard Self.legacyImportFingerprint(current) == expectedFingerprint else {
+                        warnings.append("Kept credentials for profile \(profileID) because they changed after import.")
+                        continue
+                    }
+                    try self.authVault._deleteAuthBlobUnlocked(profileID: profileID)
+                    deletedAuth[profileID] = current
+                    removedAuth += 1
+                }
+
+                for (profileID, importedLabel) in backup.addedProfiles {
+                    guard let profile = self.config.profiles.first(where: { $0.id == profileID }) else { continue }
+                    guard profileID != self.config.activeProfile, profileID != self.liveProfileId else {
+                        warnings.append("Kept profile settings for active profile \(profileID).")
+                        continue
+                    }
+                    guard profile.label == importedLabel else {
+                        warnings.append("Kept profile settings for \(profileID) because its label changed after import.")
+                        continue
+                    }
+                    guard !(try self.authVault.hasAuthBlob(profileID: profileID)) else {
+                        warnings.append("Kept profile \(profileID) because it still has saved credentials.")
+                        continue
+                    }
+                    self.config.profiles.removeAll { $0.id == profileID }
+                    removedProfiles += 1
+                }
+
+                try self.saveConfigThrowing()
+            } catch {
+                for (profileID, authData) in deletedAuth {
+                    if (try? self.authVault.loadAuthBlob(profileID: profileID)) == nil {
+                        try? self.authVault._saveAuthBlobUnlocked(authData, profileID: profileID)
+                    }
+                }
+                self.config = previousConfig
+                throw error
+            }
+            return (removedAuth, removedProfiles, warnings)
+        }
+        self.refreshStatusesFromStoredAuth()
+        if undoResult.warnings.isEmpty {
+            backup.undoneAt = Date()
+            try self.writeLegacyImportBackup(backup, to: manifestURL)
+        }
+        return LegacyProfileImportResult(
+            importedProfiles: undoResult.removedProfiles,
+            copiedCredentials: 0,
+            skippedCredentials: backup.importedAuthFingerprints.count - undoResult.removedAuth,
+            warnings: undoResult.warnings)
+    }
+
+    private func isSymbolicLink(at url: URL) -> Bool {
+        var attributes = stat()
+        return url.path.withCString { path in
+            lstat(path, &attributes) == 0 && (attributes.st_mode & S_IFMT) == S_IFLNK
+        }
+    }
+
+    private func deleteImportedAuthIfUnchanged(profileID: String, expectedFingerprint: String) throws -> Bool {
+        try self.authVault.transact {
+            guard let current = try self.authVault.loadAuthBlob(profileID: profileID),
+                  Self.legacyImportFingerprint(current) == expectedFingerprint else { return false }
+            try self.authVault._deleteAuthBlobUnlocked(profileID: profileID)
+            return true
+        }
+    }
+
+    private static func safeImportedLabel(_ label: String, profileID: String) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.count <= 80,
+              trimmed.rangeOfCharacter(from: .controlCharacters) == nil else {
+            return "Profile \(profileID)"
+        }
+        return trimmed
+    }
+
+    private static func legacySourcePriority(_ source: String) -> Int {
+        switch source {
+        case "old macOS Keychain": return 0
+        case "old development vault": return 1
+        default: return 2
+        }
+    }
+
+    private static func legacyImportFingerprint(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func latestLegacyProfileImportManifestURL() -> URL? {
+        let backupsDirectory = self.paths.switcherHome.appendingPathComponent("backups", isDirectory: true)
+        guard let entries = try? self.fileManager.contentsOfDirectory(
+            at: backupsDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return nil }
+        return entries
+            .filter { $0.lastPathComponent.hasPrefix("legacy-profile-import-") }
+            .map { $0.appendingPathComponent("manifest.json") }
+            .filter { self.fileManager.fileExists(atPath: $0.path) }
+            .filter { url in
+                guard let data = try? Data(contentsOf: url),
+                      let backup = try? JSONDecoder().decode(LegacyProfileImportBackup.self, from: data) else {
+                    return false
+                }
+                return backup.undoneAt == nil
+            }
+            .max { lhs, rhs in
+                let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return left < right
+            }
+    }
+
+    private func writeLegacyImportBackup(_ backup: LegacyProfileImportBackup, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try AtomicFileWriter.write(encoder.encode(backup), to: url, fileManager: self.fileManager)
     }
 
     func relaunchWorkspacePath() -> String? {
@@ -380,6 +787,19 @@ final class ProfileStore: ObservableObject {
             self.cache.snapshots[id] = snapshot
             self.cacheDirty = true
         }
+    }
+
+    /// Current Desktop usage can be healthy while its independent saved login
+    /// needs authentication. Keep that saved-session rejection and credential.
+    func updateLiveUsageSnapshot(_ id: String, _ snapshot: UsageSnapshot) {
+        guard self.liveProfileId == id else { return }
+        self.statuses[id] = .available(snapshot)
+        self.cache.snapshots[id] = snapshot
+        self.cacheDirty = true
+    }
+
+    func isUsingLiveUsage(_ id: String) -> Bool {
+        self.liveProfileId == id && self.refreshDiagnostics[id]?.lastDecision == "available-live-read-only"
     }
 
     func recordRenewalState(_ state: RenewalState, for id: String) {
@@ -657,7 +1077,7 @@ final class ProfileStore: ObservableObject {
 
     private func saveConfigThrowing() throws {
         let data = try Self.configEncoder.encode(self.config)
-        try data.write(to: self.configURL, options: .atomic)
+        try AtomicFileWriter.write(data, to: self.configURL, fileManager: self.fileManager)
     }
 
     private func keychainMigrationCheckpoint() -> (String, AuthMigrationState, String?) throws -> Void {

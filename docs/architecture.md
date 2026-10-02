@@ -35,6 +35,7 @@ macOS Keychain
 | `CodexMultiSwitcherApp/AppLogging.swift` | App-side log configuration and redaction setup |
 | `CodexMultiSwitcherApp/ProfileModels.swift` | View-layer profile and usage model types |
 | `CodexMultiSwitcherApp/ProfileStore.swift` | `@MainActor` profile state store — loads, saves, and publishes profile config |
+| `CodexMultiSwitcherApp/LegacyProfileImport.swift` | Preview and result types for copying data from the original app |
 | `CodexMultiSwitcherApp/UsageProvider.swift` | `@MainActor` usage coordinator — schedules refreshes and merges snapshots |
 | `CodexMultiSwitcherApp/CodexBridge.swift` | Uses the shared Codex Desktop lifecycle for profile switches and translates helper responses |
 | `CodexMultiSwitcherApp/DebugInfoBuilder.swift` | Assembles redacted debug info for clipboard copy |
@@ -58,6 +59,8 @@ macOS Keychain
 Usage data is fetched via a single path: Codex's own `app-server` JSON-RPC endpoint. The CLI or app launches `codex app-server` in a temporary profile-scoped environment and reads quota from its JSON-RPC response. There is no direct OpenAI usage API call and no OAuth refresh on poll. Each returned window includes its duration, which the menu uses for its label instead of assuming fixed five-hour and weekly slots. Missing windows are omitted.
 
 The app coordinates refresh state through an app-local `UsageProvider` (`@MainActor`). Profile config is owned by `ProfileStore` (`@MainActor`). UI-independent fetching and profile selection logic live in `CodexProfileCore/Usage`.
+
+The profile import flow reads the original `~/.codex-switcher` config and file vaults plus its pre-Data-Protection Keychain service. It keeps the source untouched, refuses to overwrite destination credentials, and stores a permission-restricted undo manifest under `~/.codex-multi-switcher/backups/`. Undo removes only auth bytes that still match the import fingerprint and only removes profile metadata that remains unchanged. Credentials stored only in the original app's Data Protection Keychain cannot cross its signing-team access group.
 
 The `best-auth` CLI command runs the same fetch path independently (bounded concurrency of 3) so it never relies solely on a stale cache when the menu bar app is not running.
 

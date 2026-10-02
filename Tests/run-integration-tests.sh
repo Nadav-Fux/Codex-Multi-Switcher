@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# A Local app terminal may carry live-home and vault overrides. The fixtures
+# below set their own homes and stores; inherited overrides must not retarget
+# a test at the user's active account or credentials.
+unset CODEX_PROFILE_LIVE_HOME CLAUDE_PROFILE_USER_HOME
+unset CODEX_PROFILE_FILE_AUTH_STORE_DIR CODEX_PROFILE_TEST_AUTH_STORE_DIR
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-profile-integration.XXXXXX")"
 HELPER="$WORK_DIR/codex-profile"
@@ -12,7 +18,7 @@ LAUNCH_LOG="$WORK_DIR/fake-app-launch.log"
 LOGIN_HOME_LOG="$WORK_DIR/fake-codex-login-home.log"
 TEST_HOME="$WORK_DIR/home"
 AUTH_STORE="$WORK_DIR/auth-store"
-BUILD_DIR="$WORK_DIR/build"
+BUILD_DIR="${CODEX_PROFILE_INTEGRATION_BUILD_DIR:-$WORK_DIR/build}"
 TOKEN_STUB_PID=""
 TOKEN_STUB_ENDPOINT=""
 TOKEN_STUB_COUNT=""
@@ -32,8 +38,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The menu app refreshes Claude at startup as well as Codex. Keep discovery on
+# an inert fixture so these integration runs never invoke a real Claude CLI.
+mkdir -p "$WORK_DIR/fake-bin"
+cat > "$WORK_DIR/fake-bin/claude" <<'SCRIPT'
+#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = status ] && [ "$3" = --json ]; then
+  printf '{"loggedIn":false}\n'
+  exit 1
+fi
+printf 'Unexpected fake Claude command\n' >&2
+exit 2
+SCRIPT
+chmod +x "$WORK_DIR/fake-bin/claude"
+export PATH="$WORK_DIR/fake-bin:$PATH"
+
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
   export DEVELOPER_DIR=/Applications/Xcode.app
+fi
+
+SDK_ARGS=()
+if [[ -n "${CODEX_PROFILE_SDK:-}" ]]; then
+  SDK_ARGS=(--sdk "$CODEX_PROFILE_SDK")
 fi
 
 swift build \
@@ -41,8 +67,9 @@ swift build \
   -c release \
   --product codex-profile \
   --scratch-path "$BUILD_DIR" \
+  ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} \
   >/dev/null
-BIN_DIR="$(swift build --package-path "$ROOT_DIR" -c release --scratch-path "$BUILD_DIR" --show-bin-path)"
+BIN_DIR="$(swift build --package-path "$ROOT_DIR" -c release --scratch-path "$BUILD_DIR" ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} --show-bin-path)"
 cp "$BIN_DIR/codex-profile" "$HELPER"
 chmod +x "$HELPER"
 swift build \
@@ -50,6 +77,7 @@ swift build \
   -c release \
   --product CodexMultiSwitcher \
   --scratch-path "$BUILD_DIR" \
+  ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} \
   >/dev/null
 cp "$BIN_DIR/CodexMultiSwitcher" "$APP_BIN"
 chmod +x "$APP_BIN"

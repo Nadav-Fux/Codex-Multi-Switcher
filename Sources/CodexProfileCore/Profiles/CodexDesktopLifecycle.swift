@@ -4,12 +4,20 @@ import Foundation
 public struct CodexDesktopInstallation {
     public let appPath: String?
     public let bundleIdentifier: String
+    public let version: String?
     public let executablePath: String?
     public let bundledCLIPath: String
 
-    public init(appPath: String?, bundleIdentifier: String, executablePath: String?, bundledCLIPath: String) {
+    public init(
+        appPath: String?,
+        bundleIdentifier: String,
+        version: String? = nil,
+        executablePath: String?,
+        bundledCLIPath: String
+    ) {
         self.appPath = appPath
         self.bundleIdentifier = bundleIdentifier
+        self.version = version
         self.executablePath = executablePath
         self.bundledCLIPath = bundledCLIPath
     }
@@ -71,6 +79,51 @@ public struct CodexDesktopLifecycle {
             throw CodexDesktopLifecycleError.installationNotFound
         }
         return installation
+    }
+
+    /// Human-readable checks for support reports. This only reads the app
+    /// bundle and never writes to or launches the installed desktop app.
+    public func compatibilitySummary() -> [String] {
+        do {
+            let installation = try self.resolveInstallation()
+            guard let appPath = installation.appPath else {
+                return ["desktop_status: resolved executable without an app bundle"]
+            }
+            let resources = URL(fileURLWithPath: appPath)
+                .appendingPathComponent("Contents/Resources", isDirectory: true)
+            let package = resources.appendingPathComponent("codex-cli", isDirectory: true)
+            let metadataURL = package.appendingPathComponent("codex-package.json")
+            var lines = [
+                "desktop_path: \(appPath)",
+                "desktop_bundle_id: \(installation.bundleIdentifier)",
+                "desktop_version: \(installation.version ?? "unknown")",
+            ]
+
+            if self.fileManager.fileExists(atPath: metadataURL.path) {
+                lines.append("codex_cli_layout: package metadata")
+                if let data = try? Data(contentsOf: metadataURL),
+                   let metadata = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let entrypoint = metadata["entrypoint"] as? String {
+                    lines.append("codex_cli_entrypoint: \(entrypoint)")
+                } else {
+                    lines.append("codex_cli_metadata: unreadable or missing entrypoint")
+                }
+            } else if self.fileManager.isExecutableFile(
+                atPath: package.appendingPathComponent("bin/codex").path) {
+                lines.append("codex_cli_layout: legacy packaged bin/codex fallback")
+            } else if self.fileManager.isExecutableFile(
+                atPath: resources.appendingPathComponent("codex").path) {
+                lines.append("codex_cli_layout: legacy Resources/codex fallback")
+            } else {
+                lines.append("codex_cli_layout: no known CLI entrypoint found")
+            }
+
+            lines.append("codex_cli_path: \(installation.bundledCLIPath)")
+            lines.append("codex_cli_executable: \(self.fileManager.isExecutableFile(atPath: installation.bundledCLIPath))")
+            return lines
+        } catch {
+            return ["desktop_status: unavailable", "desktop_error: \(error.localizedDescription)"]
+        }
     }
 
     public func resolveBundledCLI() throws -> String {
@@ -239,6 +292,7 @@ public struct CodexDesktopLifecycle {
         return CodexDesktopInstallation(
             appPath: canonicalAppPath,
             bundleIdentifier: Self.bundleIdentifier,
+            version: info["CFBundleShortVersionString"] as? String,
             executablePath: self.canonicalPath(executable),
             bundledCLIPath: bundledCLI)
     }

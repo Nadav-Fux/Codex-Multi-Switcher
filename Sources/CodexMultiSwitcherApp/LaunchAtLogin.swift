@@ -33,6 +33,7 @@ enum LaunchAtLogin {
         .appendingPathComponent("Library/LaunchAgents/com.codex-multi-switcher.plist")
 
     static var state: State {
+        if AppInfo.isLocalBuild { return LocalLaunchAtLogin.state }
         guard Self.isEligible else { return .unavailable }
         switch SMAppService.mainApp.status {
         case .enabled:
@@ -49,6 +50,10 @@ enum LaunchAtLogin {
     }
 
     static func enable() throws {
+        if AppInfo.isLocalBuild {
+            try LocalLaunchAtLogin.enable()
+            return
+        }
         guard Self.isEligible else { throw OperationError.unavailable }
         do {
             try SMAppService.mainApp.register()
@@ -58,6 +63,10 @@ enum LaunchAtLogin {
     }
 
     static func disable() throws {
+        if AppInfo.isLocalBuild {
+            try LocalLaunchAtLogin.disable()
+            return
+        }
         guard Self.isEligible else { throw OperationError.unavailable }
 
         let validatedLegacyData = try Self.validatedLegacyDataForDisable()
@@ -85,6 +94,10 @@ enum LaunchAtLogin {
     }
 
     static func migrateLegacyLaunchAgentIfNeeded() {
+        if AppInfo.isLocalBuild {
+            LocalLaunchAtLogin.migrateLegacyIfNeeded()
+            return
+        }
         guard Self.isEligible,
               FileManager.default.fileExists(atPath: Self.legacyPlistURL.path) else { return }
 

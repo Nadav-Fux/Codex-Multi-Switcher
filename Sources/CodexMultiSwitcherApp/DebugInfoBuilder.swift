@@ -15,9 +15,12 @@ enum DebugInfoBuilder {
             "helper: \(CodexBridge.helperPathForDebug())",
             "log_file: \(AppLogger.logURL.path)",
             "",
-            "State:",
+            "Codex Desktop compatibility:",
         ]
 
+        lines.append(contentsOf: CodexDesktopLifecycle().compatibilitySummary().map { "  \($0)" })
+        lines.append("")
+        lines.append("State:")
         lines.append(contentsOf: store.debugSummaryLines().map { "  \($0)" })
         lines.append("")
         lines.append("Recent Logs:")

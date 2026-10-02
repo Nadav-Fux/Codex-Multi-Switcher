@@ -104,6 +104,26 @@ public enum AuthBlob {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Persistable identity binding without storing tokens or raw identity claims.
+    /// Per-claim hashes let a validated token rotation add identity fields.
+    public static func identityClaimFingerprints(from data: Data) -> [String: String]? {
+        guard let json = try? parseTopLevelObject(from: data), let identity = authIdentity(from: json) else { return nil }
+        return identity.mapValues { value in
+            SHA256.hash(data: Data("\(value)".utf8)).map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
+    public static func identityMatches(_ data: Data, claimFingerprints: [String: String]) -> Bool {
+        guard let current = identityClaimFingerprints(from: data) else { return false }
+        var matches = 0
+        for (key, expected) in claimFingerprints {
+            guard let actual = current[key] else { continue }
+            guard actual == expected else { return false }
+            if key != "kind" { matches += 1 }
+        }
+        return matches > 0
+    }
+
     /// Compares two blobs' identities by VALUE rather than by the shape of the
     /// whole identity dictionary. A refresh response that merely ADDS an
     /// identifying field (e.g. an `id_token` the stored blob never had) is not

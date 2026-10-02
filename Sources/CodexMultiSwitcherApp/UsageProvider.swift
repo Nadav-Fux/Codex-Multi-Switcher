@@ -7,6 +7,7 @@ import CryptoKit
 @MainActor
 final class UsageProvider {
     private let store: ProfileStore
+    private let paths: AppPaths
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration: UUID?
     private var lastRefreshAll: Date = .distantPast
@@ -28,6 +29,7 @@ final class UsageProvider {
 
     init(store: ProfileStore) {
         self.store = store
+        self.paths = store.usageAuthSource().paths
     }
 
     func cancelRefreshes() {
@@ -45,10 +47,11 @@ final class UsageProvider {
         self.activeLeases.removeAll()
         if !leasesToRelease.isEmpty {
             let previous = self.pendingLeaseRelease
+            let paths = self.paths
             self.pendingLeaseRelease = Task {
                 await previous?.value
                 for (profileID, token) in leasesToRelease {
-                    await Self.removeLease(profileIDs: [profileID], expectedToken: token)
+                    await Self.removeLease(profileIDs: [profileID], expectedToken: token, paths: paths)
                 }
             }
         }
@@ -90,6 +93,7 @@ final class UsageProvider {
 
         self.refreshTask = Task { @MainActor in
             let groups = await Self.groupContexts(contexts, source: source)
+            guard !Task.isCancelled, self.refreshGeneration == generation else { return }
             await withTaskGroup(of: Void.self) { group in
                 var pending = groups[...]
                 let initialBatch = min(3, pending.count)
@@ -100,6 +104,10 @@ final class UsageProvider {
                     }
                 }
                 for await _ in group {
+                    guard !Task.isCancelled, self.refreshGeneration == generation else {
+                        group.cancelAll()
+                        break
+                    }
                     if let fetchGroup = pending.popFirst() {
                         group.addTask { @MainActor in
                             await self.refreshGroup(fetchGroup, generation: generation, source: source)
@@ -117,7 +125,7 @@ final class UsageProvider {
         }
     }
 
-    private struct RefreshContext {
+    struct RefreshContext {
         let id: String
         let cached: UsageSnapshot?
         let isLive: Bool
@@ -127,24 +135,33 @@ final class UsageProvider {
         /// identity. Used to detect that a persisted rejection's credential has
         /// been replaced. Nil when the auth blob could not be loaded or parsed.
         var credentialFingerprint: String? = nil
+        var usesLiveAuth = false
+        var usesReadOnlyLiveAuth = false
     }
 
-    private struct RefreshGroup {
+    struct RefreshGroup {
         var contexts: [RefreshContext]
         let authData: Data?
+        let queryAuthData: Data?
         let loadError: (any Error)?
     }
 
-    private nonisolated static func groupContexts(
+    nonisolated static func groupContexts(
         _ contexts: [RefreshContext], source: ProfileStore.UsageAuthSource
     ) async -> [RefreshGroup] {
         var groups: [String: RefreshGroup] = [:]
         for var context in contexts {
+            guard !Task.isCancelled else { break }
             var loadError: (any Error)?
             var authData: Data?
+            var queryAuthData: Data?
             do {
-                authData = try await Self.loadAuthData(
+                let loaded = try await Self.loadAuthData(
                     source: source, profileID: context.id, isLive: context.isLive)
+                authData = loaded?.data
+                queryAuthData = loaded?.queryData
+                context.usesLiveAuth = loaded?.usesLiveAuth ?? false
+                context.usesReadOnlyLiveAuth = loaded?.isReadOnlyLive ?? false
             } catch {
                 loadError = error
             }
@@ -154,12 +171,14 @@ final class UsageProvider {
             // account identity can still hold different credentials. Batching
             // by identity would fetch one profile's usage and apply it to a
             // sibling profile with a different refresh token.
-            let key = context.credentialFingerprint ?? "profile:\(context.id)"
+            let key = context.usesReadOnlyLiveAuth ? "live-read-only:\(context.id)" :
+                (context.credentialFingerprint ?? "profile:\(context.id)")
             if var group = groups[key] {
                 group.contexts.append(context)
                 groups[key] = group
             } else {
-                groups[key] = RefreshGroup(contexts: [context], authData: authData, loadError: loadError)
+                groups[key] = RefreshGroup(contexts: [context], authData: authData,
+                                           queryAuthData: queryAuthData, loadError: loadError)
             }
         }
         return Array(groups.values)
@@ -181,7 +200,8 @@ final class UsageProvider {
     private func refreshGroup(
         _ fetchGroup: RefreshGroup, generation: UUID, source: ProfileStore.UsageAuthSource
     ) async {
-        guard !self.store.isAuthMutationInProgress() else { return }
+        guard !Task.isCancelled, self.refreshGeneration == generation,
+              !self.store.isAuthMutationInProgress() else { return }
         var diagnostics = Dictionary(uniqueKeysWithValues: fetchGroup.contexts.map {
             ($0.id, ProfileRefreshDiagnostics(lastAttemptAt: Date()))
         })
@@ -191,10 +211,8 @@ final class UsageProvider {
         ) async {
             // Bail if the refresh was cancelled (e.g. by cancelRefreshes() during
             // a profile switch). Prevents in-flight stale writes from landing.
-            guard !Task.isCancelled, self.refreshGeneration == generation else { return }
-
-            self.store.clearRenewalStateIfCredentialMoved(
-                for: context.id, currentCredentialFingerprint: context.credentialFingerprint)
+            guard !Task.isCancelled, self.refreshGeneration == generation,
+                  !self.store.isAuthMutationInProgress() else { return }
 
             // Re-derive liveness at finalize time. The snapshot was fetched under
             // whichever credentials were live at refresh START; if the live
@@ -205,19 +223,52 @@ final class UsageProvider {
             if context.isLive != currentlyLive { return }
 
             diagnostics[context.id]?.lastDecision = decision
-            // Re-check whether auth was torn down while we fetched. Live profiles
-            // use a cheap main-safe file stat; non-live profiles re-query the
-            // vault, but off the main actor so a Keychain consent prompt cannot
-            // block the menu bar.
-            let stillAvailable = currentlyLive
-                ? self.store.liveAuthExists()
-                : await Self.loadAuthAvailability(source: source, profileID: context.id)
+            // A new login can replace the same profile slot during a fetch.
+            // Re-read its credential off the main actor and reject results
+            // belonging to the prior account, even if the slot stayed live.
+            let currentAuth: LoadedAuth?
+            do {
+                currentAuth = try await Self.loadAuthData(
+                    source: source, profileID: context.id, isLive: currentlyLive)
+            } catch {
+                guard !Task.isCancelled, self.refreshGeneration == generation else { return }
+                diagnostics[context.id]?.lastError = error.localizedDescription
+                diagnostics[context.id]?.lastDecision = "auth-unavailable"
+                self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
+                self.store.updateStatus(context.id, .stale(context.cached))
+                return
+            }
             guard !Task.isCancelled, self.refreshGeneration == generation else { return }
-            if !stillAvailable {
+            guard !self.store.isAuthMutationInProgress() else { return }
+            if currentAuth == nil {
                 let overrideDecision = context.cached != nil ? "relogin-needed" : "not-set-up"
                 diagnostics[context.id]?.lastDecision = overrideDecision
                 self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
                 self.store.updateStatus(context.id, context.cached.map { .reloginNeeded($0) } ?? .notSetUp)
+                return
+            }
+            if context.usesReadOnlyLiveAuth, currentAuth?.isReadOnlyLive != true {
+                // Desktop may have switched accounts or its token may have
+                // expired during the query. A fallback saved blob is not proof
+                // that this result still belongs to the current live session.
+                diagnostics[context.id]?.lastDecision = "live-read-only-source-changed"
+                self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
+                self.store.updateStatus(context.id, .stale(context.cached))
+                return
+            }
+            if let fetchedAuth = fetchGroup.authData, let currentAuth,
+               !AuthBlob.identityMatches(fetchedAuth, currentAuth.data) {
+                return
+            }
+            if !context.usesReadOnlyLiveAuth {
+                self.store.clearRenewalStateIfCredentialMoved(
+                    for: context.id,
+                    currentCredentialFingerprint: currentAuth.flatMap { Self.credentialFingerprint(from: $0.data) })
+            }
+            if context.usesReadOnlyLiveAuth, case let .available(snapshot) = status {
+                diagnostics[context.id]?.lastDecision = "available-live-read-only"
+                self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
+                self.store.updateLiveUsageSnapshot(context.id, snapshot)
                 return
             }
             self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
@@ -253,11 +304,19 @@ final class UsageProvider {
             expiresAt: Date().addingTimeInterval(60),
             createdAt: Date())
         await self.pendingLeaseRelease?.value
+        guard !Task.isCancelled, self.refreshGeneration == generation,
+              !self.store.isAuthMutationInProgress() else { return }
         guard await Self.claimLease(
-            profileIDs: fetchGroup.contexts.map(\.id), reservation: reservation) else {
+            profileIDs: fetchGroup.contexts.map(\.id), reservation: reservation, paths: self.paths) else {
             for context in fetchGroup.contexts {
                 await finalize(context, .stale(context.cached), decision: "reserved")
             }
+            return
+        }
+        guard !Task.isCancelled, self.refreshGeneration == generation,
+              !self.store.isAuthMutationInProgress() else {
+            await Self.removeLease(
+                profileIDs: fetchGroup.contexts.map(\.id), expectedToken: reservation.token, paths: self.paths)
             return
         }
         for context in fetchGroup.contexts {
@@ -271,17 +330,31 @@ final class UsageProvider {
         // `do`/`catch` below.
 
         do {
-            let snapshot = try await CLIUsageFetcher.fetch(
-                profileId: fetchGroup.contexts[0].id, authData: authData, codexConfigURL: self.store.codexConfigURL(),
+            let result = try await CLIUsageFetcher.fetchResult(
+                profileId: fetchGroup.contexts[0].id, authData: fetchGroup.queryAuthData ?? authData,
+                codexConfigURL: self.store.codexConfigURL(),
+                environment: source.paths.environment,
                 clientVersion: AppInfo.version)
+            await self.persistRotatedAuth(result.updatedAuthData, original: authData, group: fetchGroup, source: source)
             for context in fetchGroup.contexts {
                 diagnostics[context.id]?.lastError = nil
-                await finalize(context, .available(snapshot), decision: "available")
+                await finalize(context, .available(result.snapshot), decision: "available")
                 AppLogger.info("Usage refresh succeeded", metadata: ["profile": context.id])
             }
         } catch is CancellationError {
             await self.releaseLease(fetchGroup.contexts.map(\.id), expectedToken: reservation.token)
             return
+        } catch let error as CLIUsageOperationError {
+            await self.persistRotatedAuth(error.updatedAuthData, original: authData, group: fetchGroup, source: source)
+            for context in fetchGroup.contexts {
+                diagnostics[context.id]?.lastError = error.localizedDescription
+                await finalize(
+                    context,
+                    error.isAuthRequired ? .reloginNeeded(context.cached) : .stale(context.cached),
+                    decision: error.isAuthRequired ? "relogin-needed" : "stale")
+                AppLogger.warning("Usage refresh failed",
+                                  metadata: ["profile": context.id, "error": error.localizedDescription])
+            }
         } catch let error as CodexRPCError where error.isAuthRequired {
             for context in fetchGroup.contexts {
                 diagnostics[context.id]?.lastError = error.localizedDescription
@@ -316,7 +389,7 @@ final class UsageProvider {
     /// `refreshGroup` after the lease is claimed, since `removeLease` is
     /// `async` and `defer` bodies cannot contain `await`.
     private func releaseLease(_ profileIDs: [String], expectedToken: String) async {
-        await Self.removeLease(profileIDs: profileIDs, expectedToken: expectedToken)
+        await Self.removeLease(profileIDs: profileIDs, expectedToken: expectedToken, paths: self.paths)
         for id in profileIDs where self.activeLeases[id] == expectedToken {
             self.activeLeases.removeValue(forKey: id)
         }
@@ -327,10 +400,9 @@ final class UsageProvider {
     /// unknown-but-real and must not be clobbered with an empty/partial one.
     private struct CacheDecodeFailed: Error {}
 
-    private nonisolated static func claimLease(
-        profileIDs: [String], reservation: LeaseReservation
+    nonisolated static func claimLease(
+        profileIDs: [String], reservation: LeaseReservation, paths: AppPaths
     ) async -> Bool {
-        let paths = AppPaths()
         do {
             try CacheLock.withLock(at: paths.cacheLockURL) {
                 var cache: UsageCache
@@ -365,10 +437,9 @@ final class UsageProvider {
         }
     }
 
-    private nonisolated static func removeLease(
-        profileIDs: [String], expectedToken: String
+    nonisolated static func removeLease(
+        profileIDs: [String], expectedToken: String, paths: AppPaths
     ) async {
-        let paths = AppPaths()
         try? CacheLock.withLock(at: paths.cacheLockURL) {
             var cache: UsageCache
             switch Self.loadCache(paths: paths) {
@@ -425,22 +496,57 @@ final class UsageProvider {
     /// Loads the auth blob off the main actor. `nonisolated` so that awaiting it
     /// from the main actor runs the body on the global concurrent executor,
     /// keeping the potentially-blocking file/Keychain syscall off the main thread.
-    private nonisolated static func loadAuthData(
-        source: ProfileStore.UsageAuthSource, profileID: String, isLive: Bool
-    ) async throws -> Data? {
-        if isLive {
-            guard FileManager.default.fileExists(atPath: source.liveAuthURL.path) else { return nil }
-            return try Data(contentsOf: source.liveAuthURL)
-        }
-        return try source.vault.loadAuthBlob(profileID: profileID)
+    struct LoadedAuth {
+        let data: Data
+        let queryData: Data
+        let usesLiveAuth: Bool
+        let isReadOnlyLive: Bool
     }
 
-    /// Checks a non-live profile's auth-blob availability off the main actor,
-    /// mirroring the threading of `loadAuthData` so a Keychain consent prompt
-    /// cannot block the main thread.
-    private nonisolated static func loadAuthAvailability(
-        source: ProfileStore.UsageAuthSource, profileID: String
-    ) async -> Bool {
-        ((try? source.vault.authBlobAvailability(profileID: profileID)) ?? .missing) == .present
+    nonisolated static func loadAuthData(
+        source: ProfileStore.UsageAuthSource, profileID: String, isLive: Bool
+    ) async throws -> LoadedAuth? {
+        if let saved = try source.vault.loadAuthBlob(profileID: profileID) {
+            // A plan change or Desktop token rotation can leave an independent
+            // saved session stale. Use the matching active Desktop access token
+            // only while its JWT is valid, with its real refresh token removed.
+            if isLive, let live = try? Data(contentsOf: source.liveAuthURL),
+               AuthBlob.identityMatches(saved, live), let query = ReadOnlyUsageAuth.prepare(from: live) {
+                return LoadedAuth(data: live, queryData: query, usesLiveAuth: true, isReadOnlyLive: true)
+            }
+            return LoadedAuth(data: saved, queryData: saved, usesLiveAuth: false, isReadOnlyLive: false)
+        }
+        // Without a saved identity there is no proof that this slot owns the
+        // live account. Never borrow another account or an unknown live session.
+        return nil
+    }
+
+    private func persistRotatedAuth(
+        _ updated: Data?, original: Data, group: RefreshGroup, source: ProfileStore.UsageAuthSource
+    ) async {
+        guard let updated else { return }
+        // All child writes from a live read-only query are disposable, including
+        // errors. Neither the vault nor Desktop auth can receive that output.
+        guard !group.contexts.contains(where: \.usesReadOnlyLiveAuth) else { return }
+        // Persist a successfully rotated token even when the refresh was
+        // cancelled after its network request. The CAS preserves any newer
+        // login/deletion while preventing cancellation from discarding rotation.
+        let profileIDs = group.contexts.map(\.id)
+        let liveURL = group.contexts.contains(where: \.usesLiveAuth) ? source.liveAuthURL : nil
+        await Self.persistRotatedAuth(
+            updated, original: original, profileIDs: profileIDs, vault: source.vault, liveAuthURL: liveURL)
+    }
+
+    private nonisolated static func persistRotatedAuth(
+        _ updated: Data, original: Data, profileIDs: [String], vault: AuthVault, liveAuthURL: URL?
+    ) async {
+        do {
+            _ = try AuthCredentialUpdate.persistIfUnchanged(
+                originalData: original, updatedData: updated,
+                profileIDs: profileIDs, vault: vault, liveAuthURL: liveAuthURL)
+        } catch {
+            AppLogger.warning("Could not save Codex's rotated credential",
+                              metadata: ["error": error.localizedDescription])
+        }
     }
 }

@@ -4,6 +4,7 @@
 
 - macOS 14+
 - Xcode.app. The test runner uses SwiftPM and Swift Testing; the scripts set `DEVELOPER_DIR=/Applications/Xcode.app` when available.
+- App builds can also use compatible Command Line Tools. Set `CODEX_PROFILE_SDK` to an installed SDK path for `build.sh`, `Scripts/package_preview.sh`, and the test runners. On the current machine, macOS 26.5 builds successfully; the default macOS 27 SDK lacks SwiftUI macros. The Swift unit suite still requires XCTest from full Xcode.
 - [ChatGPT](https://openai.com/codex/) with Codex Desktop installed (or `CODEX_APP` / `CODEX_CLI` overrides)
 
 ## Build
@@ -48,6 +49,28 @@ Integration tests are hermetic: temporary home directory, fake Codex binaries, f
 
 ## Run
 
+For a Finder-launchable preview, run `bash Scripts/package_preview.sh` and open
+`.build/Codex Multi Switcher Preview.app`. Its compiled entry point always selects
+`~/Library/Application Support/Codex Multi Switcher Preview` as the profile home,
+and its menu bar item shows remaining five-hour and weekly usage percentages. It starts with separate profiles and cannot
+register production login or renewal agents. This is a development build, not
+the signed production app. Its importer explicitly reads profile names from the
+real user's original app folder; it never reads original credentials. Use Set Up
+for a separate sign-in to each account. Desktop switching is blocked in Preview,
+because its separate auth home does not control the user's running Codex app.
+Outside Preview, import defaults to the selected profile home and may copy
+accessible legacy credentials after review.
+The optional `--launch-at-login` argument keeps the settings window closed when
+a login agent starts Preview; the menu bar item still appears.
+
+`bash Scripts/package_local.sh` builds an ad hoc signed local app. It uses the
+same private file vault and profiles as Preview, while its compiled entry point
+sets `CODEX_PROFILE_LIVE_HOME` to the real `~/.codex` so account switching targets
+the running Codex Desktop app. This option is for personal use on the machine
+where it was built; it has no Developer ID signature, notarization, or Keychain
+access group. Do not run Preview and Local simultaneously against the shared
+profile home. The original app can remain installed as a fallback.
+
 ```bash
 codex-multi-switcher    # menu bar app
 codex-profile --help      # CLI helper
@@ -75,6 +98,7 @@ The public key must be set as `SPARKLE_ED_PUBLIC_KEY` in your environment for re
 |---|---|
 | `CODEX_PROFILE_HOME` | Home root for profile-switcher and Codex data. Defaults to the macOS user home; config is stored in `<root>/.codex-multi-switcher/`. |
 | `CODEX_PROFILE_TEST_HOME` | Isolated home root for development and test runs. Config is stored in `<root>/.codex-multi-switcher/`. |
+| `CODEX_PROFILE_LIVE_HOME` | Override for the active Codex home. The compiled Local app sets this to the current user's real `~/.codex` while its profile store stays isolated. |
 | `CODEX_APP` | Optional path to the Codex Desktop app bundle. Without it, the helper finds the installed `com.openai.codex` bundle, including ChatGPT.app and legacy Codex.app. |
 | `CODEX_CLI` | Path to Codex CLI binary |
 | `CODEX_BUNDLED_CLI` | Optional path to the app's bundled `codex` CLI |

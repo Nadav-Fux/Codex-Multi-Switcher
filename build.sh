@@ -27,6 +27,11 @@ if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
   export DEVELOPER_DIR=/Applications/Xcode.app
 fi
 
+SDK_ARGS=()
+if [[ -n "${CODEX_PROFILE_SDK:-}" ]]; then
+  SDK_ARGS=(--sdk "$CODEX_PROFILE_SDK")
+fi
+
 has_signing_identity() {
   local identity="${1:-}"
   [[ -n "$identity" ]] || return 1
@@ -73,8 +78,8 @@ HELPER_TMP="$(mktemp "$OUT_DIR/.codex-profile.XXXXXX")"
 trap 'rm -f "$OUT_TMP" "$HELPER_TMP"' EXIT
 
 log "Building CodexMultiSwitcher..."
-swift build -c release --product CodexMultiSwitcher --scratch-path "$BUILD_DIR"
-BIN_DIR="$(swift build -c release --scratch-path "$BUILD_DIR" --show-bin-path)"
+swift build -c release --product CodexMultiSwitcher --scratch-path "$BUILD_DIR" ${SDK_ARGS[@]+"${SDK_ARGS[@]}"}
+BIN_DIR="$(swift build -c release --scratch-path "$BUILD_DIR" ${SDK_ARGS[@]+"${SDK_ARGS[@]}"} --show-bin-path)"
 cp "$BIN_DIR/CodexMultiSwitcher" "$OUT_TMP"
 
 chmod +x "$OUT_TMP"
@@ -83,7 +88,7 @@ verify_signature "$OUT_TMP"
 mv -f "$OUT_TMP" "$OUT"
 
 log "Building helper..."
-swift build -c release --product codex-profile --scratch-path "$BUILD_DIR"
+swift build -c release --product codex-profile --scratch-path "$BUILD_DIR" ${SDK_ARGS[@]+"${SDK_ARGS[@]}"}
 cp "$BIN_DIR/codex-profile" "$HELPER_TMP"
 chmod +x "$HELPER_TMP"
 codesign "${CODESIGN_ARGS[@]}" "$HELPER_TMP"

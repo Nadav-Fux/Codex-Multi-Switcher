@@ -2,52 +2,109 @@ import Cocoa
 import Foundation
 
 enum IconRenderer {
-    private static let iconHeight: CGFloat = 20
+    private static let iconHeight: CGFloat = 23
     private static let rowHeight = Self.iconHeight / 2
-    private static let textFontSize: CGFloat = 8.5
-    private static let horizontalMargin: CGFloat = 1
+    private static let textFontSize: CGFloat = 10
+    private static let labelFontSize: CGFloat = 8
+    private static let labelGap: CGFloat = 3
+    private static let horizontalMargin: CGFloat = 2
     private static let emptyIconSize = CGSize(width: 18, height: 18)
     private static let scale: CGFloat = 2
     private static let emptyIconName = "codex-multi-switcher-menu-icon-empty.png"
 
     // MARK: - Public
 
-    static func render(primaryPercent: Int, secondaryPercent: Int) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: Self.textFontSize, weight: .semibold)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.black,
-        ]
-
-        let topStr = NSAttributedString(string: String(format: "%02d", primaryPercent), attributes: attrs)
-        let bottomStr = NSAttributedString(string: String(format: "%02d", secondaryPercent), attributes: attrs)
+    static func render(primaryRemainingPercent: Int?, secondaryRemainingPercent: Int?,
+                       primaryShowsUsed: Bool = false, secondaryShowsUsed: Bool = false,
+                       cached: Bool = false, weeklyOnly: Bool = false,
+                       weeklyResetAt: Date? = nil, showResetCountdown: Bool = true) -> NSImage {
+        if weeklyOnly {
+            return Self.renderWeeklyOnly(remainingPercent: secondaryRemainingPercent,
+                showsUsed: secondaryShowsUsed, cached: cached, resetAt: weeklyResetAt,
+                showResetCountdown: showResetCountdown)
+        }
+        let primaryValue = primaryRemainingPercent.map {
+            let remaining = min(100, max(0, $0))
+            return primaryShowsUsed ? 100 - remaining : remaining
+        }
+        let secondaryValue = secondaryRemainingPercent.map {
+            let remaining = min(100, max(0, $0))
+            return secondaryShowsUsed ? 100 - remaining : remaining
+        }
+        let primaryColor = cached ? Self.cachedQuotaColor : primaryRemainingPercent.map(Self.color(for:)) ?? Self.cachedQuotaColor
+        let secondaryColor = cached ? Self.cachedQuotaColor : secondaryRemainingPercent.map(Self.color(for:)) ?? Self.cachedQuotaColor
+        let font = NSFont.monospacedDigitSystemFont(ofSize: Self.textFontSize, weight: .bold)
+        let topStr = NSAttributedString(
+            string: primaryValue.map { String(format: "%02d", $0) } ?? "—",
+            attributes: Self.quotaTextAttributes(font: font, color: primaryColor))
+        let bottomStr = NSAttributedString(
+            string: secondaryValue.map { String(format: "%02d", $0) } ?? "—",
+            attributes: Self.quotaTextAttributes(font: font, color: secondaryColor))
+        let labelFont = NSFont.systemFont(ofSize: Self.labelFontSize, weight: .medium)
+        let topLabel = NSAttributedString(
+            string: "5h", attributes: Self.quotaTextAttributes(font: labelFont, color: primaryColor))
+        let bottomLabel = NSAttributedString(
+            string: "w", attributes: Self.quotaTextAttributes(font: labelFont, color: secondaryColor))
         let topSize = topStr.size()
         let bottomSize = bottomStr.size()
-
-        let topUrgency = Urgency(percent: primaryPercent)
-        let bottomUrgency = Urgency(percent: secondaryPercent)
-
-        let contentWidth = max(
-            Self.rowWidth(textSize: topSize, urgency: topUrgency),
-            Self.rowWidth(textSize: bottomSize, urgency: bottomUrgency))
+        let numberWidth = max(topSize.width, bottomSize.width)
+        let labelWidth = max(topLabel.size().width, bottomLabel.size().width)
+        let contentWidth = numberWidth + Self.labelGap + labelWidth
         let imageWidth = ceil(contentWidth + Self.horizontalMargin * 2)
         let size = NSSize(width: imageWidth, height: Self.iconHeight)
 
         let image = NSImage(size: size, flipped: true) { _ in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-
-            let rightEdge = imageWidth - Self.horizontalMargin
-
-            Self.drawRow(attrStr: topStr, textSize: topSize, urgency: topUrgency,
-                         rightEdge: rightEdge, rowY: 0, in: ctx)
-            Self.drawRow(attrStr: bottomStr, textSize: bottomSize, urgency: bottomUrgency,
-                         rightEdge: rightEdge, rowY: Self.rowHeight, in: ctx)
+            let numberRightEdge = Self.horizontalMargin + numberWidth
+            Self.drawRow(topStr, textSize: topSize, rightEdge: numberRightEdge, rowY: 0)
+            Self.drawRow(bottomStr, textSize: bottomSize, rightEdge: numberRightEdge, rowY: Self.rowHeight)
+            let labelX = numberRightEdge + Self.labelGap
+            Self.drawLabel(topLabel, x: labelX, rowY: 0)
+            Self.drawLabel(bottomLabel, x: labelX, rowY: Self.rowHeight)
 
             return true
         }
 
-        image.isTemplate = true
+        // Template images discard the traffic-light colors in the menu bar.
+        image.isTemplate = false
+        let primaryDescription = primaryValue.map { "5 hours \($0) percent \(primaryShowsUsed ? "used" : "remaining")" } ?? "5 hours unavailable"
+        let secondaryDescription = secondaryValue.map { "week \($0) percent \(secondaryShowsUsed ? "used" : "remaining")" } ?? "week unavailable"
+        image.accessibilityDescription = "Codex quota: \(cached ? "cached observations, " : "")\(primaryDescription), \(secondaryDescription)"
         return image
+    }
+
+    private static func renderWeeklyOnly(remainingPercent: Int?, showsUsed: Bool, cached: Bool,
+                                         resetAt: Date?, showResetCountdown: Bool) -> NSImage {
+        let remaining = remainingPercent.map { min(100, max(0, $0)) }
+        let value = remaining.map { showsUsed ? 100 - $0 : $0 }
+        let color = cached ? Self.cachedQuotaColor : remaining.map(Self.color(for:)) ?? Self.cachedQuotaColor
+        let number = NSAttributedString(string: value.map { "\($0)%" } ?? "—",
+            attributes: Self.quotaTextAttributes(font: .monospacedDigitSystemFont(ofSize: 12, weight: .bold), color: color))
+        var suffix = "w"
+        if showResetCountdown, let countdown = Self.weeklyCountdown(resetAt) { suffix += " · " + countdown }
+        let detail = NSAttributedString(string: suffix,
+            attributes: Self.quotaTextAttributes(font: .monospacedDigitSystemFont(ofSize: 8, weight: .medium), color: color))
+        let width = ceil(number.size().width + detail.size().width + 7)
+        let image = NSImage(size: NSSize(width: width, height: Self.iconHeight), flipped: true) { _ in
+            number.draw(at: NSPoint(x: 2, y: (Self.iconHeight - number.size().height) / 2))
+            detail.draw(at: NSPoint(x: 5 + number.size().width, y: (Self.iconHeight - detail.size().height) / 2))
+            return true
+        }
+        image.isTemplate = false
+        let amount = value.map { "week \($0) percent \(showsUsed ? "used" : "remaining")" } ?? "week unavailable"
+        let resetDescription = showResetCountdown ? resetAt.map { ", resets \($0.formatted(date: .complete, time: .shortened))" } ?? "" : ""
+        image.accessibilityDescription = "Codex quota: \(cached ? "cached observation, " : "")\(amount)\(resetDescription)"
+        return image
+    }
+
+    private static func weeklyCountdown(_ resetAt: Date?, now: Date = Date()) -> String? {
+        guard let resetAt else { return nil }
+        let seconds = resetAt.timeIntervalSince(now)
+        guard seconds.isFinite else { return nil }
+        if seconds <= 0 { return "reset due" }
+        if seconds > 365 * 86400 { return ">365d" }
+        let hours = Int(seconds) / 3600
+        if hours >= 24 { return "\(hours / 24)d\(hours % 24)h" }
+        return hours == 0 ? "<1h" : "\(hours)h"
     }
 
     static func renderEmpty() -> NSImage {
@@ -55,73 +112,43 @@ enum IconRenderer {
             ?? Self.renderFallbackEmpty()
     }
 
-    // MARK: - Urgency
+    // Light colors keep small glyphs legible on dark and saturated menu backgrounds.
+    static let cachedQuotaColor = NSColor(srgbRed: 0.77, green: 0.80, blue: 0.85, alpha: 1)
+    static let lowQuotaColor = NSColor(srgbRed: 1.00, green: 0.67, blue: 0.72, alpha: 1)
+    static let midQuotaColor = NSColor(srgbRed: 1.00, green: 0.86, blue: 0.44, alpha: 1)
+    static let highQuotaColor = NSColor(srgbRed: 0.50, green: 0.94, blue: 0.69, alpha: 1)
 
-    private enum Urgency {
-        case normal, warning, critical
+    // The thresholds always describe remaining quota, independently of display mode.
+    static func color(for remainingPercent: Int) -> NSColor {
+        if remainingPercent < 20 { return Self.lowQuotaColor }
+        if remainingPercent < 50 { return Self.midQuotaColor }
+        return Self.highQuotaColor
+    }
 
-        init(percent: Int) {
-            if percent >= 90 { self = .critical }
-            else if percent >= 70 { self = .warning }
-            else { self = .normal }
-        }
-
-        var boxHorizontalPadding: CGFloat? {
-            switch self {
-            case .normal: return nil
-            case .warning: return 1.5
-            case .critical: return 2.0
-            }
-        }
-
-        var cornerRadius: CGFloat {
-            switch self {
-            case .normal: return 0
-            case .warning: return 2.0
-            case .critical: return 2.5
-            }
-        }
+    static func quotaTextAttributes(font: NSFont, color: NSColor) -> [NSAttributedString.Key: Any] {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.88)
+        shadow.shadowBlurRadius = 1.25
+        shadow.shadowOffset = .zero
+        return [.font: font, .foregroundColor: color, .shadow: shadow,
+                .strokeColor: NSColor.white.withAlphaComponent(0.8), .strokeWidth: -0.8]
     }
 
     // MARK: - Row Drawing
 
-    private static func rowWidth(textSize: CGSize, urgency: Urgency) -> CGFloat {
-        guard let padding = urgency.boxHorizontalPadding else { return textSize.width }
-        return textSize.width + padding * 2
-    }
-
     private static func drawRow(
-        attrStr: NSAttributedString,
+        _ attrStr: NSAttributedString,
         textSize: CGSize,
-        urgency: Urgency,
         rightEdge: CGFloat,
-        rowY: CGFloat,
-        in ctx: CGContext
+        rowY: CGFloat
     ) {
         let textY = rowY + (Self.rowHeight - textSize.height) / 2
+        attrStr.draw(at: NSPoint(x: rightEdge - textSize.width, y: textY))
+    }
 
-        guard let padding = urgency.boxHorizontalPadding else {
-            attrStr.draw(at: NSPoint(x: rightEdge - textSize.width, y: textY))
-            return
-        }
-
-        let boxWidth = textSize.width + padding * 2
-        let boxHeight = Self.rowHeight
-        let boxX = rightEdge - boxWidth
-        let boxRect = CGRect(x: boxX, y: rowY, width: boxWidth, height: boxHeight)
-        let boxPath = CGPath(
-            roundedRect: boxRect,
-            cornerWidth: urgency.cornerRadius,
-            cornerHeight: urgency.cornerRadius,
-            transform: nil)
-
-        ctx.saveGState()
-        ctx.setFillColor(NSColor.black.cgColor)
-        ctx.addPath(boxPath)
-        ctx.fillPath()
-        ctx.setBlendMode(.clear)
-        attrStr.draw(at: NSPoint(x: boxX + padding, y: textY))
-        ctx.restoreGState()
+    private static func drawLabel(_ label: NSAttributedString, x: CGFloat, rowY: CGFloat) {
+        let textY = rowY + (Self.rowHeight - label.size().height) / 2
+        label.draw(at: NSPoint(x: x, y: textY))
     }
 
     // MARK: - Empty Icon

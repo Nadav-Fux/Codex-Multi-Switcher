@@ -137,9 +137,19 @@ if [[ -f "$ROOT_DIR/appcast.xml" ]]; then
   cp "$ROOT_DIR/appcast.xml" "$APPCAST_WORK_DIR/appcast.xml"
 fi
 
-"$SPARKLE_DIR/bin/generate_appcast" \
-  --download-url-prefix "https://github.com/Nadav-Fux/codex-multi-switcher/releases/download/v${VERSION}/" \
-  "$APPCAST_WORK_DIR"
+if [[ -n "${SPARKLE_ED_PRIVATE_KEY:-}" ]]; then
+  # Sparkle supports reading its EdDSA private key from stdin in CI, so the
+  # secret never needs to be written to a file or placed in process arguments.
+  printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | \
+    "$SPARKLE_DIR/bin/generate_appcast" \
+      --ed-key-file - \
+      --download-url-prefix "https://github.com/Nadav-Fux/codex-multi-switcher/releases/download/v${VERSION}/" \
+      "$APPCAST_WORK_DIR"
+else
+  "$SPARKLE_DIR/bin/generate_appcast" \
+    --download-url-prefix "https://github.com/Nadav-Fux/codex-multi-switcher/releases/download/v${VERSION}/" \
+    "$APPCAST_WORK_DIR"
+fi
 
 cp "$APPCAST_WORK_DIR/appcast.xml" "$ROOT_DIR/appcast.xml"
 if grep -q '<enclosure' "$ROOT_DIR/appcast.xml" && grep '<enclosure' "$ROOT_DIR/appcast.xml" | grep -v 'sparkle:edSignature=' | grep -q .; then
