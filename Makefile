@@ -4,7 +4,7 @@ BUILD_OUT ?= /tmp/codex-multi-switcher-build-check
 APP_IDENTITY ?= -
 CLI_INSTALL_PATH ?= $(HOME)/.local/bin/codex-profile
 
-.PHONY: build check test test-unit test-integration format install-cli
+.PHONY: build check test test-unit test-integration test-claude test-usage format install-cli
 
 # Installs the CLI with an ad-hoc signature by default. A loose CLI is
 # file-vault-only: it lacks the packaged helper's Keychain Sharing entitlement
@@ -23,12 +23,20 @@ format:
 build:
 	./build.sh "$(BUILD_OUT)"
 
-test: test-unit test-integration
+test: test-unit test-integration test-claude test-usage
 
 test-unit:
 	./Tests/run-swift-tests.sh
 
 test-integration:
 	./Tests/run-integration-tests.sh
+
+test-claude:
+	./Tests/run-claude-tests.sh
+	python3 Tests/ClaudeStatuslineBridgeTests.py
+
+test-usage:
+	./Tests/run-usage-normalization-tests.sh
+	./Tests/run-active-usage-tests.sh
 
 check: test build

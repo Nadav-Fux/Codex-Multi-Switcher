@@ -370,6 +370,7 @@ mkdir -p \
 
 cp "$APP_BINARY" "$APP_BUNDLE/Contents/MacOS/CodexMultiSwitcher"
 cp "$HELPER_BINARY" "$HELPER_APP_EXECUTABLE"
+cp "$ROOT_DIR/Scripts/ClaudeStatuslineBridge.py" "$APP_BUNDLE/Contents/Resources/ClaudeStatuslineBridge.py"
 ln -s "CodexProfileHelper.app/Contents/MacOS/codex-profile" "$HELPER_COMPAT_LINK"
 chmod +x "$APP_BUNDLE/Contents/MacOS/CodexMultiSwitcher" "$HELPER_APP_EXECUTABLE"
 cp "$ROOT_DIR/Resources/LaunchAgents/com.codexmultiswitcher.app.renew.plist" \
@@ -443,7 +444,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
   <key>CodexMultiSwitcherGitCommit</key>
   <string>$GIT_COMMIT</string>
   <key>SUFeedURL</key>
-  <string>https://raw.githubusercontent.com/Nadav-Fux/codex-multi-switcher/main/appcast.xml</string>
+  <string>https://github.com/Nadav-Fux/codex-multi-switcher/releases/latest/download/appcast.xml</string>
   <key>SUEnableAutomaticChecks</key>
   <true/>
   <key>SUScheduledCheckInterval</key>

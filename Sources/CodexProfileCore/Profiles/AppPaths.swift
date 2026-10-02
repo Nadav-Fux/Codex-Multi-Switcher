@@ -27,7 +27,12 @@ public struct AppPaths {
     }
 
     public var liveCodexHome: URL {
-        self.userHome.appendingPathComponent(".codex", isDirectory: true)
+        // A locally signed build can keep its own file vault while switching
+        // the real desktop account. The normal and test paths remain unchanged.
+        if let path = self.environment["CODEX_PROFILE_LIVE_HOME"], !path.isEmpty {
+            return URL(fileURLWithPath: path).standardizedFileURL
+        }
+        return self.userHome.appendingPathComponent(".codex", isDirectory: true)
     }
 
     public var configURL: URL {

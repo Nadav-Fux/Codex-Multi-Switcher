@@ -49,7 +49,7 @@ enum CodexProfileCLI {
     private static let paths = AppPaths()
     private static let configStore = ProfileConfigStore(paths: Self.paths)
     private static let vault = Self.makeVault()
-    private static let version = "0.1.0"
+    private static let version = "0.2.1"
     private static let signedSmokeServicePrefix = "com.codexmultiswitcher.app.auth.smoke."
     private static let signedSmokeLegacyServicePrefix = "com.codexmultiswitcher.app.auth.legacy-smoke."
 
@@ -320,17 +320,34 @@ enum CodexProfileCLI {
 
         self.note("Codex profile doctor")
         self.note("")
+        let lifecycle = CodexDesktopLifecycle()
+        self.note("Codex Desktop compatibility:")
+        for line in lifecycle.compatibilitySummary() {
+            self.note("  \(line)")
+        }
+        if let installation = try? lifecycle.resolveInstallation(),
+           let appPath = installation.appPath {
+            let signatureStatus = self.runAndWait(
+                "/usr/bin/codesign",
+                arguments: ["--verify", "--deep", "--strict", appPath],
+                quiet: true)
+            self.note("  code_signature: \(signatureStatus == 0 ? "verified" : "verification failed (status \(signatureStatus))")")
+        } else {
+            self.note("  code_signature: unavailable (desktop bundle not resolved)")
+        }
+        self.note("")
         if let desktop = try? self.codexAppBinary() {
             self.note("Desktop: \(desktop)")
         } else {
             self.note("Desktop: missing (install ChatGPT or set CODEX_APP)")
         }
 
-        if let cli = try? self.findCodexCLI() {
+        do {
+            let cli = try self.findCodexCLI()
             self.note("CLI: \(cli)")
             _ = self.runAndWait(cli, arguments: ["--version"])
-        } else {
-            self.note("CLI: missing")
+        } catch {
+            self.note("CLI: unavailable (\(error.localizedDescription))")
         }
 
         let diagnostics = self.vault.diagnostics()
@@ -876,15 +893,21 @@ enum CodexProfileCLI {
                 var groupedData: [String: Data] = [:]
 
                 func authData(for id: String) -> Data? {
-                    if id == activeProfile,
+                    if vaultReadable {
+                        do {
+                            switch try self.loadAuthBlobBounded(vault, profileID: id, bound: readBound) {
+                            case .data(let data): if let data { return data }
+                            default: return nil
+                            }
+                        } catch { return nil }
+                    }
+                    // Local file-vault sessions are independent of the desktop login.
+                    if self.environment("CODEX_PROFILE_FILE_AUTH_STORE_DIR") == nil,
+                       id == activeProfile,
                        FileManager.default.fileExists(atPath: liveAuthURL.path) {
                         return try? Data(contentsOf: liveAuthURL)
                     }
-                    guard vaultReadable else { return nil }
-                    switch try? self.loadAuthBlobBounded(vault, profileID: id, bound: readBound) {
-                    case .data(let data): return data
-                    default: return nil
-                    }
+                    return nil
                 }
 
                 for profile in profiles {
@@ -935,13 +958,23 @@ enum CodexProfileCLI {
                             }
                         }
                         do {
-                            let snapshot = try await CLIUsageFetcher.fetch(
+                            let result = try await CLIUsageFetcher.fetchResult(
                                 profileId: fetchGroup.profileIDs[0],
                                 authData: fetchGroup.authData,
                                 codexConfigURL: configURL,
                                 clientVersion: version)
-                            return (fetchGroup.profileIDs, snapshot, nil)
+                            if let rotated = result.updatedAuthData {
+                                _ = try AuthCredentialUpdate.persistIfUnchanged(
+                                    originalData: fetchGroup.authData, updatedData: rotated,
+                                    profileIDs: fetchGroup.profileIDs, vault: vault)
+                            }
+                            return (fetchGroup.profileIDs, result.snapshot, nil)
                         } catch {
+                            if let operationError = error as? CLIUsageOperationError {
+                                _ = try? AuthCredentialUpdate.persistIfUnchanged(
+                                    originalData: fetchGroup.authData, updatedData: operationError.updatedAuthData,
+                                    profileIDs: fetchGroup.profileIDs, vault: vault)
+                            }
                             return (fetchGroup.profileIDs, nil, error.localizedDescription)
                         }
                     }

@@ -4,6 +4,7 @@ public enum DuplicateAwareAuthSaverError: LocalizedError, Equatable {
     case duplicate(existingLabel: String)
     case missingFingerprint
     case staleWrite(profileLabel: String)
+    case targetAlreadyHasAuth(profileLabel: String)
 
     public var errorDescription: String? {
         switch self {
@@ -13,11 +14,44 @@ public enum DuplicateAwareAuthSaverError: LocalizedError, Equatable {
             return "Saved auth does not contain enough account identity information."
         case .staleWrite(let profileLabel):
             return "Refusing to save: '\(profileLabel)' already holds a more recently refreshed credential for this account."
+        case .targetAlreadyHasAuth(let profileLabel):
+            return "Refusing to import over existing credentials for '\(profileLabel)'."
         }
     }
 }
 
 public enum DuplicateAwareAuthSaver {
+    /// Imports auth only when the destination slot is empty. The target check,
+    /// duplicate-account check, and write run under the vault's transaction
+    /// lock so an import can never replace a credential created after preview.
+    public static func saveIfMissing(
+        _ data: Data,
+        profileID targetProfileID: String,
+        profiles: [ProfileConfig],
+        vault: AuthVault
+    ) throws {
+        guard let newFingerprint = AuthBlob.identityFingerprint(from: data) else {
+            throw DuplicateAwareAuthSaverError.missingFingerprint
+        }
+
+        try vault.transact {
+            if try vault.loadAuthBlob(profileID: targetProfileID) != nil {
+                let label = profiles.first(where: { $0.id == targetProfileID })?.label ?? targetProfileID
+                throw DuplicateAwareAuthSaverError.targetAlreadyHasAuth(profileLabel: label)
+            }
+
+            for profile in profiles where profile.id != targetProfileID {
+                guard let existingData = try vault.loadAuthBlob(profileID: profile.id),
+                      AuthBlob.identityFingerprint(from: existingData) == newFingerprint else {
+                    continue
+                }
+                throw DuplicateAwareAuthSaverError.duplicate(existingLabel: profile.label)
+            }
+
+            try vault._saveAuthBlobUnlocked(data, profileID: targetProfileID)
+        }
+    }
+
     public static func save(
         _ data: Data,
         profileID targetProfileID: String,

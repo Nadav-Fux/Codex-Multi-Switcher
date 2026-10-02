@@ -1,5 +1,108 @@
 import Foundation
 
+/// A backend-owned earned reset. Its ID is opaque and must never be inferred
+/// from a date or array index when redeeming a credit.
+public struct BankedResetCredit: Codable, Equatable, Identifiable, Sendable {
+    public let id: String
+    public let status: String
+    public let resetType: String
+    public let grantedAt: Date?
+    public let expiresAt: Date?
+    public let title: String?
+    public let description: String?
+
+    public init(
+        id: String,
+        status: String,
+        resetType: String,
+        grantedAt: Date? = nil,
+        expiresAt: Date? = nil,
+        title: String? = nil,
+        description: String? = nil
+    ) {
+        self.id = id
+        self.status = status
+        self.resetType = resetType
+        self.grantedAt = grantedAt
+        self.expiresAt = expiresAt
+        self.title = title
+        self.description = description
+    }
+
+    public func isRedeemable(now: Date = Date()) -> Bool {
+        !self.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && self.isAvailable
+            && self.resetType == "codexRateLimits"
+            && (self.expiresAt.map { $0 > now } ?? true)
+    }
+
+    public var isAvailable: Bool { self.status == "available" }
+}
+
+public enum BankedResetOutcome: String, Codable, Sendable {
+    case reset
+    case alreadyRedeemed
+    case nothingToReset
+    case noCredit
+
+    /// A successful redemption remains complete even if reading the updated
+    /// usage subsequently fails. Retrying it must keep the same idempotency key.
+    public var completedRedemption: Bool {
+        self == .reset || self == .alreadyRedeemed
+    }
+}
+
+public struct CLIUsageResult {
+    public let snapshot: UsageSnapshot
+    /// Changed, validated credentials read back from the isolated Codex home.
+    /// The caller must persist them only if the profile still has the input auth.
+    public let updatedAuthData: Data?
+
+    public init(snapshot: UsageSnapshot, updatedAuthData: Data?) {
+        self.snapshot = snapshot
+        self.updatedAuthData = updatedAuthData
+    }
+}
+
+public struct CLIBankedResetResult {
+    public let outcome: BankedResetOutcome
+    public let snapshot: UsageSnapshot?
+    public let updatedAuthData: Data?
+    /// An error refreshing usage after a known redemption result. This must not
+    /// turn a successful redemption into a fresh logical attempt.
+    public let refreshError: String?
+
+    public init(
+        outcome: BankedResetOutcome,
+        snapshot: UsageSnapshot?,
+        updatedAuthData: Data?,
+        refreshError: String?
+    ) {
+        self.outcome = outcome
+        self.snapshot = snapshot
+        self.updatedAuthData = updatedAuthData
+        self.refreshError = refreshError
+    }
+}
+
+/// A failed isolated operation may still have refreshed credentials. Preserve
+/// them using the same conditional-save rule as a successful operation.
+public struct CLIUsageOperationError: LocalizedError {
+    public let underlyingError: Error
+    public let updatedAuthData: Data
+
+    public init(underlyingError: Error, updatedAuthData: Data) {
+        self.underlyingError = underlyingError
+        self.updatedAuthData = updatedAuthData
+    }
+
+    public var errorDescription: String? { self.underlyingError.localizedDescription }
+
+    public var isAuthRequired: Bool {
+        (self.underlyingError as? CodexRPCError)?.isAuthRequired ?? false
+    }
+}
+
 public struct UsageSnapshot: Codable, Equatable {
     public let planType: String?
     public let creditsRemaining: Double?
@@ -10,6 +113,19 @@ public struct UsageSnapshot: Codable, Equatable {
     public let fetchedAt: Date
     public let primaryWindowDurationMins: Int?
     public let secondaryWindowDurationMins: Int?
+    /// Nil preserves the meaning of caches written before availability was recorded.
+    public let primaryWindowAvailable: Bool?
+    public let secondaryWindowAvailable: Bool?
+    public var hasPrimaryWindow: Bool { self.primaryWindowAvailable ?? true }
+    public var hasSecondaryWindow: Bool { self.secondaryWindowAvailable ?? true }
+    /// Nil means this Codex version did not report banked reset inventory.
+    public let bankedResetCount: Int?
+    /// Nil means dates were not returned. A nil entry means that reset has no expiry.
+    /// The backend may return fewer details than bankedResetCount.
+    public let bankedResetExpirations: [Date?]?
+    /// Detail rows with usable opaque IDs. Nil means details were not supplied.
+    /// The backend may cap this list; bankedResetCount remains authoritative.
+    public let bankedResetCredits: [BankedResetCredit]?
 
     public init(
         planType: String?,
@@ -20,7 +136,12 @@ public struct UsageSnapshot: Codable, Equatable {
         secondaryResetAt: Date?,
         fetchedAt: Date,
         primaryWindowDurationMins: Int? = nil,
-        secondaryWindowDurationMins: Int? = nil
+        secondaryWindowDurationMins: Int? = nil,
+        bankedResetCount: Int? = nil,
+        bankedResetExpirations: [Date?]? = nil,
+        bankedResetCredits: [BankedResetCredit]? = nil,
+        primaryWindowAvailable: Bool? = nil,
+        secondaryWindowAvailable: Bool? = nil
     ) {
         self.planType = planType
         self.creditsRemaining = creditsRemaining
@@ -31,6 +152,11 @@ public struct UsageSnapshot: Codable, Equatable {
         self.fetchedAt = fetchedAt
         self.primaryWindowDurationMins = primaryWindowDurationMins
         self.secondaryWindowDurationMins = secondaryWindowDurationMins
+        self.primaryWindowAvailable = primaryWindowAvailable
+        self.secondaryWindowAvailable = secondaryWindowAvailable
+        self.bankedResetCount = bankedResetCount
+        self.bankedResetExpirations = bankedResetExpirations
+        self.bankedResetCredits = bankedResetCredits
     }
 }
 

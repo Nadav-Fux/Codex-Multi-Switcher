@@ -157,9 +157,9 @@ struct ProfileHealth {
 
     private static func healthScore(for snapshot: UsageSnapshot) -> (score: Int, weeklyScore: Int, resetAt: Date?) {
         (
-            snapshot.primaryUsedPercent,
-            snapshot.secondaryUsedPercent,
-            snapshot.primaryResetAt
+            snapshot.hasPrimaryWindow ? snapshot.primaryUsedPercent : (snapshot.hasSecondaryWindow ? snapshot.secondaryUsedPercent : 100),
+            snapshot.hasSecondaryWindow ? snapshot.secondaryUsedPercent : 0,
+            snapshot.hasPrimaryWindow ? snapshot.primaryResetAt : snapshot.secondaryResetAt
         )
     }
 

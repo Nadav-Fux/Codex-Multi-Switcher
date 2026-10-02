@@ -5,8 +5,13 @@ import SwiftUI
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var claudeStatusItem: NSStatusItem?
+    private var claudeStore: ClaudeProfileStore!
+    private var claudeRefreshTimer: Timer?
     private var store: ProfileStore!
     private var usageProvider: UsageProvider!
+    private var resetScheduler: BankedResetScheduler!
+    private var isRenewing = false
     private var periodicRefreshTimer: Timer?
     private var menu: PersistentActionMenu!
     private weak var refreshMenuItem: PersistentRefreshMenuItem?
@@ -62,6 +67,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        if AppInfo.isLocalBuild {
+            guard !self.terminateIfLocalInstanceIsRunning() else { return }
+            LaunchAtLogin.migrateLegacyLaunchAgentIfNeeded()
+        }
         let environment = ProcessInfo.processInfo.environment
         if decision == .isolated {
             self.store = ProfileStore(
@@ -70,23 +79,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             self.store = ProfileStore(environment: environment)
         }
+        self.claudeStore = ClaudeProfileStore(environment: environment)
+        self.claudeStore.onChange = { [weak self] in
+            self?.updateClaudeIcon()
+            if self?.isMenuOpen == true { self?.rebuildMenu() }
+        }
         self.usageProvider = UsageProvider(store: self.store)
+        self.resetScheduler = BankedResetScheduler(store: self.store)
+        self.resetScheduler.canRun = { [weak self] in
+            guard let self else { return false }
+            return !self.usageProvider.isRefreshing && !self.isRenewing
+        }
+        self.resetScheduler.onCompletion = { [weak self] in
+            guard let self else { return }
+            self.updateIcon()
+            if self.isMenuOpen { self.rebuildMenu() }
+            self.hasPendingForcedRefresh = false
+            self.requestRefresh(force: true)
+        }
+        self.resetScheduler.start()
         self.syncActiveProfile(force: true)
 
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.statusItem.button?.image = IconRenderer.renderEmpty()
         self.statusItem.button?.imageScaling = .scaleNone
+        #if CODEX_MULTI_SWITCHER_PREVIEW
+            self.statusItem.button?.toolTip = "Codex Multi Switcher Preview — usage for the selected profile"
+        #endif
 
         self.menu = PersistentActionMenu(refreshAction: { [weak self] in
             self?.refreshAll()
         })
         self.menu.delegate = self
         self.statusItem.menu = self.menu
+        self.updateClaudeIcon()
+        self.claudeStore.refresh()
+        self.claudeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.claudeStore.refresh()
+                self?.updateIcon()
+            }
+        }
         if self.canHandleRecoveryNotices {
             self.registerRecoveryNoticeObserver()
         }
 
         self.registerWorkspaceObservers()
+        NotificationCenter.default.addObserver(self, selector: #selector(self.quotaDisplayChanged),
+            name: UserDefaults.didChangeNotification, object: UserDefaults.standard)
         self.usageProvider.onRefreshComplete = { [weak self] in
             self?.handleRefreshComplete()
         }
@@ -99,9 +139,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.startRenewal()
 
         self.sparkleUpdater.startIfBundledApp()
+        if ((AppInfo.isPreview || AppInfo.isLocalBuild) && !ProcessInfo.processInfo.arguments.contains("--launch-at-login"))
+            || ProcessInfo.processInfo.arguments.contains("--settings") {
+            DispatchQueue.main.async { [weak self] in self?.openSettings() }
+        }
         if self.canHandleRecoveryNotices {
             self.prepareRecoveryNoticeIfNeeded()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard self.store != nil else { return false }
+        self.openSettings()
+        return true
+    }
+
+    private func terminateIfLocalInstanceIsRunning() -> Bool {
+        let current = NSRunningApplication.current
+        let url = Bundle.main.bundleURL.standardizedFileURL
+        guard let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.codexmultiswitcher.local")
+            .filter({ $0.processIdentifier != current.processIdentifier && $0.bundleURL?.standardizedFileURL == url })
+            .filter({ Self.launchedBefore($0, current) }).first else { return false }
+        _ = running.activate(options: [.activateAllWindows])
+        NSApp.terminate(nil)
+        return true
     }
 
     private func terminateIfInstalledInstanceIsRunning() -> Bool {
@@ -153,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     deinit {
         self.periodicRefreshTimer?.invalidate()
+        self.claudeRefreshTimer?.invalidate()
         self.menuRefreshRetryTask?.cancel()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -164,6 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         guard self.store != nil, self.usageProvider != nil else { return }
         self.isMenuOpen = true
+        self.claudeStore.refresh()
         self.syncActiveProfile()
         self.rebuildMenu()
         if self.refreshPreferences.refreshWhenMenuOpens {
@@ -218,6 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        self.isRenewing = true
         CodexBridge.runCommand(path: path, arguments: ["renew", "--json"]) { [weak self] result in
             DispatchQueue.main.async {
                 self?.handleRenewalResult(result)
@@ -228,6 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handleRenewalResult(
         _ result: Result<CodexBridge.CommandResult, CodexBridgeError>
     ) {
+        self.isRenewing = false
         defer { self.requestRefresh() }
         switch result {
         case let .success(command):
@@ -295,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleSystemWake() {
         guard self.store != nil, self.usageProvider != nil else { return }
         AppLogger.info("System woke; forcing usage refresh")
+        self.claudeStore.refresh()
         self.syncActiveProfile(force: true)
         self.updateIcon()
         self.requestRefresh(force: true)
@@ -315,6 +381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.refreshMenuItem?.setEnabled(true)
         }
         self.updateIcon()
+        self.resetScheduler.checkDueSchedules()
         guard self.isMenuOpen else { return }
         self.rebuildMenu()
     }
@@ -348,17 +415,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateIcon() {
         guard self.store != nil, self.statusItem != nil else { return }
-        guard let activeId = self.store.liveProfileId else {
+        let displayedId = self.store.liveProfileId
+            ?? ((AppInfo.isPreview || AppInfo.isLocalBuild) ? self.store.config.activeProfile : nil)
+        guard let displayedId else {
             self.statusItem.button?.image = IconRenderer.renderEmpty()
             return
         }
 
-        if let snap = self.store.statuses[activeId]?.snapshot {
+        if let status = self.store.statuses[displayedId], let snap = status.snapshot {
+            let now = Date()
+            let cached = status.usageIsCached || now.timeIntervalSince(snap.fetchedAt) > 300
+            let weeklyOnly = !snap.hasPrimaryWindow && snap.hasSecondaryWindow && snap.secondaryWindowDurationMins == 10080
+            let primaryRemaining: Int? = snap.hasPrimaryWindow && (snap.primaryResetAt.map { $0 > now } ?? true)
+                ? max(0, min(100, 100 - snap.primaryUsedPercent)) : nil
+            let secondaryRemaining: Int? = snap.hasSecondaryWindow && (snap.secondaryResetAt.map { $0 > now } ?? true)
+                ? max(0, min(100, 100 - snap.secondaryUsedPercent)) : nil
             self.statusItem.button?.image = IconRenderer.render(
-                primaryPercent: snap.primaryUsedPercent,
-                secondaryPercent: snap.secondaryUsedPercent)
+                primaryRemainingPercent: primaryRemaining,
+                secondaryRemainingPercent: secondaryRemaining,
+                primaryShowsUsed: UserDefaults.standard.bool(forKey: QuotaDisplayPreferences.primaryKey),
+                secondaryShowsUsed: UserDefaults.standard.bool(forKey: QuotaDisplayPreferences.secondaryKey), cached: cached,
+                weeklyOnly: weeklyOnly, weeklyResetAt: snap.secondaryResetAt,
+                showResetCountdown: UserDefaults.standard.object(forKey: "showWeeklyResetCountdown") == nil
+                    || UserDefaults.standard.bool(forKey: "showWeeklyResetCountdown"))
+            let profileLabel = self.store.config.profiles
+                .first(where: { $0.id == displayedId })?.label ?? "Profile \(displayedId)"
+            let profileState = self.store.liveProfileId == displayedId ? "Active" : "Selected"
+            let primaryDescription = weeklyOnly ? "" : " · 5h: \(primaryRemaining.map { "\($0)% left" } ?? "Not reported or awaiting update")"
+            let resetDescription = snap.secondaryResetAt.map { " · Weekly quota resets: \($0.formatted(date: .abbreviated, time: .shortened))" } ?? ""
+            self.statusItem.button?.toolTip =
+                "\(profileState) \(profileLabel) · \(cached ? "Cached observation" : "Current usage")\(primaryDescription) · Week: \(secondaryRemaining.map { "\($0)% left" } ?? "Not reported or awaiting update")\(resetDescription) · \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened))"
         } else {
             self.statusItem.button?.image = IconRenderer.renderEmpty()
+            self.statusItem.button?.toolTip = "Codex Multi Switcher — usage unavailable"
+        }
+    }
+
+    @objc private func quotaDisplayChanged() {
+        self.updateIcon()
+        self.updateClaudeIcon()
+    }
+
+    private func updateClaudeIcon() {
+        guard self.claudeStore != nil, self.menu != nil else { return }
+        let defaults = UserDefaults.standard
+        let show = defaults.object(forKey: "showClaudeInMenuBar") == nil || defaults.bool(forKey: "showClaudeInMenuBar")
+        guard show else {
+            if let item = self.claudeStatusItem { NSStatusBar.system.removeStatusItem(item) }
+            self.claudeStatusItem = nil
+            return
+        }
+        if self.claudeStatusItem == nil {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            item.button?.imageScaling = .scaleNone
+            item.menu = self.menu
+            self.claudeStatusItem = item
+        }
+        let status = self.claudeStore.statuses[self.claudeStore.selectedID]
+        self.claudeStatusItem?.button?.image = ClaudeIconRenderer.render(
+            snapshot: status?.usage,
+            primaryShowsUsed: defaults.bool(forKey: "claudePrimaryQuotaShowsUsed"),
+            secondaryShowsUsed: defaults.bool(forKey: "claudeSecondaryQuotaShowsUsed"))
+        let label = self.claudeStore.profiles.first(where: { $0.id == self.claudeStore.selectedID })?.label ?? "Claude Code"
+        if let usage = status?.usage {
+            self.claudeStatusItem?.button?.toolTip = "Claude Code · \(label) · \(usage.isStale ? "Cached, out of date" : "Last observed usage") · \(usage.observedAt.formatted(date: .abbreviated, time: .shortened))"
+        } else {
+            self.claudeStatusItem?.button?.toolTip = "Claude Code · \(label) · Usage unavailable; open Settings → Claude Code to connect the status line"
         }
     }
 
@@ -437,6 +559,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if addedProfileSection {
             self.menu.addItem(.separator())
         }
+
+        let claudeView = ClaudeMenuSectionView(store: self.claudeStore,
+            onSettings: { [weak self] in self?.openClaudeSettings() },
+            onOpen: { [weak self] id in self?.claudeStore.openSession(id: id) })
+        let claudeHost = NSHostingView(rootView: claudeView)
+        claudeHost.frame = NSRect(x: 0, y: 0, width: 290, height: ClaudeMenuSectionView.height(for: self.claudeStore))
+        let claudeItem = NSMenuItem()
+        claudeItem.view = claudeHost
+        self.menu.addItem(claudeItem)
+        self.menu.addItem(.separator())
 
         let refreshItem = self.menu.makeRefreshItem()
         refreshItem.setEnabled(!self.usageProvider.isRefreshing)
@@ -548,11 +680,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         let failing = tracked.filter { self.store.refreshDiagnostics[$0.id]?.lastError != nil }
+        let activeSnapshot = self.store.liveProfileId.flatMap { self.store.statuses[$0]?.snapshot }
+        let weeklyOnly = activeSnapshot.map { !$0.hasPrimaryWindow && $0.hasSecondaryWindow && $0.secondaryWindowDurationMins == 10080 } ?? false
         let header = UsageHeaderView(
             isRefreshing: self.usageProvider.isRefreshing,
             updatedAt: updatedAt,
             failingProfiles: failing.count,
-            trackedProfiles: tracked.count)
+            trackedProfiles: tracked.count,
+            showsPrimaryControl: !weeklyOnly)
         let hostView = NSHostingView(rootView: header)
         let height = header.showsFailure ? UsageHeaderView.failureHeight : UsageHeaderView.baseHeight
         hostView.frame = NSRect(x: 0, y: 0, width: 290, height: height)
@@ -588,17 +723,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func cardHeight(for status: ProfileStatus, hasDuplicate: Bool) -> CGFloat {
         var height: CGFloat
         switch status {
-        case .available:
-            height = 46
+        case .available(let snap):
+            height = snap.hasPrimaryWindow && snap.hasSecondaryWindow ? 54 : 42
         case .stale(let snap) where snap != nil:
-            height = 46
+            height = snap!.hasPrimaryWindow && snap!.hasSecondaryWindow ? 54 : 42
         case .reloginNeeded(let snap) where snap != nil:
-            height = 58
+            height = (snap!.hasPrimaryWindow && snap!.hasSecondaryWindow ? 54 : 42) + 15
         default:
             height = 36
         }
 
         if hasDuplicate { height += 14 }
+        height += BankedResetSummaryView.extraHeight(for: status.snapshot)
         return height
     }
 
@@ -672,6 +808,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func switchToProfile(_ id: String) {
+        guard !self.resetScheduler.isRunning else {
+            self.presentBridgeError(title: "Reset in progress", message: "Wait for the reset request to finish before switching profiles.")
+            return
+        }
+        guard !AppInfo.isPreview else {
+            self.presentBridgeError(
+                title: "Preview mode",
+                message: "You can add accounts and view their usage here. Use the original switcher to change the account in your running Codex app.")
+            return
+        }
         self.menu.cancelTracking()
         AppLogger.info("Profile selected", metadata: ["profile": id])
 
@@ -749,11 +895,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshAll() {
+        self.claudeStore.refresh()
         self.syncActiveProfile(force: true)
         self.requestRefresh(force: true)
     }
 
     private func requestRefresh(force: Bool = false) {
+        if self.resetScheduler?.isRunning == true || self.isRenewing {
+            if force { self.hasPendingForcedRefresh = true }
+            return
+        }
         if self.usageProvider.isRefreshing {
             if force {
                 self.hasPendingForcedRefresh = true
@@ -769,10 +920,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func openSettings() {
+    @objc private func openSettings() { self.showSettings(tab: 0) }
+
+    private func openClaudeSettings() { self.showSettings(tab: 3) }
+
+    private func showSettings(tab: Int) {
         self.menu.cancelTracking()
         SettingsWindow.show(
             store: self.store,
+            resetScheduler: self.resetScheduler,
+            claudeStore: self.claudeStore,
+            initialTab: tab,
             refreshPreferences: self.refreshPreferences,
             actions: SettingsActions(
                 reauthenticateProfile: { [weak self] (id: String, completion: @escaping (Result<Void, SettingsActionError>) -> Void) in
@@ -826,6 +984,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 },
                 cancelLegacyKeychainMigrationReview: { [weak self] preview in
                     self?.store.cancelLegacyKeychainMigrationReview(preview)
+                },
+                reviewLegacyProfileImport: { [weak self] in
+                    guard let self else {
+                        return .failure(SettingsActionError(message: "Settings window is unavailable."))
+                    }
+                    do {
+                        return .success(try self.store.reviewLegacyProfileImport(
+                            sourceHome: (AppInfo.isPreview || AppInfo.isLocalBuild)
+                                ? FileManager.default.homeDirectoryForCurrentUser : nil,
+                            includeCredentials: !AppInfo.isPreview && !AppInfo.isLocalBuild))
+                    } catch {
+                        return .failure(SettingsActionError(message: error.localizedDescription))
+                    }
+                },
+                importLegacyProfiles: { [weak self] preview in
+                    guard let self else {
+                        return .failure(SettingsActionError(message: "Settings window is unavailable."))
+                    }
+                    do {
+                        return .success(try self.store.importLegacyProfiles(preview))
+                    } catch {
+                        return .failure(SettingsActionError(message: error.localizedDescription))
+                    }
+                },
+                cancelLegacyProfileImport: { [weak self] in
+                    self?.store.cancelLegacyProfileImportReview()
+                },
+                undoLatestLegacyProfileImport: { [weak self] in
+                    guard let self else {
+                        return .failure(SettingsActionError(message: "Settings window is unavailable."))
+                    }
+                    do {
+                        return .success(try self.store.undoLatestLegacyProfileImport())
+                    } catch {
+                        return .failure(SettingsActionError(message: error.localizedDescription))
+                    }
                 }))
     }
 
@@ -845,6 +1039,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentFailureAlert: Bool,
         completion: ((Result<Void, CodexBridgeError>) -> Void)? = nil
     ) {
+        guard !self.resetScheduler.isRunning else {
+            let error = CodexBridgeError.stateUpdateFailed("Wait for the reset request to finish before signing in.")
+            completion?(.failure(error))
+            return
+        }
         let store = self.store!
         store.beginAuthMutation()
         CodexBridge.startLogin(profileId: profileId) { [weak self] result in
@@ -893,6 +1092,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func clearSavedAuth(for profileId: String) -> Result<Void, SettingsActionError> {
+        guard !self.resetScheduler.isRunning else {
+            return .failure(SettingsActionError(message: "Wait for the reset request to finish before changing saved sign-ins."))
+        }
         do {
             self.hasPendingForcedRefresh = false
             self.usageProvider.cancelRefreshes()

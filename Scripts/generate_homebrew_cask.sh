@@ -44,7 +44,6 @@ cask "$CASK_TOKEN" do
   binary "#{appdir}/CodexMultiSwitcher.app/Contents/Helpers/codex-profile"
 
   zap trash: [
-    "~/.codex-multi-switcher",
     "~/Library/Logs/CodexMultiSwitcher",
     "~/Library/Preferences/com.codexmultiswitcher.app.plist",
   ]

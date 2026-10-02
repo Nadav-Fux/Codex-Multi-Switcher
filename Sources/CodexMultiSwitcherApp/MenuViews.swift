@@ -22,9 +22,13 @@ enum Palette {
     static let mid = Color(red: 0.70, green: 0.55, blue: 0.35)
 }
 
-func progressColor(for percent: Int) -> Color {
-    if percent >= 90 { return Palette.danger }
-    if percent >= 70 { return Palette.mid }
+func remainingQuotaPercent(for usedPercent: Int) -> Int {
+    100 - min(100, max(0, usedPercent))
+}
+
+func remainingQuotaColor(for remainingPercent: Int) -> Color {
+    if remainingPercent < 20 { return Palette.danger }
+    if remainingPercent < 50 { return Palette.warning }
     return Palette.success
 }
 
@@ -39,7 +43,7 @@ func usageWindowLabel(durationMins: Int?, legacyLabel: String) -> String {
 func planDisplayName(_ raw: String?) -> String {
     guard let raw, !raw.isEmpty else { return "" }
     switch raw {
-    case "pro": return "Pro"
+    case "pro", "prolite": return "Pro"
     case "plus": return "Plus"
     case "team": return "Team"
     case "business": return "Business"
@@ -191,29 +195,143 @@ struct UsageBar: View {
 
 struct UsageRow: View {
     let label: String
-    let percent: Int
+    let usedPercent: Int
     let resetAt: Date?
     let isHighlighted: Bool
+    let showsUsed: Bool
+    var cached = false
+    private var showsCached: Bool { self.cached || self.resetAt.map { $0 <= Date() } == true }
 
     var body: some View {
         HStack(spacing: 4) {
             Text(self.label)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(self.isHighlighted ? .secondary : .tertiary)
-                .frame(width: 16, alignment: .leading)
-
-            UsageBar(percent: Double(self.percent), tint: progressColor(for: self.percent))
-
-            Text("\(self.percent)%")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(self.isHighlighted ? .primary : .secondary)
-                .frame(width: 30, alignment: .trailing)
+                .frame(width: 24, alignment: .leading)
+
+            UsageBar(percent: Double(self.displayPercent), tint: self.quotaColor)
+
+            Text("\(self.showsCached ? "Cached " : "")\(self.displayPercent)% \(self.showsUsed ? "used" : "left")")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(self.quotaColor)
+                .frame(width: self.showsCached ? 108 : 62, alignment: .trailing)
 
             Text(resetCountdown(from: self.resetAt))
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(self.isHighlighted ? .secondary : .tertiary)
                 .frame(width: 42, alignment: .trailing)
+                .help(self.resetAt.map { "Quota resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(self.showsCached ? "Cached " : "")\(self.label) quota: \(self.displayPercent) percent \(self.showsUsed ? "used" : "remaining")")
+        .accessibilityValue(self.resetAt.map { "Resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
+    }
+
+    private var displayPercent: Int {
+        QuotaDisplayPreferences.value(usedPercent: self.usedPercent, showsUsed: self.showsUsed)
+    }
+
+    private var remainingPercent: Int {
+        remainingQuotaPercent(for: self.usedPercent)
+    }
+
+    private var quotaColor: Color {
+        self.showsCached ? .secondary : remainingQuotaColor(for: self.remainingPercent)
+    }
+}
+
+struct BankedResetSummaryView: View {
+    let snapshot: UsageSnapshot
+
+    private static let maximumVisibleExpirations = 4
+    private static let lineHeight: CGFloat = 14
+
+    /// Include the spacing above the summary when sizing the menu's NSHostingView.
+    static func extraHeight(for snapshot: UsageSnapshot?) -> CGFloat {
+        guard let snapshot, snapshot.bankedResetCount != nil else { return 0 }
+        return Self.contentHeight(for: snapshot) + 2
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.counterclockwise.circle")
+                Text("\(self.count) banked reset\(self.count == 1 ? "" : "s")")
+                Spacer(minLength: 4)
+                if !self.visibleExpirations.isEmpty {
+                    Text("Expires · local time")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(self.count > 0 ? Palette.accent : Color.secondary)
+            .frame(height: Self.lineHeight)
+
+            ForEach(Array(self.visibleExpirations.enumerated()), id: \.offset) { index, expiry in
+                HStack(spacing: 5) {
+                    Text("\(index + 1).")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 12, alignment: .leading)
+                    Text(expiry.map { $0.formatted(.dateTime.day().month(.abbreviated).hour().minute()) } ?? "No expiry")
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let expiry {
+                        Text(expiry > Date() ? resetCountdown(from: expiry) : "Expired")
+                            .foregroundStyle(Self.expirationColor(for: expiry))
+                    }
+                }
+                .font(.system(size: 9, design: .monospaced))
+                .frame(height: Self.lineHeight)
+                .help(expiry.map { "Banked reset expires \($0.formatted(date: .complete, time: .shortened))" } ?? "This banked reset has no expiration date")
+            }
+
+            if let note = Self.detailNote(for: self.snapshot) {
+                Text(note)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(height: Self.lineHeight, alignment: .leading)
+            }
+        }
+        .frame(height: Self.contentHeight(for: self.snapshot), alignment: .topLeading)
+    }
+
+    private var count: Int { max(0, self.snapshot.bankedResetCount ?? 0) }
+
+    private var visibleExpirations: [Date?] {
+        Array(Self.sortedExpirations(for: self.snapshot).prefix(Self.maximumVisibleExpirations))
+    }
+
+    private static func sortedExpirations(for snapshot: UsageSnapshot) -> [Date?] {
+        (snapshot.bankedResetExpirations ?? []).sorted {
+            ($0 ?? .distantFuture) < ($1 ?? .distantFuture)
+        }
+    }
+
+    private static func detailNote(for snapshot: UsageSnapshot) -> String? {
+        let count = max(0, snapshot.bankedResetCount ?? 0)
+        let detailsCount = snapshot.bankedResetExpirations?.count ?? 0
+        if detailsCount > Self.maximumVisibleExpirations {
+            return "+\(detailsCount - Self.maximumVisibleExpirations) more dates in Settings"
+        }
+        if detailsCount < count {
+            return detailsCount == 0 ? "Expiry dates unavailable" : "\(count - detailsCount) expiry date\(count - detailsCount == 1 ? "" : "s") unavailable"
+        }
+        return nil
+    }
+
+    private static func contentHeight(for snapshot: UsageSnapshot) -> CGFloat {
+        let rows = min(Self.maximumVisibleExpirations, snapshot.bankedResetExpirations?.count ?? 0)
+        let noteRows = Self.detailNote(for: snapshot) == nil ? 0 : 1
+        return CGFloat(1 + rows + noteRows) * Self.lineHeight
+    }
+
+    private static func expirationColor(for expiry: Date) -> Color {
+        let secondsRemaining = expiry.timeIntervalSinceNow
+        if secondsRemaining < 24 * 3600 { return Palette.danger }
+        if secondsRemaining < 72 * 3600 { return Palette.warning }
+        return .secondary
     }
 }
 
@@ -222,9 +340,10 @@ struct UsageHeaderView: View {
     let updatedAt: Date?
     let failingProfiles: Int
     let trackedProfiles: Int
+    var showsPrimaryControl = true
 
-    static let baseHeight: CGFloat = 42
-    static let failureHeight: CGFloat = 57
+    static let baseHeight: CGFloat = 68
+    static let failureHeight: CGFloat = 83
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -234,6 +353,9 @@ struct UsageHeaderView: View {
             Text(self.statusLabel)
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
+
+            QuotaDisplayControlsView(showsPrimary: self.showsPrimaryControl)
+                .padding(.top, 3)
 
             if self.showsFailure {
                 Label(self.failureLabel, systemImage: "exclamationmark.triangle.fill")
@@ -275,6 +397,8 @@ struct ProfileCardView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     @State private var isHovered = false
+    @AppStorage(QuotaDisplayPreferences.primaryKey) private var primaryShowsUsed = false
+    @AppStorage(QuotaDisplayPreferences.secondaryKey) private var secondaryShowsUsed = false
 
     var body: some View {
         Button(action: self.onSwitch) {
@@ -305,6 +429,12 @@ struct ProfileCardView: View {
 
     private var headerRow: some View {
         HStack(spacing: 6) {
+            if self.isActive {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Palette.accent)
+                    .accessibilityLabel("Active profile")
+            }
             Text(self.profile.label)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(self.titleColor)
@@ -339,14 +469,14 @@ struct ProfileCardView: View {
                 .foregroundStyle(self.metadataColor)
         case .stale(let snap):
             if let snap {
-                self.usageBars(snap)
+                self.usageBars(snap, cached: true)
             } else {
                 Text("No data yet")
                     .font(.system(size: 10))
                     .foregroundStyle(self.metadataColor)
             }
         case .reloginNeeded(let snap):
-            if let snap { self.usageBars(snap) }
+            if let snap { self.usageBars(snap, cached: true) }
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 9))
@@ -361,35 +491,33 @@ struct ProfileCardView: View {
         }
     }
 
-    private func usageBars(_ snap: UsageSnapshot) -> some View {
+    private func usageBars(_ snap: UsageSnapshot, cached: Bool = false) -> some View {
         VStack(spacing: 2) {
-            if self.hasPrimaryWindow(snap) {
+            if snap.hasPrimaryWindow {
                 UsageRow(
                     label: usageWindowLabel(
                         durationMins: snap.primaryWindowDurationMins,
                         legacyLabel: "5h"),
-                    percent: snap.primaryUsedPercent,
+                    usedPercent: snap.primaryUsedPercent,
                     resetAt: snap.primaryResetAt,
-                    isHighlighted: self.isActive || self.isHovered)
+                    isHighlighted: self.isActive || self.isHovered,
+                    showsUsed: self.primaryShowsUsed, cached: cached)
             }
-            if self.hasSecondaryWindow(snap) {
+            if snap.hasSecondaryWindow {
                 UsageRow(
                     label: usageWindowLabel(
                         durationMins: snap.secondaryWindowDurationMins,
                         legacyLabel: "Wk"),
-                    percent: snap.secondaryUsedPercent,
+                    usedPercent: snap.secondaryUsedPercent,
                     resetAt: snap.secondaryResetAt,
-                    isHighlighted: self.isActive || self.isHovered)
+                    isHighlighted: self.isActive || self.isHovered,
+                    showsUsed: self.secondaryShowsUsed, cached: cached)
+            }
+            if snap.bankedResetCount != nil {
+                BankedResetSummaryView(snapshot: snap)
             }
         }
-    }
-
-    private func hasPrimaryWindow(_ snap: UsageSnapshot) -> Bool {
-        snap.primaryWindowDurationMins != nil || snap.primaryResetAt != nil || snap.primaryUsedPercent > 0
-    }
-
-    private func hasSecondaryWindow(_ snap: UsageSnapshot) -> Bool {
-        snap.secondaryWindowDurationMins != nil || snap.secondaryResetAt != nil || snap.secondaryUsedPercent > 0
+        .help(cached ? "Cached observation from \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened)). Refresh or sign in again to confirm current quota." : "Quota reported by Codex")
     }
 
     private var planType: String? {
@@ -486,3 +614,11 @@ private struct ProfileCardVisualState {
 }
 
 // MARK: - Menu Bar Icon
+
+/// Cached credentials/refresh failures must not present historical quota as current.
+extension ProfileStatus {
+    var usageIsCached: Bool {
+        if case .available = self { return false }
+        return true
+    }
+}

@@ -12,6 +12,10 @@ struct SettingsActions {
     let confirmLegacyKeychainMigration: (KeychainMigrationPreview, Int) -> Result<Void, SettingsActionError>
     let completePendingKeychainMigration: (KeychainMigrationPreview, Int) -> Result<Void, SettingsActionError>
     let cancelLegacyKeychainMigrationReview: (KeychainMigrationPreview) -> Void
+    let reviewLegacyProfileImport: () -> Result<LegacyProfileImportPreview, SettingsActionError>
+    let importLegacyProfiles: (LegacyProfileImportPreview) -> Result<LegacyProfileImportResult, SettingsActionError>
+    let cancelLegacyProfileImport: () -> Void
+    let undoLatestLegacyProfileImport: () -> Result<LegacyProfileImportResult, SettingsActionError>
 }
 
 enum SettingsWindow {
@@ -21,6 +25,9 @@ enum SettingsWindow {
 
     static func show(
         store: ProfileStore,
+        resetScheduler: BankedResetScheduler,
+        claudeStore: ClaudeProfileStore,
+        initialTab: Int = 0,
         refreshPreferences: RefreshPreferences,
         actions: SettingsActions
     ) {
@@ -32,6 +39,9 @@ enum SettingsWindow {
             wc.window?.contentView = NSHostingView(
                 rootView: SettingsView(
                     store: store,
+                    resetScheduler: resetScheduler,
+                    claudeStore: claudeStore,
+                    initialTab: initialTab,
                     refreshPreferences: refreshPreferences,
                     actions: actions,
                     migrationLifecycle: lifecycle))
@@ -42,11 +52,12 @@ enum SettingsWindow {
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 820, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false)
-        window.title = "Settings"
+        window.title = "Codex Multi Switcher"
+        window.minSize = NSSize(width: 760, height: 620)
         window.center()
         window.isReleasedWhenClosed = false
         let windowDelegate = SettingsWindowDelegate { Self.cancelActiveMigrationReview() }
@@ -55,6 +66,9 @@ enum SettingsWindow {
 
         let view = SettingsView(
             store: store,
+            resetScheduler: resetScheduler,
+            claudeStore: claudeStore,
+            initialTab: initialTab,
             refreshPreferences: refreshPreferences,
             actions: actions,
             migrationLifecycle: lifecycle)
@@ -117,6 +131,9 @@ final class SettingsMigrationLifecycle {
 
 struct SettingsView: View {
     @ObservedObject var store: ProfileStore
+    @ObservedObject var resetScheduler: BankedResetScheduler
+    @ObservedObject var claudeStore: ClaudeProfileStore
+    let initialTab: Int
     @ObservedObject var refreshPreferences: RefreshPreferences
     let actions: SettingsActions
     let migrationLifecycle: SettingsMigrationLifecycle
@@ -126,8 +143,20 @@ struct SettingsView: View {
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
+                if AppInfo.isLocalBuild {
+                    Text("Account switching enabled • Profiles saved on this Mac")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                } else if AppInfo.isPreview {
+                    Text("Preview: import profile names in General, then select a profile and click Set Up to sign in. Use + to add another account. Switching the running Codex app is available in the original switcher.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                }
                 Picker("", selection: self.$selectedTab) {
-                    Label("Profiles", systemImage: "person.2").tag(0)
+                    Label("Codex", systemImage: "person.2").tag(0)
+                    Label("Claude Code", systemImage: "terminal").tag(3)
                     Label("General", systemImage: "gearshape").tag(1)
                     Label("About", systemImage: "info.circle").tag(2)
                 }
@@ -139,7 +168,8 @@ struct SettingsView: View {
                 Divider()
 
                 switch self.selectedTab {
-                case 0: ProfilesTab(store: self.store, actions: self.actions, toast: self.toast)
+                case 0: ProfilesTab(store: self.store, resetScheduler: self.resetScheduler, actions: self.actions, toast: self.toast)
+                case 3: ClaudeProfilesTab(store: self.claudeStore, toast: self.toast)
                 case 1:
                     GeneralTab(
                         store: self.store,
@@ -154,11 +184,13 @@ struct SettingsView: View {
 
             ToastOverlay(state: self.toast)
         }
+        .onAppear { self.selectedTab = self.initialTab }
     }
 }
 
 struct ProfilesTab: View {
     @ObservedObject var store: ProfileStore
+    @ObservedObject var resetScheduler: BankedResetScheduler
     let actions: SettingsActions
     @ObservedObject var toast: ToastState
     @State private var selectedId: String?
@@ -241,6 +273,8 @@ struct ProfilesTab: View {
                         .frame(width: 24, height: 20)
                 }
                 .buttonStyle(.borderless)
+                .help("Add a profile, then click Set Up to sign in")
+                .accessibilityLabel("Add Profile")
 
                 Divider().frame(height: 14)
 
@@ -365,6 +399,17 @@ struct ProfilesTab: View {
                                 }
                             }
                         }
+                    }
+
+                    if let snapshot = status.snapshot {
+                        ProfileQuotaView(snapshot: snapshot, cached: status.usageIsCached && !self.store.isUsingLiveUsage(profile.id))
+                        if self.store.isUsingLiveUsage(profile.id),
+                           self.store.cache.renewalStates[profile.id]?.renewalAction == .rejected {
+                            Text("Current desktop usage. Saved sign-in needs re-authentication.")
+                                .font(.system(size: 11)).foregroundStyle(Palette.warning)
+                        }
+                        BankedResetInventoryView(profileID: profile.id, profileLabel: profile.label,
+                            snapshot: snapshot, scheduler: self.resetScheduler, toast: self.toast)
                     }
 
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -538,6 +583,7 @@ struct ProfilesTab: View {
 }
 
 struct GeneralTab: View {
+    @AppStorage("showWeeklyResetCountdown") private var showWeeklyResetCountdown = true
     let store: ProfileStore
     @ObservedObject var refreshPreferences: RefreshPreferences
     let actions: SettingsActions
@@ -554,9 +600,13 @@ struct GeneralTab: View {
     @State private var migrationError: String?
     @State private var isReviewingMigration = false
     @State private var isMigrationActionInFlight = false
+    @State private var legacyImportPreview: LegacyProfileImportPreview?
+    @State private var isReviewingLegacyImport = false
+    @State private var canUndoLegacyImport = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("STARTUP")
                     .font(.system(size: 11, weight: .semibold))
@@ -615,12 +665,43 @@ struct GeneralTab: View {
                 Toggle(
                     "Refresh when the menu opens",
                     isOn: self.$refreshPreferences.refreshWhenMenuOpens)
+                Toggle("Show time until weekly reset", isOn: self.$showWeeklyResetCountdown)
+                    .font(.system(size: 12))
+                    .help("Show days and hours next to the weekly quota when the plan reports only a weekly window.")
 
                 if self.refreshPreferences.interval == .manual {
                     Text("Automatic background refresh is off. Refresh from the menu or press Command-R.")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("PROFILE IMPORT")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+                    Button("Scan Original App…") {
+                        self.reviewLegacyProfileImport()
+                    }
+                    .disabled(self.isReviewingLegacyImport || self.isMigrationActionInFlight)
+
+                    if self.canUndoLegacyImport {
+                        Button("Undo Latest Import") {
+                            self.undoLatestLegacyProfileImport()
+                        }
+                        .disabled(self.isMigrationActionInFlight)
+                    }
+                }
+
+                Text(AppInfo.isPreview || AppInfo.isLocalBuild
+                     ? "Copy profile names from the original app. Sign in to each account using Profiles → Set Up. The original app's saved credentials are not copied."
+                     : "Preview and copy profiles from ~/.codex-switcher. The old folder stays intact. A private backup lets you undo this import; credentials that cannot be transferred will require a new sign-in.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
             }
 
             if self.store.shouldShowKeychainMigration {
@@ -678,6 +759,7 @@ struct GeneralTab: View {
             }
 
             Spacer()
+          }
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -685,6 +767,7 @@ struct GeneralTab: View {
             self.refreshLaunchAtLoginState()
             self.refreshRenewalAgentState()
             self.refreshLastRenewalRun()
+            self.canUndoLegacyImport = self.store.canUndoLatestLegacyProfileImport
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             self.refreshLaunchAtLoginState()
@@ -701,6 +784,15 @@ struct GeneralTab: View {
                 onCancel: self.cancelLegacyKeychainMigrationReview,
                 onConfirm: { self.confirmLegacyKeychainMigration(sheet) }
             )
+        }
+        .sheet(item: self.$legacyImportPreview, onDismiss: {
+            self.actions.cancelLegacyProfileImport()
+        }) { preview in
+            LegacyProfileImportConfirmationSheet(
+                preview: preview,
+                isActionInFlight: self.isMigrationActionInFlight,
+                onCancel: { self.legacyImportPreview = nil },
+                onConfirm: { self.confirmLegacyProfileImport(preview) })
         }
         .alert("Keychain Migration", isPresented: Binding(
             get: { self.migrationError != nil },
@@ -746,6 +838,45 @@ struct GeneralTab: View {
             }
         case let .failure(error):
             self.clearMigrationUIWithError(error)
+        }
+    }
+
+    private func reviewLegacyProfileImport() {
+        self.isReviewingLegacyImport = true
+        defer { self.isReviewingLegacyImport = false }
+        switch self.actions.reviewLegacyProfileImport() {
+        case let .success(preview):
+            self.legacyImportPreview = preview
+        case let .failure(error):
+            self.toast.show(error.message, style: .error)
+        }
+    }
+
+    private func confirmLegacyProfileImport(_ preview: LegacyProfileImportPreview) {
+        self.isMigrationActionInFlight = true
+        defer { self.isMigrationActionInFlight = false }
+        switch self.actions.importLegacyProfiles(preview) {
+        case let .success(result):
+            self.legacyImportPreview = nil
+            self.canUndoLegacyImport = self.store.canUndoLatestLegacyProfileImport
+            let detail = result.warnings.first.map { " \($0)" } ?? ""
+            let summary = "Imported \(result.importedProfiles) profile(s), copied \(result.copiedCredentials) credential(s), skipped \(result.skippedCredentials).\(detail)"
+            self.toast.show(summary, style: result.skippedCredentials == 0 ? .success : .info)
+        case let .failure(error):
+            self.toast.show(error.message, style: .error)
+        }
+    }
+
+    private func undoLatestLegacyProfileImport() {
+        self.isMigrationActionInFlight = true
+        defer { self.isMigrationActionInFlight = false }
+        switch self.actions.undoLatestLegacyProfileImport() {
+        case let .success(result):
+            self.canUndoLegacyImport = self.store.canUndoLatestLegacyProfileImport
+            let detail = result.warnings.first.map { " \($0)" } ?? ""
+            self.toast.show("Undo removed \(result.importedProfiles) profile(s); skipped \(result.skippedCredentials) credential action(s).\(detail)", style: result.warnings.isEmpty ? .success : .info)
+        case let .failure(error):
+            self.toast.show(error.message, style: .error)
         }
     }
 
@@ -821,7 +952,7 @@ struct GeneralTab: View {
                 .buttonStyle(.link)
             }
         case .unavailable:
-            Text("The signed app in /Applications owns Launch at Login. Isolated development builds cannot change it.")
+            Text("Launch at Login is unavailable for this build or its login item needs repair.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
@@ -858,7 +989,7 @@ struct GeneralTab: View {
                 .buttonStyle(.link)
             }
         case .unavailable:
-            Text("The signed app in /Applications owns renewal scheduling. Isolated development builds cannot change it.")
+            Text("This build renews sign-ins while opening and refreshing the app. Daily renewal while the app is closed requires the signed release.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         case nil:
@@ -1055,6 +1186,85 @@ struct AboutTab: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity)
+    }
+}
+
+private struct LegacyProfileImportConfirmationSheet: View {
+    let preview: LegacyProfileImportPreview
+    let isActionInFlight: Bool
+    let onCancel: () -> Void
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Import Profiles")
+                .font(.system(size: 17, weight: .semibold))
+
+            Text("Found \(self.preview.items.count) profile(s) in ~/.codex-switcher. Existing profiles and credentials will not be overwritten.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
+            List(self.preview.items) { item in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(item.label)
+                            .font(.system(size: 13, weight: .medium))
+                        Spacer()
+                        Text("ID \(item.id)")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(self.status(for: item))
+                        .font(.system(size: 11))
+                        .foregroundStyle(item.destinationHasAuth ? Palette.success : Palette.warning)
+                }
+                .padding(.vertical, 3)
+            }
+            .frame(minHeight: 120, maxHeight: 240)
+
+            if !self.preview.warnings.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(Array(self.preview.warnings.enumerated()), id: \.offset) { _, warning in
+                            Text("• \(warning)")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 100)
+            }
+
+            Text("A private backup of the current profile settings is saved before import. The original folder is never changed. Undo removes only credentials that still exactly match what this import copied.")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel") { self.onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(self.isActionInFlight)
+                Button("Import \(self.preview.newProfiles) Profile(s)") {
+                    self.onConfirm()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(self.isActionInFlight || self.preview.items.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    private func status(for item: LegacyProfileImportItem) -> String {
+        if item.destinationHasAuth { return "Credentials already saved here; will keep current copy." }
+        switch item.credentialState {
+        case .ready(let source): return "Saved credentials can be copied from \(source)."
+        case .unavailable: return "No transferable credentials; sign in again after import."
+        case .conflictingCopies: return "Different credential copies found; skipped for safety."
+        }
     }
 }
 

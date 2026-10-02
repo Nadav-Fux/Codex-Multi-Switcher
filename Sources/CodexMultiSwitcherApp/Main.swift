@@ -6,6 +6,28 @@ import CodexProfileCore
 #endif
 enum Main {
     static func main() {
+        #if CODEX_MULTI_SWITCHER_PREVIEW || CODEX_MULTI_SWITCHER_LOCAL
+            // A double-clickable preview must always use its own profile home,
+            // even when launched by Finder without development environment vars.
+            let previewHome = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Codex Multi Switcher Preview")
+            guard setenv("CODEX_PROFILE_HOME", previewHome.path, 1) == 0 else {
+                fatalError("Unable to configure the preview profile home")
+            }
+        #endif
+        #if CODEX_MULTI_SWITCHER_LOCAL
+            let realCodexHome = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".codex")
+            guard setenv("CODEX_PROFILE_LIVE_HOME", realCodexHome.path, 1) == 0 else {
+                fatalError("Unable to configure the live Codex home")
+            }
+            guard setenv("CLAUDE_PROFILE_USER_HOME", FileManager.default.homeDirectoryForCurrentUser.path, 1) == 0 else {
+                fatalError("Unable to configure the live Claude home")
+            }
+        #elseif CODEX_MULTI_SWITCHER_PREVIEW
+            unsetenv("CODEX_PROFILE_LIVE_HOME")
+            unsetenv("CLAUDE_PROFILE_USER_HOME")
+        #endif
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 
