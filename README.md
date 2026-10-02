@@ -93,13 +93,23 @@ usage API requests. The existing `claude-2x-statusline` installation can remain 
 place. New managed profiles get a simple quota status line without copying the
 default profile's settings or credentials.
 
-The separate **CL** menu bar badge shows five-hour and weekly quota for the
+**Settings → General → Show in menu bar** chooses Codex only, Claude Code only,
+or both. Both indicators are drawn in one menu bar item and stay adjacent.
+Hold **Command (⌘)** and drag the item beside Wi-Fi or the battery to place it;
+macOS manages its location. A high-contrast monochrome terminal symbol identifies Codex; an orange
+asterisk identifies Claude beside their quota numbers. The Claude indicator shows five-hour and weekly quota for the
 selected Claude account. Each period has independent **Left/Used** controls.
-Missing, expired, stale, or account-unmatched observations show a dash in the menu bar; settings
-show cached observations with their source and timestamp. A legacy statusline
-cache cannot identify its account and is always labelled unverified. Usage is
-updated when Claude emits native `rate_limits` data, normally after a model
-response; **Refresh** reads saved observations and authentication status. Project
+Missing individual windows show a dash; when no current Claude windows exist,
+the indicator shows its symbol and `?`. Settings show cached observations with
+their source and timestamp. A legacy statusline
+cache cannot identify its account and is always labelled unverified. For the
+default Claude account, the app can read current quota through Claude’s OAuth
+profile and usage endpoints. It reads the existing credential without a Keychain
+prompt, verifies the server account against the CLI identity, and never renews
+or writes credentials. This path is unavailable when macOS denies the read.
+Separate managed accounts use native `rate_limits` statusline data, normally
+after a model response. **Refresh** checks saved observations, authentication
+status, and eligible default-account usage. Project
 settings that override `statusLine` must also use the bridge for that session.
 No Claude banked-reset or automatic-reset action is implemented.
 
@@ -127,6 +137,9 @@ make check
 ```
 
 The integration suite uses isolated homes and fake Codex executables. `Tests/run-banked-reset-tests.sh` exercises the real RPC client against a fake server, including exact-credit retries, account checks, and rotated-token handling. `Tests/run-feature-tests.sh` runs scheduler and credential persistence unit checks independently of XCTest. `Tests/run-app-feature-tests.sh` checks the actual app scheduler against a fake server, including journal-before-send behavior and relaunch after an uncertain response. `Tests/run-claude-tests.sh` uses private temporary directories and a fake Claude CLI to check registry isolation, default Keychain selection, native usage identity, statusline backup/restore, and managed launchers. `python3 Tests/ClaudeStatuslineBridgeTests.py` checks the token-free Python bridge and previous-command preservation. `Tests/run-usage-normalization-tests.sh` checks weekly-only and swapped-window responses. `Tests/run-active-usage-tests.sh` checks matching live account reads, discarded child credential writes, retained saved login rejection, and account changes during a fetch. Set `CODEX_PROFILE_SDK` if needed.
+
+When no current Claude windows have been observed, its badge shows its glyph and `?`
+instead of ambiguous percentage rows. The tooltip explains how to obtain usage.
 
 The desktop-layout regression fixture covers the package metadata layout as well as legacy executable discovery.
 

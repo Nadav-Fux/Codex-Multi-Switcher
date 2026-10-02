@@ -18,7 +18,7 @@ struct AppFeatureSmoke {
             primaryShowsUsed: true, secondaryShowsUsed: false)
         try Self.require(mixed.accessibilityDescription?.contains("26 percent used") == true, "Independent used mode")
         try Self.require(mixed.accessibilityDescription?.contains("4 percent remaining") == true, "Independent remaining mode")
-        try Self.require(!mixed.isTemplate && mixed.size.width < 55, "Colored compact badge")
+        try Self.require(!mixed.isTemplate && mixed.size.width < 85, "Colored compact badge")
         try Self.require(IconRenderer.color(for: 50) == IconRenderer.highQuotaColor, "50 percent threshold")
         try Self.require(IconRenderer.color(for: 20) == IconRenderer.midQuotaColor, "20 percent threshold")
         try Self.require(IconRenderer.color(for: 19) == IconRenderer.lowQuotaColor, "Low quota threshold")
@@ -31,7 +31,7 @@ struct AppFeatureSmoke {
             weeklyOnly: true, weeklyResetAt: weeklyReset)
         let weeklyCompact = IconRenderer.render(primaryRemainingPercent: nil, secondaryRemainingPercent: 95,
             weeklyOnly: true, weeklyResetAt: weeklyReset, showResetCountdown: false)
-        try Self.require(weeklyBadge.size.height == 23 && weeklyBadge.size.width < 130 &&
+        try Self.require(weeklyBadge.size.height == 23 && weeklyBadge.size.width < 160 &&
             weeklyBadge.accessibilityDescription?.contains("week 95 percent remaining") == true &&
             weeklyBadge.accessibilityDescription?.contains("5 hours") == false,
             "Weekly-only badge is a single bounded number without a five-hour label")
@@ -44,7 +44,7 @@ struct AppFeatureSmoke {
         let claudeUsage = ClaudeUsageSnapshot(fiveHour: ClaudeUsageWindow(usedPercentage: 25),
             sevenDay: nil, observedAt: Date(), source: .nativeBridge, isStale: false, accountVerified: true)
         let claudeBadge = ClaudeIconRenderer.render(snapshot: claudeUsage, primaryShowsUsed: false, secondaryShowsUsed: true)
-        try Self.require(claudeBadge.size.height == 23 && claudeBadge.size.width < 70 && !claudeBadge.isTemplate,
+        try Self.require(claudeBadge.size.height == 23 && claudeBadge.size.width < 100 && !claudeBadge.isTemplate,
             "Claude badge stays compact and colored")
         try Self.require(claudeBadge.accessibilityDescription?.contains("75 percent remaining") == true &&
             claudeBadge.accessibilityDescription?.contains("week unavailable") == true,
@@ -60,6 +60,35 @@ struct AppFeatureSmoke {
         try Self.require(expiredBadge.accessibilityDescription?.contains("5 hours unavailable") == true &&
             expiredBadge.accessibilityDescription?.contains("week 70 percent remaining") == true,
             "Expired window stays unavailable without hiding a current independent window")
+        let preferenceSuite = "fixture-menu-providers-\(UUID().uuidString)"
+        let providerDefaults = UserDefaults(suiteName: preferenceSuite)!
+        defer { providerDefaults.removePersistentDomain(forName: preferenceSuite) }
+        try Self.require(MenuBarProviders.selection(in: providerDefaults) == .both,
+            "Default providers preserve both indicators")
+        providerDefaults.set(false, forKey: "showClaudeInMenuBar")
+        try Self.require(MenuBarProviders.selection(in: providerDefaults) == .codex,
+            "Legacy Claude visibility migrates without hiding Codex")
+        for choice in MenuBarProviders.allCases {
+            MenuBarProviders.set(choice, in: providerDefaults)
+            try Self.require(MenuBarProviders.selection(in: providerDefaults) == choice &&
+                providerDefaults.bool(forKey: "showClaudeInMenuBar") == choice.showsClaude,
+                "Provider selection persists and mirrors legacy preference")
+        }
+        providerDefaults.set("invalid", forKey: MenuBarProviders.key)
+        try Self.require(MenuBarProviders.selection(in: providerDefaults) == .both,
+            "Invalid selection falls back to visible providers")
+        let combined = MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .both)
+        try Self.require(combined.size.height == 23 && !combined.isTemplate &&
+            combined.size.width == ceil(weeklyBadge.size.width) + ceil(claudeBadge.size.width) + 8 &&
+            combined.accessibilityDescription?.contains("Codex") == true &&
+            combined.accessibilityDescription?.contains("Claude Code") == true,
+            "Both providers form one adjacent menu bar image with explicit identities")
+        try Self.require(MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .codex)
+            .accessibilityDescription?.contains("Claude Code") == false,
+            "Codex-only selection excludes Claude")
+        try Self.require(MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .claude)
+            .accessibilityDescription?.contains("Codex") == false,
+            "Claude-only selection excludes Codex")
         try Self.require(QuotaDisplayPreferences.value(usedPercent: 101, showsUsed: false) == 0, "Clamp remaining")
         let plist = try PropertyListSerialization.data(fromPropertyList: ["Label":"fixture.login",
             "ProgramArguments":["/usr/bin/open","-a","/fixture/Test.app","--args","--launch-at-login"],

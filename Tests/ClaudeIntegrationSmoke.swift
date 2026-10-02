@@ -192,6 +192,7 @@ struct ClaudeIntegrationSmoke {
                     "Custom managed statusLine is preserved without importing default")
         try installer.restore(profile: managed)
 
+        try await ClaudeCurrentUsageChecks.run(root: root, home: dedicatedHome, environment: environment, bridge: bridge)
         let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge)
         var callbackCount = 0
         store.onChange = { callbackCount += 1 }

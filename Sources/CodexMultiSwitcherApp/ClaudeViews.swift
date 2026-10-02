@@ -43,7 +43,8 @@ private struct ClaudeQuotaControls: View {
 struct ClaudeProfilesTab: View {
     @ObservedObject var store: ClaudeProfileStore
     @ObservedObject var toast: ToastState
-    @AppStorage("showClaudeInMenuBar") private var showClaudeInMenuBar = true
+    @AppStorage(MenuBarProviders.key) private var menuBarProviders = ""
+    @AppStorage("showClaudeInMenuBar") private var legacyShowClaude = true
     @State private var detailID: String?
     @State private var label = ""
     @State private var editingID: String?
@@ -136,7 +137,15 @@ struct ClaudeProfilesTab: View {
         return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Claude Code").font(.system(size: 17, weight: .semibold))
-                Toggle("Show Claude in menu bar", isOn: $showClaudeInMenuBar)
+                Toggle("Show Claude in menu bar", isOn: Binding(
+                    get: {
+                        _ = self.menuBarProviders
+                        _ = self.legacyShowClaude
+                        return MenuBarProviders.selection().showsClaude
+                    },
+                    set: { show in
+                        MenuBarProviders.set(show ? .both : .codex)
+                    }))
                     .font(.system(size: 12))
                 Text("Choose an account for new Claude terminal sessions. Existing sessions keep their current account.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
@@ -196,8 +205,10 @@ struct ClaudeProfilesTab: View {
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Usage bridge").font(.system(size: 13, weight: .semibold))
-                    Text("Install a statusline bridge in this account’s Claude settings to record usage from future Claude sessions. It preserves the output of your existing statusline command.")
+                    Text("Optional usage bridge").font(.system(size: 13, weight: .semibold))
+                    Text(profile.isDefault
+                        ? "Current usage can be read automatically for your existing default Claude account. The optional statusline bridge records usage from future sessions as a fallback and preserves your existing statusline output."
+                        : "Separate Claude accounts use the statusline bridge to record usage from future sessions. It preserves the output of your existing statusline command.")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                     HStack {
                         Button(status?.bridgeInstalled == true ? "Update Usage Bridge" : "Install Bridge for This Account") {
@@ -210,7 +221,9 @@ struct ClaudeProfilesTab: View {
                         }
                     }
                     .disabled(status?.busy == true)
-                    Text("Usage updates when Claude emits statusline data. Refresh reads the saved observation.")
+                    Text(profile.isDefault
+                        ? "Refresh checks available account usage without changing your sign-in. Bridge observations update when Claude emits statusline data."
+                        : "Refresh reads the saved bridge observation. Send a new Claude response to update it.")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)
                 }
             }
@@ -256,6 +269,8 @@ private func claudeAccountLabel(_ status: ClaudeProfileStatus?) -> String {
 
 private func claudeSourceLabel(_ snapshot: ClaudeUsageSnapshot) -> String {
     switch snapshot.source {
+    case .oauthUsage:
+        return snapshot.accountVerified ? "Claude account usage · account matched" : "Claude account usage · account unverified"
     case .legacyStatusline: return "Legacy statusline cache · account unverified"
     case .nativeBridge:
         return snapshot.accountVerified ? "Claude bridge · account matched" : "Claude bridge · account unverified"
@@ -292,7 +307,7 @@ private struct ClaudeUsageDetail: View {
                 Text("Observed \(snapshot.observedAt.formatted(date: .abbreviated, time: .standard))")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
             } else {
-                Text("No Claude usage observation available. Install the bridge and use a new Claude session.")
+                Text("Claude usage is not available yet. Refresh can check the existing default account automatically. Separate accounts use the bridge and a new Claude session.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
@@ -306,8 +321,8 @@ private struct ClaudeUsageDetail: View {
                 Text(value.map { claudePercent($0.usedPercentage, showsUsed: showsUsed, cached: claudeUsageIsCached(snapshot, window: $0)) } ?? "Unavailable")
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                     .help(claudeUsageIsCached(snapshot, window: value)
-                        ? "Cached observation. Send a new Claude response to update usage."
-                        : "Quota observed from Claude’s statusline")
+                        ? "Cached observation. Refresh checks the default account; separate accounts update through a new Claude response using the bridge."
+                        : "Account usage or a saved Claude statusline observation; see the source below")
             }
             if let value, value.usedPercentage.isFinite {
                 UsageBar(percent: claudeDisplayValue(value.usedPercentage, showsUsed: showsUsed),
@@ -466,8 +481,8 @@ private struct ClaudeMenuProfileRow: View {
                 Text(claudePercent(window.usedPercentage, showsUsed: showsUsed, cached: claudeUsageIsCached(status?.usage, window: window)))
                     .frame(width: claudeUsageIsCached(status?.usage, window: window) ? 108 : 62, alignment: .trailing)
                     .help(claudeUsageIsCached(status?.usage, window: window)
-                        ? "Cached observation. Send a new Claude response to update usage."
-                        : "Quota observed from Claude’s statusline")
+                        ? "Cached observation. Refresh checks the default account; separate accounts update through a new Claude response using the bridge."
+                        : "Account usage or a saved Claude statusline observation; see the source below")
                 Text(window.resetsAt.map { $0 > Date() ? resetCountdown(from: $0) : "Due" } ?? "—")
                     .frame(width: 44, alignment: .trailing).lineLimit(1)
                     .help(window.resetsAt.map { "Resets \($0.formatted(date: .complete, time: .standard))" } ?? "Reset time unavailable")
