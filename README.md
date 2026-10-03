@@ -50,6 +50,21 @@ saved sign-in remains blocked for activation until re-authenticated.
 Cached or failed-refresh observations are gray and explicitly labelled. Menu bar
 colors use lighter rose, yellow and jade with an outline and shadow for contrast.
 
+The active Codex account checks for usage about every 30 seconds and its menu bar
+percentage updates once that response is validated, without waiting for other
+accounts. Other accounts use the
+background interval selected in **Settings → General** (five minutes by default).
+The active refresh has its own toggle and continues while the menu is open.
+Menu-open refresh checks the active account; **Refresh All** or Command-R updates
+all accounts. Failed requests retain a labelled cached observation. Percentages
+come from Codex's response and can reflect the service's own reporting delay.
+Refresh also reads supplied banked reset inventory; it does not redeem a reset.
+
+Click the **Codex** or **Claude Code** menu heading to collapse or expand that
+provider's details. Each choice is saved across launches. Collapsing a section
+does not stop its usage updates or change the providers shown in the menu bar.
+You can also open it from **File → Show Usage Menu** while Settings is focused.
+
 In **Settings → Codex**, each reset with a supplied ID shows its grant date, expiry, and remaining time. **Use now** confirms a manual redemption. **Schedule automatic reset** lets you explicitly enable a date/time or 1–720 hours before expiry. No schedules are created automatically. A schedule whose chosen trigger has already passed is labelled **Enable and run now**. Times use the Mac's local time zone.
 
 Scheduling is local: this app must be running, the Mac awake, and the network available. The app checks every minute and after launch/wake; it does not wake a sleeping Mac or ask the server to schedule a future reset. A schedule is bound to one exact reset and account. The request ID is journaled before sending and reused when an uncertain request is retried. Cancelling stops future attempts and cannot undo a request already accepted by Codex. If a scheduled attempt reports nothing to reset, the credit remains and the schedule retries after 15 minutes; a manual no-op stops immediately.
@@ -96,7 +111,7 @@ default profile's settings or credentials.
 **Settings → General → Show in menu bar** chooses Codex only, Claude Code only,
 or both. Both indicators are drawn in one menu bar item and stay adjacent.
 Hold **Command (⌘)** and drag the item beside Wi-Fi or the battery to place it;
-macOS manages its location. A high-contrast monochrome terminal symbol identifies Codex; an orange
+macOS manages its location. A white ChatGPT/OpenAI knot on a black badge identifies Codex; an orange
 asterisk identifies Claude beside their quota numbers. The Claude indicator shows five-hour and weekly quota for the
 selected Claude account. Each period has independent **Left/Used** controls.
 Missing individual windows show a dash; when no current Claude windows exist,

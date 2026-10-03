@@ -11,6 +11,7 @@ final class UsageProvider {
     private var refreshTask: Task<Void, Never>?
     private var refreshGeneration: UUID?
     private var lastRefreshAll: Date = .distantPast
+    private var lastRefreshActive: [String: Date] = [:]
     private(set) var isRefreshing = false
     /// Leases currently held by this refresh cycle, keyed by profile ID, so
     /// `cancelRefreshes()` can release them immediately instead of waiting on
@@ -26,6 +27,8 @@ final class UsageProvider {
     /// before any claim, which makes the ordering deterministic.
     private var pendingLeaseRelease: Task<Void, Never>?
     var onRefreshComplete: (() -> Void)?
+    /// Fired after a profile's guarded status update, before slower profiles finish.
+    var onProfileRefresh: ((String) -> Void)?
 
     init(store: ProfileStore) {
         self.store = store
@@ -79,16 +82,42 @@ final class UsageProvider {
             return
         }
 
-        self.lastRefreshAll = Date()
-        self.isRefreshing = true
-        let generation = UUID()
-        self.refreshGeneration = generation
-
-        let profiles = self.store.config.profiles
+        let now = Date()
+        self.lastRefreshAll = now
         let liveId = self.store.liveProfileId ?? ""
+        let profiles = self.store.config.profiles.sorted {
+            // Keep stable profile order while scheduling the active credential first.
+            ($0.id == liveId ? 0 : 1) < ($1.id == liveId ? 0 : 1)
+        }
+        if profiles.contains(where: { $0.id == liveId }) {
+            self.lastRefreshActive[liveId] = now
+        }
         let contexts = profiles.map { p in
             RefreshContext(id: p.id, cached: self.store.cache.snapshots[p.id], isLive: p.id == liveId)
         }
+        self.startRefresh(contexts: contexts)
+    }
+
+    /// Cheap timer/menu refresh of only the current profile. Shares the full refresh's
+    /// lifecycle so cancellation, renewal coordination and leases remain serialized.
+    func refreshActive(force: Bool = false) {
+        guard !self.isRefreshing, !self.store.isAuthMutationInProgress(),
+              let id = self.store.liveProfileId,
+              self.store.config.profiles.contains(where: { $0.id == id }) else { return }
+        let now = Date()
+        // A slightly late timer fire must not make the next 30s tick miss its
+        // cooldown by a fraction of a second and defer the refresh to 60s.
+        let activeCooldown = max(1, RefreshPreferences.activeAccountRefreshInterval - 1)
+        guard force || now.timeIntervalSince(self.lastRefreshActive[id] ?? .distantPast) >= activeCooldown else { return }
+        self.store.reloadRenewalStatesFromDisk()
+        self.lastRefreshActive[id] = now
+        self.startRefresh(contexts: [RefreshContext(id: id, cached: self.store.cache.snapshots[id], isLive: true)])
+    }
+
+    private func startRefresh(contexts: [RefreshContext]) {
+        self.isRefreshing = true
+        let generation = UUID()
+        self.refreshGeneration = generation
         let source = self.store.usageAuthSource()
 
         self.refreshTask = Task { @MainActor in
@@ -181,7 +210,18 @@ final class UsageProvider {
                                            queryAuthData: queryAuthData, loadError: loadError)
             }
         }
-        return Array(groups.values)
+        // Dictionary iteration order must not push the active account behind slow
+        // inactive requests. Preserve the supplied order for the other groups.
+        let order = Dictionary(contexts.enumerated().map { ($0.element.id, $0.offset) },
+                               uniquingKeysWith: min)
+        return groups.values.sorted { lhs, rhs in
+            let leftLive = lhs.contexts.contains(where: \.isLive)
+            let rightLive = rhs.contexts.contains(where: \.isLive)
+            if leftLive != rightLive { return leftLive }
+            let leftOrder = lhs.contexts.compactMap { order[$0.id] }.min() ?? Int.max
+            let rightOrder = rhs.contexts.compactMap { order[$0.id] }.min() ?? Int.max
+            return leftOrder < rightOrder
+        }
     }
 
     /// Mirrors the CLI's `renewalCredentialFingerprint`: SHA-256 of the refresh
@@ -206,13 +246,19 @@ final class UsageProvider {
             ($0.id, ProfileRefreshDiagnostics(lastAttemptAt: Date()))
         })
 
+        func canFinalize(_ context: RefreshContext) -> Bool {
+            !Task.isCancelled && self.refreshGeneration == generation
+                && !self.store.isAuthMutationInProgress()
+                && context.isLive == (context.id == (self.store.liveProfileId ?? ""))
+                && self.store.config.profiles.contains(where: { $0.id == context.id })
+        }
+
         func finalize(
             _ context: RefreshContext, _ status: ProfileStatus, decision: String
         ) async {
             // Bail if the refresh was cancelled (e.g. by cancelRefreshes() during
             // a profile switch). Prevents in-flight stale writes from landing.
-            guard !Task.isCancelled, self.refreshGeneration == generation,
-                  !self.store.isAuthMutationInProgress() else { return }
+            guard canFinalize(context) else { return }
 
             // Re-derive liveness at finalize time. The snapshot was fetched under
             // whichever credentials were live at refresh START; if the live
@@ -220,8 +266,6 @@ final class UsageProvider {
             // auth.json and must not be written under `id`. The post-switch forced
             // refreshAll will supply correct data, so we drop the result here.
             let currentlyLive = context.id == (self.store.liveProfileId ?? "")
-            if context.isLive != currentlyLive { return }
-
             diagnostics[context.id]?.lastDecision = decision
             // A new login can replace the same profile slot during a fetch.
             // Re-read its credential off the main actor and reject results
@@ -231,20 +275,21 @@ final class UsageProvider {
                 currentAuth = try await Self.loadAuthData(
                     source: source, profileID: context.id, isLive: currentlyLive)
             } catch {
-                guard !Task.isCancelled, self.refreshGeneration == generation else { return }
+                guard canFinalize(context) else { return }
                 diagnostics[context.id]?.lastError = error.localizedDescription
                 diagnostics[context.id]?.lastDecision = "auth-unavailable"
                 self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
                 self.store.updateStatus(context.id, .stale(context.cached))
+                self.onProfileRefresh?(context.id)
                 return
             }
-            guard !Task.isCancelled, self.refreshGeneration == generation else { return }
-            guard !self.store.isAuthMutationInProgress() else { return }
+            guard canFinalize(context) else { return }
             if currentAuth == nil {
                 let overrideDecision = context.cached != nil ? "relogin-needed" : "not-set-up"
                 diagnostics[context.id]?.lastDecision = overrideDecision
                 self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
                 self.store.updateStatus(context.id, context.cached.map { .reloginNeeded($0) } ?? .notSetUp)
+                self.onProfileRefresh?(context.id)
                 return
             }
             if context.usesReadOnlyLiveAuth, currentAuth?.isReadOnlyLive != true {
@@ -254,6 +299,7 @@ final class UsageProvider {
                 diagnostics[context.id]?.lastDecision = "live-read-only-source-changed"
                 self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
                 self.store.updateStatus(context.id, .stale(context.cached))
+                self.onProfileRefresh?(context.id)
                 return
             }
             if let fetchedAuth = fetchGroup.authData, let currentAuth,
@@ -269,10 +315,12 @@ final class UsageProvider {
                 diagnostics[context.id]?.lastDecision = "available-live-read-only"
                 self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
                 self.store.updateLiveUsageSnapshot(context.id, snapshot)
+                self.onProfileRefresh?(context.id)
                 return
             }
             self.store.updateRefreshDiagnostics(context.id, diagnostics[context.id]!)
             self.store.updateStatus(context.id, status)
+            self.onProfileRefresh?(context.id)
         }
 
         guard let authData = fetchGroup.authData else {

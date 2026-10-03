@@ -27,3 +27,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+## ChatGPT / OpenAI provider mark
+
+`assets/openai-knot-menu.png` is the flat menu icon from OpenAI's installed
+ChatGPT application (`chatgptTemplate@2x.png`). The app renders its alpha mask
+in white as the Codex provider identifier. ChatGPT and OpenAI marks belong
+to OpenAI.

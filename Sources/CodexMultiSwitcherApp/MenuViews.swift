@@ -56,7 +56,7 @@ func planDisplayName(_ raw: String?) -> String {
 
 func updatedLabel(from date: Date, now: Date = Date()) -> String {
     let age = max(0, Int(now.timeIntervalSince(date)))
-    if age < 60 { return "Updated just now" }
+    if age < 60 { return "Updated \(age)s ago" }
 
     let minutes = age / 60
     if minutes < 60 { return "Updated \(minutes)m ago" }
@@ -341,18 +341,27 @@ struct UsageHeaderView: View {
     let failingProfiles: Int
     let trackedProfiles: Int
     var showsPrimaryControl = true
+    var updateSubject = "Latest account"
+    var showsTitle = true
 
     static let baseHeight: CGFloat = 68
     static let failureHeight: CGFloat = 83
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Codex")
-                .font(.system(size: 12, weight: .semibold))
+            if self.showsTitle {
+                Text("Codex")
+                    .font(.system(size: 12, weight: .semibold))
+            }
 
-            Text(self.statusLabel)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(self.statusLabel(now: context.date))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .help(self.statusLabel(now: context.date))
+            }
 
             QuotaDisplayControlsView(showsPrimary: self.showsPrimaryControl)
                 .padding(.top, 3)
@@ -374,10 +383,9 @@ struct UsageHeaderView: View {
         !self.isRefreshing && self.failingProfiles > 0
     }
 
-    private var statusLabel: String {
-        if self.isRefreshing { return "Refreshing..." }
-        guard let updatedAt else { return "No usage data" }
-        return updatedLabel(from: updatedAt)
+    private func statusLabel(now: Date) -> String {
+        let age = self.updatedAt.map { updatedLabel(from: $0, now: now) } ?? "No usage data"
+        return "\(self.updateSubject) · \(age)" + (self.isRefreshing ? " · Refreshing…" : "")
     }
 
     private var failureLabel: String {
@@ -385,6 +393,33 @@ struct UsageHeaderView: View {
             return "Refresh failing - numbers are out of date"
         }
         return "Refresh failing for \(self.failingProfiles) of \(self.trackedProfiles)"
+    }
+}
+
+struct ProviderSectionHeaderView: View {
+    static let height: CGFloat = 32
+
+    let title: String
+    let isCollapsed: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: self.onToggle) {
+            HStack(spacing: 7) {
+                Text(self.title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Image(systemName: self.isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: Self.height, maxHeight: Self.height, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint(self.isCollapsed ? "Expand section" : "Collapse section")
     }
 }
 
@@ -462,7 +497,7 @@ struct ProfileCardView: View {
     private var statusContent: some View {
         switch self.status {
         case .available(let snap):
-            self.usageBars(snap)
+            self.usageBars(snap, cached: UsageFreshness.isCached(fetchedAt: snap.fetchedAt, isActive: self.isActive))
         case .loading:
             Text("No data yet")
                 .font(.system(size: 10))
@@ -517,7 +552,7 @@ struct ProfileCardView: View {
                 BankedResetSummaryView(snapshot: snap)
             }
         }
-        .help(cached ? "Cached observation from \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened)). Refresh or sign in again to confirm current quota." : "Quota reported by Codex")
+        .help(cached ? "Cached observation from \(snap.fetchedAt.formatted(date: .abbreviated, time: .shortened)). Refresh to confirm current quota." : "Quota reported by Codex at \(snap.fetchedAt.formatted(date: .abbreviated, time: .standard))")
     }
 
     private var planType: String? {

@@ -48,6 +48,7 @@ cp "$BIN_DIR/CodexMultiSwitcher" "$STAGED_APP/Contents/MacOS/CodexMultiSwitcher"
 cp "$BIN_DIR/codex-profile" "$STAGED_APP/Contents/Helpers/codex-profile"
 cp "$ROOT_DIR/assets/AppIcon.icns" "$STAGED_APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT_DIR/assets/codex-multi-switcher-menu-icon-empty.png" "$STAGED_APP/Contents/Resources/"
+cp "$ROOT_DIR/assets/openai-knot-menu.png" "$STAGED_APP/Contents/Resources/"
 cp "$ROOT_DIR/Scripts/ClaudeStatuslineBridge.py" "$STAGED_APP/Contents/Resources/ClaudeStatuslineBridge.py"
 cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

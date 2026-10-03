@@ -43,6 +43,8 @@ enum RefreshInterval: String, CaseIterable, Identifiable {
 
 @MainActor
 final class RefreshPreferences: ObservableObject {
+    static let activeAccountRefreshInterval: TimeInterval = 30
+
     @Published var interval: RefreshInterval {
         didSet {
             self.defaults.set(self.interval.rawValue, forKey: Self.intervalKey)
@@ -55,14 +57,43 @@ final class RefreshPreferences: ObservableObject {
         }
     }
 
+    @Published var refreshActiveAccountAutomatically: Bool {
+        didSet {
+            self.defaults.set(self.refreshActiveAccountAutomatically, forKey: Self.activeAccountKey)
+        }
+    }
+
+    private static let activeAccountKey = UsageFreshness.activeAccountKey
     private static let intervalKey = "refreshInterval"
     private static let menuOpenKey = "refreshWhenMenuOpens"
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.interval = RefreshInterval(
+        let savedInterval = RefreshInterval(
             rawValue: defaults.string(forKey: Self.intervalKey) ?? "") ?? .fiveMinutes
-        self.refreshWhenMenuOpens = defaults.bool(forKey: Self.menuOpenKey)
+        self.interval = savedInterval
+        self.refreshWhenMenuOpens = defaults.object(forKey: Self.menuOpenKey) == nil
+            ? true : defaults.bool(forKey: Self.menuOpenKey)
+        self.refreshActiveAccountAutomatically = UsageFreshness.activeAccountRefreshEnabled(defaults: defaults)
+    }
+}
+
+/// Shared age policy for the menu icon, account cards, and Settings quota cards.
+enum UsageFreshness {
+    static let activeAccountKey = "refreshActiveAccountAutomatically"
+
+    static func activeAccountRefreshEnabled(defaults: UserDefaults = .standard) -> Bool {
+        if defaults.object(forKey: Self.activeAccountKey) != nil {
+            return defaults.bool(forKey: Self.activeAccountKey)
+        }
+        let interval = RefreshInterval(rawValue: defaults.string(forKey: "refreshInterval") ?? "") ?? .fiveMinutes
+        return interval != .manual
+    }
+
+    static func isCached(fetchedAt: Date, isActive: Bool, now: Date = Date(),
+                         defaults: UserDefaults = .standard) -> Bool {
+        let threshold: TimeInterval = isActive && Self.activeAccountRefreshEnabled(defaults: defaults) ? 90 : 300
+        return now.timeIntervalSince(fetchedAt) > threshold
     }
 }
