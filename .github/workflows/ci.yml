@@ -23,6 +23,9 @@ jobs:
           swift --version
           xcodebuild -version
 
+      - name: Codex rate-limit regression tests
+        run: swift test --filter CodexRateLimitsTests
+
       - name: Tests
         run: make test
 
