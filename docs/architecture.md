@@ -86,4 +86,10 @@ The signed app registers `com.codexmultiswitcher.app.renew` through `SMAppServic
 
 - Auth tokens stored in the Data Protection Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`; older ACL-backed copies move only through a reviewed, explicit Settings action
 - Log output redacts emails, bearer tokens, cookies, API keys, and OAuth fields
-- Two network destinations only: Codex's `app-server` JSON-RPC endpoint (via a local process, authenticated per-profile) for usage, and `https://auth.openai.com/oauth/token` for credential renewal
+- Codex network paths: Codex's `app-server` JSON-RPC endpoint (via a local process, authenticated per-profile) for usage, and `https://auth.openai.com/oauth/token` for credential renewal
+
+## Additional provider observations
+
+`CodexProfileCore/Providers` defines Foundation-only normalized snapshots and read-only adapters. Credential material and raw responses do not enter those values. `ExternalProviderStore` independently schedules Antigravity and GLM, bounds concurrent work to one request per provider, and replaces failures with an explicit unavailable state. A current percentage requires a verified unchanged credential context, an observation no older than three minutes, and a reset timestamp that has not passed. Unknown percentages never imply 100%.
+
+`AntigravityUsageReader` runs only version-gated `agy -p /usage --output-format json`. It retains independent Gemini/non-Gemini families and the server's shared window IDs. `GLMCodingPlanUsageService` accepts a user-supplied Personal Coding Plan key from the app’s own Keychain service and makes a bounded HTTPS quota GET to `api.z.ai`; the default ZCode loader refuses its encrypted credentials without reading or transmitting them; it disables cookies/cache and rejects redirects. Both compare credential context before and after a read. Manual GLM key changes also invalidate the snapshot and increment an app-store generation, rejecting any read started before the change. These paths observe quota and do not implement account switching or reset redemption. Provider visibility and per-bucket display modes are separate from account registries.

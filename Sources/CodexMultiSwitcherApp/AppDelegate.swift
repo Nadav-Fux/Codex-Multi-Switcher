@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var claudeMenuTooltip = "Claude Code — usage unavailable"
     private var claudeStore: ClaudeProfileStore!
     private var claudeRefreshTimer: Timer?
+    private var externalStore: ExternalProviderStore!
+    private var externalRefreshTimer: Timer?
     private var store: ProfileStore!
     private var usageProvider: UsageProvider!
     private var resetScheduler: BankedResetScheduler!
@@ -89,6 +91,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateClaudeIcon()
             if self?.isMenuOpen == true { self?.rebuildMenu() }
         }
+        self.externalStore = ExternalProviderStore(adapters: [AntigravityProviderAdapter(), GLMProviderAdapter()])
+        self.externalStore.onChange = { [weak self] in
+            self?.updateCombinedIcon()
+            if self?.isMenuOpen == true { self?.rebuildMenu() }
+        }
         self.usageProvider = UsageProvider(store: self.store)
         self.resetScheduler = BankedResetScheduler(store: self.store)
         self.resetScheduler.canRun = { [weak self] in
@@ -126,6 +133,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.updateIcon()
             }
         }
+        self.externalStore.refresh()
+        let externalTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.externalStore.refresh(); self?.updateCombinedIcon() }
+        }
+        RunLoop.main.add(externalTimer, forMode: .common)
+        self.externalRefreshTimer = externalTimer
         if self.canHandleRecoveryNotices {
             self.registerRecoveryNoticeObserver()
         }
@@ -227,6 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.periodicRefreshTimer?.invalidate()
         self.activeRefreshTimer?.invalidate()
         self.claudeRefreshTimer?.invalidate()
+        self.externalRefreshTimer?.invalidate()
         self.menuRefreshRetryTask?.cancel()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
@@ -239,6 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard self.store != nil, self.usageProvider != nil else { return }
         self.isMenuOpen = true
         self.claudeStore.refresh()
+        if self.refreshPreferences.refreshWhenMenuOpens { self.externalStore.refresh() }
         self.syncActiveProfile()
         self.rebuildMenu()
         if self.refreshPreferences.refreshWhenMenuOpens {
@@ -391,6 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleSystemWake() {
         guard self.store != nil, self.usageProvider != nil else { return }
         AppLogger.info("System woke; forcing usage refresh")
+        self.externalStore.refresh(force: true)
         self.claudeStore.refresh()
         self.syncActiveProfile(force: true)
         self.updateIcon()
@@ -513,13 +529,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateCombinedIcon() {
         guard self.statusItem != nil else { return }
-        let providers = MenuBarProviders.selection()
-        let codex = self.codexMenuImage ?? IconRenderer.renderEmpty()
-        let claude = self.claudeMenuImage ?? ClaudeIconRenderer.render(snapshot: nil,
-            primaryShowsUsed: false, secondaryShowsUsed: false)
-        self.statusItem.button?.image = MenuBarCompositeRenderer.render(codex: codex, claude: claude, providers: providers)
-        self.statusItem.button?.toolTip = [providers.showsCodex ? self.codexMenuTooltip : nil,
-            providers.showsClaude ? self.claudeMenuTooltip : nil].compactMap { $0 }.joined(separator: "\n")
+        let providers = ProviderVisibility.selection()
+        let selected = providers.map { provider -> (NSImage, String) in
+            switch provider {
+            case .codex: return (self.codexMenuImage ?? IconRenderer.renderEmpty(), "Codex")
+            case .claude: return (self.claudeMenuImage ?? ClaudeIconRenderer.render(snapshot: nil,
+                primaryShowsUsed: false, secondaryShowsUsed: false), "Claude Code")
+            case .antigravity, .glm:
+                return (ExternalProviderIconRenderer.render(provider: provider,
+                    snapshot: self.externalStore?.snapshots[provider]), provider.displayName)
+            }
+        }
+        self.statusItem.button?.image = MenuBarCompositeRenderer.render(selected: selected)
+        self.statusItem.button?.toolTip = providers.map { provider in
+            switch provider {
+            case .codex: return self.codexMenuTooltip
+            case .claude: return self.claudeMenuTooltip
+            case .antigravity, .glm:
+                let snapshot = self.externalStore?.snapshots[provider]
+                let message = ProviderQuotaPresentation.message(snapshot, provider: provider)
+                return provider.displayName + " · " + (message.isEmpty ? "Current subscription quota" : message)
+                    + (snapshot?.account?.displayName.map { " · " + $0 } ?? "")
+            }
+        }.joined(separator: "\n")
     }
 
     // MARK: - Menu Construction
@@ -619,6 +651,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         claudeItem.view = claudeHost
         self.menu.addItem(claudeItem)
         self.menu.addItem(.separator())
+
+        for provider in [ProviderID.antigravity, .glm] {
+            let key = "\(provider.rawValue)MenuSectionCollapsed"
+            let collapsed = UserDefaults.standard.bool(forKey: key)
+            let view = ExternalProviderMenuSection(store: self.externalStore, provider: provider,
+                isCollapsed: collapsed,
+                onToggle: { [weak self] in self?.toggleMenuSection(key) },
+                onSettings: { [weak self] in self?.showSettings(tab: provider == .antigravity ? 4 : 5) })
+            let host = NSHostingView(rootView: view)
+            host.frame = NSRect(x: 0, y: 0, width: 290, height: ExternalProviderMenuSection.height(
+                snapshot: self.externalStore.snapshots[provider], collapsed: collapsed))
+            let item = NSMenuItem()
+            item.view = host
+            self.menu.addItem(item)
+            self.menu.addItem(.separator())
+        }
 
         let refreshItem = self.menu.makeRefreshItem()
         refreshItem.setEnabled(!self.usageProvider.isRefreshing)
@@ -967,6 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshAll() {
+        self.externalStore.refresh(force: true)
         self.claudeStore.refresh()
         self.syncActiveProfile(force: true)
         self.requestRefresh(force: true)
@@ -1015,6 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             store: self.store,
             resetScheduler: self.resetScheduler,
             claudeStore: self.claudeStore,
+            externalStore: self.externalStore,
             initialTab: tab,
             refreshPreferences: self.refreshPreferences,
             actions: SettingsActions(

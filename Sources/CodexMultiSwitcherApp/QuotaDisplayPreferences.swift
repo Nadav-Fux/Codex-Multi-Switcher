@@ -1,4 +1,5 @@
 import SwiftUI
+import CodexProfileCore
 
 /// Shared by menu rows, settings cards, and the menu-bar image.
 enum QuotaDisplayPreferences {
@@ -60,5 +61,39 @@ enum MenuBarProviders: String, CaseIterable {
     static func set(_ selected: Self, in defaults: UserDefaults = .standard) {
         defaults.set(selected.rawValue, forKey: self.key)
         defaults.set(selected.showsClaude, forKey: "showClaudeInMenuBar")
+    }
+}
+
+/// Provider selection is extensible; migrate the old three-way choice on first read.
+enum ProviderVisibility {
+    static let key = "visibleUsageProviders"
+
+    static func selection(in defaults: UserDefaults = .standard) -> [ProviderID] {
+        if let stored = defaults.string(forKey: key)?.split(separator: ",").map(String.init) {
+            let ids = Set(stored.compactMap(ProviderID.init(rawValue:)))
+            if !ids.isEmpty { return ProviderID.allCases.filter { ids.contains($0) } }
+        }
+        let old = MenuBarProviders.selection(in: defaults)
+        return [.codex, .claude].filter { $0 == .codex ? old.showsCodex : old.showsClaude }
+    }
+
+    static func set(_ provider: ProviderID, visible: Bool, in defaults: UserDefaults = .standard) {
+        var selected = Set(selection(in: defaults))
+        if visible { selected.insert(provider) } else { selected.remove(provider) }
+        guard !selected.isEmpty else { return }
+        defaults.set(ProviderID.allCases.filter { selected.contains($0) }.map(\.rawValue).joined(separator: ","), forKey: key)
+    }
+}
+
+struct ProviderVisibilityControls: View {
+    @AppStorage(ProviderVisibility.key) private var selection = ""
+
+    var body: some View {
+        ForEach(ProviderID.allCases, id: \.rawValue) { provider in
+            Toggle(provider == .claude ? "Claude Code" : provider.displayName, isOn: Binding(
+                get: { _ = selection; return ProviderVisibility.selection().contains(provider) },
+                set: { ProviderVisibility.set(provider, visible: $0) }))
+            .disabled(ProviderVisibility.selection().count == 1 && ProviderVisibility.selection().contains(provider))
+        }
     }
 }

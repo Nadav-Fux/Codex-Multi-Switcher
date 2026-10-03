@@ -43,7 +43,7 @@ private struct ClaudeQuotaControls: View {
 struct ClaudeProfilesTab: View {
     @ObservedObject var store: ClaudeProfileStore
     @ObservedObject var toast: ToastState
-    @AppStorage(MenuBarProviders.key) private var menuBarProviders = ""
+    @AppStorage(ProviderVisibility.key) private var menuBarProviders = ""
     @AppStorage("showClaudeInMenuBar") private var legacyShowClaude = true
     @State private var detailID: String?
     @State private var label = ""
@@ -141,10 +141,10 @@ struct ClaudeProfilesTab: View {
                     get: {
                         _ = self.menuBarProviders
                         _ = self.legacyShowClaude
-                        return MenuBarProviders.selection().showsClaude
+                        return ProviderVisibility.selection().contains(.claude)
                     },
                     set: { show in
-                        MenuBarProviders.set(show ? .both : .codex)
+                        ProviderVisibility.set(.claude, visible: show)
                     }))
                     .font(.system(size: 12))
                 Text("Choose an account for new Claude terminal sessions. Existing sessions keep their current account.")

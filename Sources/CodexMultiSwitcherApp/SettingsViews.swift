@@ -27,6 +27,7 @@ enum SettingsWindow {
         store: ProfileStore,
         resetScheduler: BankedResetScheduler,
         claudeStore: ClaudeProfileStore,
+        externalStore: ExternalProviderStore,
         initialTab: Int = 0,
         refreshPreferences: RefreshPreferences,
         actions: SettingsActions
@@ -41,6 +42,7 @@ enum SettingsWindow {
                     store: store,
                     resetScheduler: resetScheduler,
                     claudeStore: claudeStore,
+                    externalStore: externalStore,
                     initialTab: initialTab,
                     refreshPreferences: refreshPreferences,
                     actions: actions,
@@ -68,6 +70,7 @@ enum SettingsWindow {
             store: store,
             resetScheduler: resetScheduler,
             claudeStore: claudeStore,
+                    externalStore: externalStore,
             initialTab: initialTab,
             refreshPreferences: refreshPreferences,
             actions: actions,
@@ -133,6 +136,7 @@ struct SettingsView: View {
     @ObservedObject var store: ProfileStore
     @ObservedObject var resetScheduler: BankedResetScheduler
     @ObservedObject var claudeStore: ClaudeProfileStore
+    @ObservedObject var externalStore: ExternalProviderStore
     let initialTab: Int
     @ObservedObject var refreshPreferences: RefreshPreferences
     let actions: SettingsActions
@@ -157,6 +161,8 @@ struct SettingsView: View {
                 Picker("", selection: self.$selectedTab) {
                     Label("Codex", systemImage: "person.2").tag(0)
                     Label("Claude Code", systemImage: "terminal").tag(3)
+                    Label("Antigravity", systemImage: "arrow.up.right").tag(4)
+                    Label("GLM / Z.ai", systemImage: "globe.asia.australia").tag(5)
                     Label("General", systemImage: "gearshape").tag(1)
                     Label("About", systemImage: "info.circle").tag(2)
                 }
@@ -170,6 +176,8 @@ struct SettingsView: View {
                 switch self.selectedTab {
                 case 0: ProfilesTab(store: self.store, resetScheduler: self.resetScheduler, actions: self.actions, toast: self.toast)
                 case 3: ClaudeProfilesTab(store: self.claudeStore, toast: self.toast)
+                case 4: ExternalProviderSettings(store: self.externalStore, provider: .antigravity)
+                case 5: ExternalProviderSettings(store: self.externalStore, provider: .glm)
                 case 1:
                     GeneralTab(
                         store: self.store,
@@ -586,7 +594,7 @@ struct ProfilesTab: View {
 }
 
 struct GeneralTab: View {
-    @AppStorage(MenuBarProviders.key) private var menuBarProviders = ""
+    @AppStorage(ProviderVisibility.key) private var menuBarProviders = ""
     @AppStorage("showClaudeInMenuBar") private var legacyShowClaude = true
     @AppStorage("showWeeklyResetCountdown") private var showWeeklyResetCountdown = true
     let store: ProfileStore
@@ -656,19 +664,8 @@ struct GeneralTab: View {
                 Text("MENU BAR")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Picker("Show in menu bar", selection: Binding(
-                    get: {
-                        _ = self.menuBarProviders
-                        _ = self.legacyShowClaude
-                        return MenuBarProviders.selection()
-                    },
-                    set: { MenuBarProviders.set($0) })) {
-                    ForEach(MenuBarProviders.allCases, id: \.rawValue) { provider in
-                        Text(provider.label).tag(provider)
-                    }
-                }
-                .pickerStyle(.menu)
-                Text("Both indicators stay together in one menu bar item. Hold Command and drag it to move it beside Wi-Fi or the battery. Choose the displayed Claude account in the Claude Code tab. A question mark means no current usage has been observed.")
+                ProviderVisibilityControls()
+                Text("Selected indicators stay together in one menu bar item. Hold Command and drag it beside Wi-Fi or the battery. Antigravity's G and O rows show your selected Gemini and other-model pools. A question mark means current usage is unavailable.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 Divider()
                 Text("REFRESHING")

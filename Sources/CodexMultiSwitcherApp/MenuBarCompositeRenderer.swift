@@ -5,12 +5,7 @@ enum MenuBarCompositeRenderer {
     private static let height: CGFloat = 23
     private static let gap: CGFloat = 8
 
-    static func render(codex: NSImage, claude: NSImage, providers: MenuBarProviders) -> NSImage {
-        let selected: [(NSImage, String)] = switch providers {
-        case .codex: [(codex, "Codex")]
-        case .claude: [(claude, "Claude Code")]
-        case .both: [(codex, "Codex"), (claude, "Claude Code")]
-        }
+    static func render(selected: [(NSImage, String)]) -> NSImage {
         let images = selected.map { Self.boundedImage($0.0, provider: $0.1) }
         let widths = images.map { image -> CGFloat in
             let scale = min(1, Self.height / image.size.height)
