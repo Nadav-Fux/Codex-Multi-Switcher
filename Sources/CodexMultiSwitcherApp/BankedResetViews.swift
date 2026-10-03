@@ -65,8 +65,13 @@ private struct QuotaWindowCard: View {
                 .foregroundStyle(self.tint)
                 UsageBar(percent: Double(value), tint: self.tint)
                 if let resetAt {
-                    Text("Resets \(resetAt.formatted(date: .abbreviated, time: .shortened))")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                    TimelineView(.periodic(from: .now, by: 30)) { context in
+                        Text(resetAt > context.date
+                             ? "Resets \(resetAt.formatted(date: .abbreviated, time: .shortened)) · \(resetCountdown(from: resetAt, now: context.date))"
+                             : "Reset due · refresh needed")
+                            .font(.system(size: 11))
+                            .foregroundStyle(ResetCountdownColor.color(for: resetAt, now: context.date, isStale: self.cached))
+                    }
                 } else {
                     Text("Reset time unavailable").font(.system(size: 11)).foregroundStyle(.secondary)
                 }

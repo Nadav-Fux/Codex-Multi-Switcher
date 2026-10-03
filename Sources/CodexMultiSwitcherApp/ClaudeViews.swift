@@ -277,9 +277,10 @@ private func claudeSourceLabel(_ snapshot: ClaudeUsageSnapshot) -> String {
     }
 }
 
-private func claudeUsageIsCached(_ snapshot: ClaudeUsageSnapshot?, window: ClaudeUsageWindow? = nil) -> Bool {
+private func claudeUsageIsCached(_ snapshot: ClaudeUsageSnapshot?, window: ClaudeUsageWindow? = nil,
+                                now: Date = Date()) -> Bool {
     guard let snapshot else { return false }
-    return snapshot.isStale || !snapshot.accountVerified || (window?.resetsAt.map { $0 <= Date() } ?? false)
+    return snapshot.isStale || !snapshot.accountVerified || (window?.resetsAt.map { $0 <= now } ?? false)
 }
 
 private func claudeFreshnessLabel(_ snapshot: ClaudeUsageSnapshot) -> String {
@@ -327,10 +328,16 @@ private struct ClaudeUsageDetail: View {
             if let value, value.usedPercentage.isFinite {
                 UsageBar(percent: claudeDisplayValue(value.usedPercentage, showsUsed: showsUsed),
                          tint: claudeQuotaColor(value.usedPercentage, cached: claudeUsageIsCached(snapshot, window: value)))
-                Text(value.resetsAt.map {
-                    "Resets \($0.formatted(date: .abbreviated, time: .standard)) · \(claudeCountdown($0))"
-                } ?? "Reset time unavailable")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(value.resetsAt.map {
+                        "Resets \($0.formatted(date: .abbreviated, time: .standard)) · \(claudeCountdown($0, now: context.date))"
+                    } ?? "Reset time unavailable")
+                    .font(.system(size: 10))
+                    .foregroundStyle(ResetCountdownColor.color(
+                        for: value.resetsAt,
+                        now: context.date,
+                        isStale: claudeUsageIsCached(snapshot, window: value, now: context.date)))
+                }
             }
         }
     }
@@ -351,8 +358,8 @@ private func claudeQuotaColor(_ used: Double, cached: Bool = false) -> Color {
     return remainingQuotaColor(for: Int((100 - min(100, max(0, used))).rounded()))
 }
 
-private func claudeCountdown(_ date: Date) -> String {
-    date > Date() ? resetCountdown(from: date) : "reset passed; waiting for a new Claude response"
+private func claudeCountdown(_ date: Date, now: Date = Date()) -> String {
+    date > now ? resetCountdown(from: date, now: now) : "reset passed; waiting for a new Claude response"
 }
 
 /// Menu height is fixed per visible row; extra accounts remain accessible in Settings.
@@ -495,9 +502,15 @@ private struct ClaudeMenuProfileRow: View {
                     .help(claudeUsageIsCached(status?.usage, window: window)
                         ? "Cached observation. Refresh checks the default account; separate accounts update through a new Claude response using the bridge."
                         : "Account usage or a saved Claude statusline observation; see the source below")
-                Text(window.resetsAt.map { $0 > Date() ? resetCountdown(from: $0) : "Due" } ?? "—")
-                    .frame(width: 44, alignment: .trailing).lineLimit(1)
-                    .help(window.resetsAt.map { "Resets \($0.formatted(date: .complete, time: .standard))" } ?? "Reset time unavailable")
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    Text(window.resetsAt.map { $0 > context.date ? resetCountdown(from: $0, now: context.date) : "Due" } ?? "—")
+                        .frame(width: 44, alignment: .trailing).lineLimit(1)
+                        .foregroundStyle(ResetCountdownColor.color(
+                            for: window.resetsAt,
+                            now: context.date,
+                            isStale: claudeUsageIsCached(status?.usage, window: window, now: context.date)))
+                        .help(window.resetsAt.map { "Resets \($0.formatted(date: .complete, time: .standard))" } ?? "Reset time unavailable")
+                }
             } else {
                 Text("Unavailable").foregroundStyle(.tertiary)
                 Spacer()

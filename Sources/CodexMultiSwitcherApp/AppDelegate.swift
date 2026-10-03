@@ -135,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         self.externalStore.refresh()
         let externalTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.externalStore.refresh(); self?.updateCombinedIcon() }
+            MainActor.assumeIsolated { self?.externalStore.refresh(); self?.updateIcon() }
         }
         RunLoop.main.add(externalTimer, forMode: .common)
         self.externalRefreshTimer = externalTimer

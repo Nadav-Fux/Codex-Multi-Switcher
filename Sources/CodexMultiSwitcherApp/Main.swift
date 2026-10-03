@@ -6,6 +6,31 @@ import CodexProfileCore
 #endif
 enum Main {
     static func main() {
+        // Let an explicitly authorized password manager/KV retrieval pipe a key
+        // into the signed app. Never accept the secret as a process argument.
+        if CommandLine.arguments.contains("--import-glm-key-from-stdin") {
+            guard CommandLine.arguments.dropFirst().elementsEqual(["--import-glm-key-from-stdin"]) else {
+                fputs("Usage: CodexMultiSwitcher --import-glm-key-from-stdin\n", stderr)
+                exit(64)
+            }
+            do {
+                var input = Data()
+                while let chunk = try FileHandle.standardInput.read(upToCount: 1024), !chunk.isEmpty {
+                    input.append(chunk)
+                    guard input.count <= 8192 else { throw GLMCredentialStore.Failure.invalidKey }
+                }
+                guard let key = String(data: input, encoding: .utf8) else {
+                    throw GLMCredentialStore.Failure.invalidKey
+                }
+                try GLMCredentialStore.save(key)
+                print("GLM key saved in this app's Keychain item.")
+                exit(0)
+            } catch {
+                // Fixed messages only: errors and input must not echo a key.
+                fputs("Could not import the GLM key. Check the key format and Keychain access.\n", stderr)
+                exit(1)
+            }
+        }
         #if CODEX_MULTI_SWITCHER_PREVIEW || CODEX_MULTI_SWITCHER_LOCAL
             // A double-clickable preview must always use its own profile home,
             // even when launched by Finder without development environment vars.

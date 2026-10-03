@@ -2,9 +2,13 @@ import Cocoa
 import CodexProfileCore
 import SwiftUI
 
-func resetCountdown(from date: Date?) -> String {
-    guard let date, date > Date() else { return "" }
-    let diff = Int(date.timeIntervalSinceNow)
+func resetCountdown(from date: Date?, now: Date = Date()) -> String {
+    guard let date else { return "" }
+    let remaining = date.timeIntervalSince(now)
+    guard remaining.isFinite, remaining > 0 else { return "" }
+    // Beyond a year, an exact day count adds little and can overflow Int for bad timestamps.
+    if remaining > 365 * 24 * 60 * 60 { return ">365d" }
+    let diff = Int(remaining)
     let days = diff / 86400
     let hours = (diff % 86400) / 3600
     let mins = (diff % 3600) / 60
@@ -19,7 +23,21 @@ enum Palette {
     static let success = Color(red: 0.40, green: 0.60, blue: 0.55)
     static let warning = Color(red: 0.75, green: 0.55, blue: 0.30)
     static let danger = Color(red: 0.75, green: 0.38, blue: 0.35)
+    static let resetRose = Color(red: 0.66, green: 0.43, blue: 0.49)
     static let mid = Color(red: 0.70, green: 0.55, blue: 0.35)
+}
+
+enum ResetCountdownColor {
+    static func color(for resetAt: Date?, now: Date = Date(), isStale: Bool = false) -> Color {
+        guard !isStale, let resetAt else { return .secondary }
+        let remaining = resetAt.timeIntervalSince(now)
+        guard remaining > 0 else { return .secondary }
+        if remaining <= 60 * 60 { return Palette.success }
+        if remaining <= 5 * 60 * 60 { return Palette.warning }
+        // Long windows such as weekly quotas read better as neutral metadata.
+        if remaining > 24 * 60 * 60 { return .secondary }
+        return Palette.resetRose
+    }
 }
 
 func remainingQuotaPercent(for usedPercent: Int) -> Int {
@@ -200,31 +218,35 @@ struct UsageRow: View {
     let isHighlighted: Bool
     let showsUsed: Bool
     var cached = false
-    private var showsCached: Bool { self.cached || self.resetAt.map { $0 <= Date() } == true }
 
     var body: some View {
-        HStack(spacing: 4) {
-            Text(self.label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(self.isHighlighted ? .primary : .secondary)
-                .frame(width: 24, alignment: .leading)
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            let now = context.date
+            let showsCached = self.cached || self.resetAt.map { $0 <= now } == true
+            let quotaColor = self.quotaColor(at: now)
+            HStack(spacing: 4) {
+                Text(self.label)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(self.isHighlighted ? .primary : .secondary)
+                    .frame(width: 24, alignment: .leading)
 
-            UsageBar(percent: Double(self.displayPercent), tint: self.quotaColor)
+                UsageBar(percent: Double(self.displayPercent), tint: quotaColor)
 
-            Text("\(self.showsCached ? "Cached " : "")\(self.displayPercent)% \(self.showsUsed ? "used" : "left")")
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(self.quotaColor)
-                .frame(width: self.showsCached ? 108 : 62, alignment: .trailing)
+                Text("\(showsCached ? "Cached " : "")\(self.displayPercent)% \(self.showsUsed ? "used" : "left")")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(quotaColor)
+                    .frame(width: showsCached ? 108 : 62, alignment: .trailing)
 
-            Text(resetCountdown(from: self.resetAt))
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(self.isHighlighted ? .secondary : .tertiary)
-                .frame(width: 42, alignment: .trailing)
-                .help(self.resetAt.map { "Quota resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
+                Text(resetCountdown(from: self.resetAt, now: now))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(ResetCountdownColor.color(for: self.resetAt, now: now, isStale: self.cached))
+                    .frame(width: 42, alignment: .trailing)
+                    .help(self.resetAt.map { "Quota resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(showsCached ? "Cached " : "")\(self.label) quota: \(self.displayPercent) percent \(self.showsUsed ? "used" : "remaining")")
+            .accessibilityValue(self.resetAt.map { "Resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(self.showsCached ? "Cached " : "")\(self.label) quota: \(self.displayPercent) percent \(self.showsUsed ? "used" : "remaining")")
-        .accessibilityValue(self.resetAt.map { "Resets \($0.formatted(date: .complete, time: .shortened))" } ?? "Reset time unavailable")
     }
 
     private var displayPercent: Int {
@@ -235,8 +257,9 @@ struct UsageRow: View {
         remainingQuotaPercent(for: self.usedPercent)
     }
 
-    private var quotaColor: Color {
-        self.showsCached ? .secondary : remainingQuotaColor(for: self.remainingPercent)
+    private func quotaColor(at now: Date) -> Color {
+        let showsCached = self.cached || self.resetAt.map { $0 <= now } == true
+        return showsCached ? .secondary : remainingQuotaColor(for: self.remainingPercent)
     }
 }
 
