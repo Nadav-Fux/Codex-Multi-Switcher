@@ -183,6 +183,7 @@ private struct BankedResetCreditCard: View {
     @State private var mode: BankedResetScheduleMode = .beforeExpiry
     @State private var date = Date().addingTimeInterval(3600)
     @State private var hours = 24
+    @State private var minutes = 0
     @State private var expanded = false
     @State private var working = false
     @State private var confirmUse = false
@@ -191,7 +192,11 @@ private struct BankedResetCreditCard: View {
         self.scheduler.schedule(for: self.profileID, creditID: self.credit.id)
     }
     private var trigger: Date? {
-        self.mode == .atDate ? self.date : self.credit.expiresAt?.addingTimeInterval(-Double(self.hours) * 3600)
+        self.mode == .atDate ? self.date : self.credit.expiresAt?.addingTimeInterval(-(Double(self.hours) * 60 + Double(self.minutes)) * 60)
+    }
+    private var validBeforeExpiryOffset: Bool {
+        (0...720).contains(self.hours) && (0...59).contains(self.minutes)
+            && (1...(720 * 60)).contains(self.hours * 60 + self.minutes)
     }
     private var canEdit: Bool { !AppInfo.isPreview && !self.scheduler.isRunning && !self.working && self.credit.isRedeemable() }
 
@@ -232,6 +237,7 @@ private struct BankedResetCreditCard: View {
         .onAppear {
             if let record = self.record {
                 self.mode = record.mode; self.date = record.scheduledAt; self.hours = record.hoursBeforeExpiry
+                self.minutes = record.minutesBeforeExpiry ?? 0
             } else if self.credit.expiresAt == nil { self.mode = .atDate }
         }
         .alert("Use this reset for \(self.profileLabel)?", isPresented: self.$confirmUse) {
@@ -251,7 +257,22 @@ private struct BankedResetCreditCard: View {
             if self.mode == .atDate {
                 DatePicker("Run at", selection: self.$date, displayedComponents: [.date, .hourAndMinute])
             } else {
-                Stepper("\(self.hours) hours before expiry", value: self.$hours, in: 1...720)
+                HStack(spacing: 6) {
+                    TextField("Hours", value: self.$hours, format: .number)
+                        .textFieldStyle(.roundedBorder).frame(width: 68)
+                    Text("hours")
+                    TextField("Minutes", value: self.$minutes, format: .number)
+                        .textFieldStyle(.roundedBorder).frame(width: 68)
+                    Text("minutes before expiry").foregroundStyle(.secondary)
+                }
+                .onChange(of: self.hours) { _, value in self.hours = min(720, max(0, value)) }
+                .onChange(of: self.minutes) { _, value in self.minutes = min(59, max(0, value)) }
+                if !self.validBeforeExpiryOffset {
+                    Text(self.hours == 0 && self.minutes == 0
+                         ? "Choose at least 1 minute before expiry."
+                         : "The maximum is 720 hours; use 0 minutes at that limit.")
+                        .font(.system(size: 11)).foregroundStyle(Palette.warning)
+                }
             }
             if let trigger = self.trigger {
                 Text(trigger <= Date() ? "Due now · enabling will run this reset immediately" : "Will run \(trigger.formatted(date: .abbreviated, time: .shortened))")
@@ -263,9 +284,10 @@ private struct BankedResetCreditCard: View {
             Button(self.trigger.map { $0 <= Date() } == true ? "Enable and run now" : "Save & enable schedule") {
                 self.perform {
                     try await self.scheduler.saveSchedule(profileID: self.profileID, credit: self.credit,
-                        mode: self.mode, date: self.date, hours: self.hours)
+                        mode: self.mode, date: self.date, hours: self.hours, minutes: self.minutes)
                 }
             }.buttonStyle(.borderedProminent).controlSize(.small)
+                .disabled(self.mode == .beforeExpiry && !self.validBeforeExpiryOffset)
             Text("No reset runs until you enable a schedule. A request that cannot be confirmed is retried with the same request ID.")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
         }.disabled(!self.canEdit)
