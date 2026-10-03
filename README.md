@@ -34,6 +34,16 @@ The local app uses profiles already set up in Preview, but points account switch
 
 When the Codex app-server supplies banked reset inventory, each profile card shows the available count and up to four supplied expirations with countdowns. The **Settings → Codex** tab shows every supplied expiry in the Mac's local time zone. Codex may report only the count or cap the detail list; the UI marks dates it could not obtain and never assumes a fixed number of resets. Banked resets are separate from automatic five-hour and weekly usage resets.
 
+## Additional usage providers
+
+Antigravity appears below Claude Code in the menu, with separate **Gemini** and **other-model** groups. Each group keeps the quota windows reported by the service (currently weekly and five-hour pools). Click its heading to collapse it; each window has its own saved **Left/Used** control and reset countdown. **Settings → Antigravity** selects the Gemini and other-model windows displayed in the menu bar. Quotas come from the installed official `agy` CLI's read-only `/usage` command, gated to supported versions; the current CLI account can differ from the IDE account. Its pseudonymous account identity is checked before and after reading.
+
+**GLM / Z.ai** appears next. Connect a Personal Z.ai Coding Plan API key in its Settings tab; **Save Key & Refresh** stores it in this app’s dedicated Keychain item. ZCode encrypts its account credentials per device, so the app does not read, decrypt, or transmit them. It queries the subscription quota endpoint with a bounded read-only request. Unknown windows stay unavailable, and a rejected key is reported explicitly. Changing or removing a key immediately clears its old quota and prevents in-flight results from reappearing. The connected quota source does not expose ZCode reset cards; redeem those in ZCode. See [GLM provider details](docs/glm-provider.md) and [Antigravity provider details](docs/antigravity-provider.md).
+
+**Settings → General → Menu Bar** selects any combination of the four providers. They stay adjacent in a single movable menu bar item. Existing Codex/Claude visibility preferences are preserved; enable new providers there when you want their indicators. New-provider usage refreshes about every 30 seconds while the app is running, with a slower retry after authentication failures and a manual Refresh option. Collapsing a section changes presentation only. Quota observation is independent of account switching; GLM and Antigravity switching is managed in their own apps.
+
+The shared provider model and read-only adapter interface live in `CodexProfileCore/Providers`, with grouped buckets, source, observation time, explicit availability, and separate credential handling. The new adapters use this interface without changing the existing Codex and Claude profile registries.
+
 ## Quota display and banked reset schedules
 
 For plans that report both windows, the larger menu bar numbers are labelled **5h** and **w**. Small **5h: Left/Used** and **week: Left/Used** buttons in the menu independently choose remaining percentage or usage towards 100%. The same controls appear in the Codex quota cards. Each choice persists across launches; colors always describe how much quota remains. Interior colors use a subdued jade, amber, and rose palette.
@@ -60,7 +70,7 @@ all accounts. Failed requests retain a labelled cached observation. Percentages
 come from Codex's response and can reflect the service's own reporting delay.
 Refresh also reads supplied banked reset inventory; it does not redeem a reset.
 
-Click the **Codex** or **Claude Code** menu heading to collapse or expand that
+Click any provider menu heading (**Codex**, **Claude Code**, **Antigravity**, or **GLM / Z.ai**) to collapse or expand that
 provider's details. Each choice is saved across launches. Collapsing a section
 does not stop its usage updates or change the providers shown in the menu bar.
 You can also open it from **File → Show Usage Menu** while Settings is focused.
