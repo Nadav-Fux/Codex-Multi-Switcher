@@ -27,7 +27,7 @@ final class BankedResetScheduler: ObservableObject {
                 let decoded = try decoder.decode([String: BankedResetSchedule].self, from: data)
                 guard decoded.allSatisfy({ key, value in key == value.id && !value.creditID.isEmpty
                     && !value.accountFingerprint.isEmpty && !value.idempotencyKey.isEmpty
-                    && (1...720).contains(value.hoursBeforeExpiry) }) else { throw ResetError.storageUnreadable }
+                    && value.hasValidBeforeExpiryOffset }) else { throw ResetError.storageUnreadable }
                 self.schedules = decoded
             }
             catch {
@@ -40,7 +40,7 @@ final class BankedResetScheduler: ObservableObject {
     func start() {
         guard !AppInfo.isPreview else { return }
         self.timer?.invalidate()
-        self.timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        self.timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkDueSchedules() }
         }
     }
@@ -50,8 +50,12 @@ final class BankedResetScheduler: ObservableObject {
     }
 
     func saveSchedule(profileID: String, credit: BankedResetCredit,
-                      mode: BankedResetScheduleMode, date: Date, hours: Int) async throws {
+                      mode: BankedResetScheduleMode, date: Date, hours: Int, minutes: Int = 0) async throws {
         guard !AppInfo.isPreview, !self.isRunning, self.operation == nil else { throw ResetError.busy }
+        if mode == .beforeExpiry {
+            guard (0...720).contains(hours), (0...59).contains(minutes),
+                  (1...(720 * 60)).contains(hours * 60 + minutes) else { throw ResetError.invalidOffset }
+        }
         let source = self.store.usageAuthSource()
         let data = try await Task.detached { try source.vault.loadAuthBlob(profileID: profileID) }.value
         guard let data, let fingerprint = AuthBlob.identityFingerprint(from: data) else { throw AuthError.notFound }
@@ -68,8 +72,13 @@ final class BankedResetScheduler: ObservableObject {
         if let previous = self.schedule(for: profileID, creditID: credit.id), previous.lastAttemptAt != nil, previous.completedAt == nil {
             throw ResetError.pendingAttempt
         }
+        let storedHours = mode == .beforeExpiry || ((0...720).contains(hours) && (0...59).contains(minutes)
+            && (1...(720 * 60)).contains(hours * 60 + minutes)) ? hours : 24
+        let storedMinutes = storedHours == hours ? minutes : 0
         let record = BankedResetSchedule(profileID: profileID, creditID: credit.id,
-            accountFingerprint: fingerprint, mode: mode, scheduledAt: date, hoursBeforeExpiry: hours, creditExpiresAt: credit.expiresAt, accountClaimFingerprints: AuthBlob.identityClaimFingerprints(from: data))
+            accountFingerprint: fingerprint, mode: mode, scheduledAt: date, hoursBeforeExpiry: storedHours,
+            minutesBeforeExpiry: storedMinutes, creditExpiresAt: credit.expiresAt,
+            accountClaimFingerprints: AuthBlob.identityClaimFingerprints(from: data))
         try self.persist(record)
         self.lastMessage = "Reset schedule saved."
         self.checkDueSchedules()
@@ -265,13 +274,14 @@ final class BankedResetScheduler: ObservableObject {
     }
 
     enum ResetError: LocalizedError {
-        case busy, unavailable, noExpiry, invalidDate, accountChanged, duplicate, storageUnreadable, pendingAttempt
+        case busy, unavailable, noExpiry, invalidDate, invalidOffset, accountChanged, duplicate, storageUnreadable, pendingAttempt
         var errorDescription: String? {
             switch self {
             case .busy: return "A refresh or profile operation is running. Try again shortly."
             case .unavailable: return "This reset has expired or is no longer available."
             case .noExpiry: return "This reset has no expiry date. Choose a specific date."
             case .invalidDate: return "Choose a future date before this reset expires."
+            case .invalidOffset: return "Choose between 1 minute and 720 hours before expiry."
             case .accountChanged: return "This profile now belongs to a different account. Save a new schedule for that account."
             case .duplicate: return "This reset is already scheduled for another profile of the same account."
             case .pendingAttempt: return "An earlier reset request is still awaiting confirmation. Retry that request to confirm its outcome before replacing the schedule."
