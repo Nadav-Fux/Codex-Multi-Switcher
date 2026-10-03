@@ -18,6 +18,6 @@ enum AppInfo {
         #endif
     }
     static let name = "CodexMultiSwitcher"
-    static let version = "0.2.2"
+    static let version = "0.2.4"
     static let issueURL = URL(string: "https://github.com/Nadav-Fux/codex-multi-switcher/issues/new")!
 }

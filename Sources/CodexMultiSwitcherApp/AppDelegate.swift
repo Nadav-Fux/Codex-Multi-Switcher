@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var resetScheduler: BankedResetScheduler!
     private var isRenewing = false
     private var periodicRefreshTimer: Timer?
+    private var activeRefreshTimer: Timer?
     private var menu: PersistentActionMenu!
     private weak var refreshMenuItem: PersistentRefreshMenuItem?
     private var liveAuthWarning: LiveAuthWarning?
@@ -23,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isMenuOpen = false
     private var menuRefreshRetryTask: Task<Void, Never>?
     private var hasPendingForcedRefresh = false
+    private var hasPendingActiveRefresh = false
     private var hasPendingRecoveryNotice = false
     private var hasShownRecoveryNotice = false
     private var canHandleRecoveryNotices = false
@@ -134,6 +136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.usageProvider.onRefreshComplete = { [weak self] in
             self?.handleRefreshComplete()
         }
+        self.usageProvider.onProfileRefresh = { [weak self] _ in
+            guard let self else { return }
+            self.updateIcon()
+            if self.isMenuOpen { self.rebuildMenu() }
+        }
         self.startPeriodicRefreshTimer()
         // Renewal and the first usage refresh both touch the shared lease/auth
         // state; requestRefresh() only schedules a Task while startRenewal()
@@ -218,6 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     deinit {
         self.periodicRefreshTimer?.invalidate()
+        self.activeRefreshTimer?.invalidate()
         self.claudeRefreshTimer?.invalidate()
         self.menuRefreshRetryTask?.cancel()
         NotificationCenter.default.removeObserver(self)
@@ -234,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.syncActiveProfile()
         self.rebuildMenu()
         if self.refreshPreferences.refreshWhenMenuOpens {
-            self.requestRefresh(force: true)
+            self.requestRefresh(activeOnly: true)
             self.scheduleOpenMenuRefreshRetry()
         }
     }
@@ -261,13 +269,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startPeriodicRefreshTimer() {
         self.periodicRefreshTimer?.invalidate()
         self.periodicRefreshTimer = nil
-        guard let interval = self.refreshPreferences.interval.timerInterval else { return }
-        self.periodicRefreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.syncActiveProfile()
-                self.requestRefresh()
+        self.activeRefreshTimer?.invalidate()
+        self.activeRefreshTimer = nil
+        if let interval = self.refreshPreferences.interval.timerInterval {
+            let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.syncActiveProfile()
+                    self.requestRefresh()
+                }
             }
+            timer.tolerance = min(5, interval * 0.05)
+            RunLoop.main.add(timer, forMode: .common)
+            self.periodicRefreshTimer = timer
+        }
+        if self.refreshPreferences.refreshActiveAccountAutomatically {
+            let timer = Timer(timeInterval: RefreshPreferences.activeAccountRefreshInterval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.syncActiveProfile()
+                    self.updateIcon()
+                    self.requestRefresh(activeOnly: true)
+                }
+            }
+            timer.tolerance = 0
+            RunLoop.main.add(timer, forMode: .common)
+            self.activeRefreshTimer = timer
         }
     }
 
@@ -297,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ result: Result<CodexBridge.CommandResult, CodexBridgeError>
     ) {
         self.isRenewing = false
-        defer { self.requestRefresh() }
+        defer { self.requestRefresh(force: self.hasPendingForcedRefresh) }
         switch result {
         case let .success(command):
             do {
@@ -373,14 +400,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidBecomeActive(_ notification: Notification) {
         guard self.store != nil, self.usageProvider != nil else { return }
         self.syncActiveProfile()
-        self.requestRefresh()
+        self.requestRefresh(activeOnly: true)
     }
 
     private func handleRefreshComplete() {
         guard self.store != nil, self.usageProvider != nil else { return }
         if self.hasPendingForcedRefresh {
             self.hasPendingForcedRefresh = false
+            self.hasPendingActiveRefresh = false
             self.requestRefresh(force: true)
+        } else if self.hasPendingActiveRefresh {
+            self.hasPendingActiveRefresh = false
+            self.requestRefresh(activeOnly: true)
         } else {
             self.refreshMenuItem?.setEnabled(true)
         }
@@ -398,20 +429,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard !Task.isCancelled else { return }
             guard self.isMenuOpen else { return }
             guard !self.usageProvider.isRefreshing else { return }
-            guard self.hasDisplayedStaleOrLoadingProfiles() else { return }
+            guard self.hasDisplayedStaleOrLoadingActiveProfile() else { return }
             AppLogger.info("Retrying menu-open usage refresh because stale data is still visible")
-            self.requestRefresh(force: true)
+            self.requestRefresh(activeOnly: true)
         }
     }
 
-    private func hasDisplayedStaleOrLoadingProfiles() -> Bool {
-        self.store.config.profiles.contains { profile in
-            switch self.store.statuses[profile.id] ?? .notSetUp {
-            case .loading, .stale:
-                return true
-            default:
-                return false
-            }
+    private func hasDisplayedStaleOrLoadingActiveProfile() -> Bool {
+        guard let id = self.store.liveProfileId else { return false }
+        switch self.store.statuses[id] ?? .notSetUp {
+        case .loading, .stale:
+            return true
+        default:
+            return false
         }
     }
 
@@ -430,7 +460,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if let status = self.store.statuses[displayedId], let snap = status.snapshot {
             let now = Date()
-            let cached = status.usageIsCached || now.timeIntervalSince(snap.fetchedAt) > 300
+            let cached = status.usageIsCached || UsageFreshness.isCached(
+                fetchedAt: snap.fetchedAt, isActive: self.store.liveProfileId == displayedId, now: now)
             let weeklyOnly = !snap.hasPrimaryWindow && snap.hasSecondaryWindow && snap.secondaryWindowDurationMins == 10080
             let primaryRemaining: Int? = snap.hasPrimaryWindow && (snap.primaryResetAt.map { $0 > now } ?? true)
                 ? max(0, min(100, 100 - snap.primaryUsedPercent)) : nil
@@ -522,56 +553,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.menu.addItem(.separator())
         }
 
-        self.addUsageHeader()
-        self.menu.addItem(.separator())
-
-        let healthRecords = ProfileHealth.build(
-            profiles: self.store.config.profiles,
-            statuses: self.store.statuses,
-            activeProfileId: self.store.liveProfileId,
-            canActivateAuth: { id in self.store.authCanBeActivated(for: id) })
-        var addedProfileSection = false
-        var addedRecommendation = false
-
-        if let activeHealth = healthRecords.first(where: \.isActive) {
-            self.addProfileCard(for: activeHealth)
-            addedProfileSection = true
+        let codexCollapsed = UserDefaults.standard.bool(forKey: "codexMenuSectionCollapsed")
+        self.addProviderSectionHeader(title: "Codex", collapsed: codexCollapsed) { [weak self] in
+            self?.toggleMenuSection("codexMenuSectionCollapsed")
         }
+        if !codexCollapsed {
+            self.addUsageHeader()
+            self.menu.addItem(.separator())
 
-        if let recommendation = ProfileHealth.recommendation(from: healthRecords) {
-            if addedProfileSection { self.menu.addItem(.separator()) }
-            self.addRecommendationItem(for: recommendation)
-            addedProfileSection = true
-            addedRecommendation = true
-        }
+            let healthRecords = ProfileHealth.build(
+                profiles: self.store.config.profiles,
+                statuses: self.store.statuses,
+                activeProfileId: self.store.liveProfileId,
+                canActivateAuth: { id in self.store.authCanBeActivated(for: id) })
+            var addedProfileSection = false
+            var addedRecommendation = false
 
-        let inactiveProfiles = ProfileHealth.menuOrderedInactive(healthRecords)
-        if !inactiveProfiles.isEmpty {
+            if let activeHealth = healthRecords.first(where: \.isActive) {
+                self.addProfileCard(for: activeHealth)
+                addedProfileSection = true
+            }
+
+            if let recommendation = ProfileHealth.recommendation(from: healthRecords) {
+                if addedProfileSection { self.menu.addItem(.separator()) }
+                self.addRecommendationItem(for: recommendation)
+                addedProfileSection = true
+                addedRecommendation = true
+            }
+
+            let inactiveProfiles = ProfileHealth.menuOrderedInactive(healthRecords)
+            if !inactiveProfiles.isEmpty {
+                if addedProfileSection {
+                    if addedRecommendation {
+                        self.menu.addItem(.separator())
+                    } else {
+                        self.addProfileDivider()
+                    }
+                }
+                for (index, health) in inactiveProfiles.enumerated() {
+                    self.addProfileCard(for: health)
+                    if index != inactiveProfiles.indices.last {
+                        self.addProfileDivider()
+                    }
+                }
+                addedProfileSection = true
+            }
+
             if addedProfileSection {
-                if addedRecommendation {
-                    self.menu.addItem(.separator())
-                } else {
-                    self.addProfileDivider()
-                }
+                self.menu.addItem(.separator())
             }
-            for (index, health) in inactiveProfiles.enumerated() {
-                self.addProfileCard(for: health)
-                if index != inactiveProfiles.indices.last {
-                    self.addProfileDivider()
-                }
-            }
-            addedProfileSection = true
-        }
-
-        if addedProfileSection {
+        } else {
             self.menu.addItem(.separator())
         }
 
+        let claudeCollapsed = UserDefaults.standard.bool(forKey: "claudeMenuSectionCollapsed")
         let claudeView = ClaudeMenuSectionView(store: self.claudeStore,
+            isCollapsed: claudeCollapsed,
+            onToggle: { [weak self] in self?.toggleMenuSection("claudeMenuSectionCollapsed") },
             onSettings: { [weak self] in self?.openClaudeSettings() },
             onOpen: { [weak self] id in self?.claudeStore.openSession(id: id) })
         let claudeHost = NSHostingView(rootView: claudeView)
-        claudeHost.frame = NSRect(x: 0, y: 0, width: 290, height: ClaudeMenuSectionView.height(for: self.claudeStore))
+        claudeHost.frame = NSRect(x: 0, y: 0, width: 290,
+            height: ClaudeMenuSectionView.height(for: self.claudeStore, isCollapsed: claudeCollapsed))
         let claudeItem = NSMenuItem()
         claudeItem.view = claudeHost
         self.menu.addItem(claudeItem)
@@ -603,6 +646,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private var visibleStatusButton: NSStatusBarButton? { self.statusItem?.button }
+
+    @objc func showUsageMenu() {
+        NSApp.mainMenu?.cancelTracking()
+        DispatchQueue.main.async { [weak self] in
+            self?.visibleStatusButton?.performClick(nil)
+        }
+    }
+
+    private func toggleMenuSection(_ key: String) {
+        UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: key), forKey: key)
+        // Resize after the SwiftUI button action has returned to menu tracking.
+        DispatchQueue.main.async { [weak self] in self?.rebuildMenu() }
+    }
+
+    private func addProviderSectionHeader(title: String, collapsed: Bool, onToggle: @escaping () -> Void) {
+        let view = ProviderSectionHeaderView(title: title, isCollapsed: collapsed, onToggle: onToggle)
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(x: 0, y: 0, width: 290, height: ProviderSectionHeaderView.height)
+        let item = NSMenuItem()
+        item.view = host
+        self.menu.addItem(item)
+    }
 
     private func prepareRecoveryNoticeIfNeeded() {
         guard self.canHandleRecoveryNotices else { return }
@@ -676,12 +741,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func addUsageHeader() {
-        let updatedAt = self.store.statuses.values
-            .compactMap { $0.snapshot?.fetchedAt }
-            .max()
-        // The age line alone reports the newest snapshot, so one healthy
-        // profile hides every broken one. Count the profiles whose last
-        // refresh recorded an error and say so outright.
+        // The header reports the displayed active account's observation. Other
+        // accounts can use a slower cadence, so their errors are counted separately.
         let tracked = self.store.config.profiles.filter { profile in
             switch self.store.statuses[profile.id] ?? .notSetUp {
             case .notSetUp: return false
@@ -693,12 +754,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let weeklyOnly = activeSnapshot.map { !$0.hasPrimaryWindow && $0.hasSecondaryWindow && $0.secondaryWindowDurationMins == 10080 } ?? false
         let header = UsageHeaderView(
             isRefreshing: self.usageProvider.isRefreshing,
-            updatedAt: updatedAt,
+            updatedAt: activeSnapshot?.fetchedAt,
             failingProfiles: failing.count,
             trackedProfiles: tracked.count,
-            showsPrimaryControl: !weeklyOnly)
+            showsPrimaryControl: !weeklyOnly,
+            updateSubject: "Active account",
+            showsTitle: false)
         let hostView = NSHostingView(rootView: header)
-        let height = header.showsFailure ? UsageHeaderView.failureHeight : UsageHeaderView.baseHeight
+        let height = (header.showsFailure ? UsageHeaderView.failureHeight : UsageHeaderView.baseHeight) - 16
         hostView.frame = NSRect(x: 0, y: 0, width: 290, height: height)
 
         let menuItem = NSMenuItem()
@@ -909,20 +972,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.requestRefresh(force: true)
     }
 
-    private func requestRefresh(force: Bool = false) {
-        if self.resetScheduler?.isRunning == true || self.isRenewing {
+    private func requestRefresh(force: Bool = false, activeOnly: Bool = false) {
+        if self.resetScheduler?.isRunning == true || self.isRenewing || self.store.isAuthMutationInProgress() {
             if force { self.hasPendingForcedRefresh = true }
+            if activeOnly { self.hasPendingActiveRefresh = true }
             return
         }
         if self.usageProvider.isRefreshing {
             if force {
                 self.hasPendingForcedRefresh = true
             }
+            if activeOnly { self.hasPendingActiveRefresh = true }
             self.refreshMenuItem?.setEnabled(false)
             return
         }
         self.refreshMenuItem?.setEnabled(false)
-        self.usageProvider.refreshAll(force: force)
+        if activeOnly {
+            self.usageProvider.refreshActive(force: force)
+        } else {
+            self.usageProvider.refreshAll(force: force)
+            if self.usageProvider.isRefreshing {
+                self.hasPendingActiveRefresh = false
+                self.hasPendingForcedRefresh = false
+            } else if self.hasPendingActiveRefresh {
+                self.hasPendingActiveRefresh = false
+                self.usageProvider.refreshActive()
+            }
+        }
         self.refreshMenuItem?.setEnabled(!self.usageProvider.isRefreshing)
         if self.isMenuOpen {
             self.rebuildMenu()

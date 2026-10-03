@@ -96,7 +96,7 @@ enum IconRenderer {
         return image
     }
 
-    // Provider identifiers are drawn locally; these are not official brand artwork.
+    // Codex uses the bundled flat OpenAI knot within a contrasting badge.
     private static func withCodexIdentifier(_ quota: NSImage) -> NSImage {
         let image = NSImage(size: NSSize(width: quota.size.width + 20, height: Self.iconHeight), flipped: true) { _ in
             Self.drawCodexIdentifier(in: NSRect(x: 1, y: 4, width: 15, height: 15))
@@ -109,32 +109,47 @@ enum IconRenderer {
         return image
     }
 
+    private static let openAIKnot: NSImage? = {
+        let name = "openai-knot-menu.png"
+        let candidates = [Bundle.main.resourceURL?.appendingPathComponent(name),
+            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(name)]
+        for url in candidates.compactMap({ $0 }) {
+            if let mask = NSImage(contentsOf: url) {
+                let size = mask.size
+                let whiteKnot = NSImage(size: size, flipped: false) { _ in
+                    // Tint in this isolated image so sourceIn cannot affect the black badge.
+                    NSGraphicsContext.current?.cgContext.setShadow(offset: .zero, blur: 0, color: nil)
+                    let bounds = NSRect(origin: .zero, size: size)
+                    mask.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1)
+                    NSColor.white.setFill()
+                    bounds.fill(using: .sourceIn)
+                    return true
+                }
+                whiteKnot.isTemplate = false
+                return whiteKnot
+            }
+        }
+        return nil
+    }()
+
     private static func drawCodexIdentifier(in rect: NSRect) {
-        // A terminal glyph identifies Codex without depending on another installed app.
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.8)
         shadow.shadowBlurRadius = 1.5
         shadow.shadowOffset = .zero
         shadow.set()
-        let color = NSColor(srgbRed: 0.93, green: 0.95, blue: 0.99, alpha: 1)
         let frame = NSBezierPath(roundedRect: rect, xRadius: 3, yRadius: 3)
         NSColor.black.setFill()
         frame.fill()
         NSColor.white.setStroke()
-        frame.lineWidth = 1
+        frame.lineWidth = 0.6
         frame.stroke()
-        color.setStroke()
-        let prompt = NSBezierPath()
-        prompt.move(to: NSPoint(x: rect.minX + 3.5, y: rect.minY + 4.5))
-        prompt.line(to: NSPoint(x: rect.minX + 6.5, y: rect.midY))
-        prompt.line(to: NSPoint(x: rect.minX + 3.5, y: rect.maxY - 4.5))
-        prompt.move(to: NSPoint(x: rect.minX + 8, y: rect.maxY - 4.5))
-        prompt.line(to: NSPoint(x: rect.maxX - 3, y: rect.maxY - 4.5))
-        prompt.lineWidth = 1.5
-        prompt.lineCapStyle = .round
-        prompt.lineJoinStyle = .round
-        prompt.stroke()
+        // The official template mask is tinted white in its own image; this badge supplies contrast.
+        if let knot = Self.openAIKnot {
+            knot.draw(in: rect.insetBy(dx: 1.2, dy: 1.2), from: .zero, operation: .sourceOver,
+                      fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+        }
         NSGraphicsContext.restoreGraphicsState()
     }
 

@@ -54,6 +54,11 @@ enum Main {
         appMenuItem.submenu = appMenu
 
         let fileMenu = NSMenu(title: "File")
+        let showUsageMenuItem = fileMenu.addItem(
+            withTitle: "Show Usage Menu",
+            action: #selector(AppDelegate.showUsageMenu),
+            keyEquivalent: "U")
+        fileMenu.addItem(.separator())
         fileMenu.addItem(
             withTitle: "Close Window",
             action: #selector(NSWindow.performClose(_:)),
@@ -88,6 +93,7 @@ enum Main {
         app.mainMenu = mainMenu
 
         let delegate = AppDelegate()
+        showUsageMenuItem.target = delegate
         app.delegate = delegate
         app.run()
     }

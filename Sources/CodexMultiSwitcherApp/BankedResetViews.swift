@@ -22,8 +22,10 @@ struct ProfileQuotaView: View {
                 QuotaWindowCard(title: "week", used: self.snapshot.hasSecondaryWindow ? self.snapshot.secondaryUsedPercent : nil,
                     resetAt: self.snapshot.secondaryResetAt, cached: self.cached, showsUsed: self.$secondaryShowsUsed)
             }
-            Text("\(self.cached ? "Cached · " : "")\(updatedLabel(from: self.snapshot.fetchedAt))")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text("\(self.cached ? "Cached · " : "")\(updatedLabel(from: self.snapshot.fetchedAt, now: context.date))")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
         }
     }
 }

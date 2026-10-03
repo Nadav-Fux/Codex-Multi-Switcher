@@ -402,6 +402,7 @@ log "Embedding Sparkle.framework..."
 cp -R "$SPARKLE_DIR/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 for icon in \
   codex-multi-switcher-menu-icon-empty.png \
+  openai-knot-menu.png \
   AppIcon.icns
 do
   if [[ -f "$ROOT_DIR/assets/$icon" ]]; then

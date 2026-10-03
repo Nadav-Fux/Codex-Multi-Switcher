@@ -358,15 +358,19 @@ private func claudeCountdown(_ date: Date) -> String {
 /// Menu height is fixed per visible row; extra accounts remain accessible in Settings.
 struct ClaudeMenuSectionView: View {
     @ObservedObject var store: ClaudeProfileStore
+    var isCollapsed = false
+    var onToggle: () -> Void = {}
     let onSettings: () -> Void
     let onOpen: (String) -> Void
     private static let visibleLimit = 3
     private static let rowHeight: CGFloat = 112
-    private static let headerHeight: CGFloat = 76
+    private static let headerHeight = ProviderSectionHeaderView.height
+    private static let detailsHeight: CGFloat = 44
     private static let footerHeight: CGFloat = 34
 
-    static func height(for store: ClaudeProfileStore) -> CGFloat {
-        headerHeight + (hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18) + visibleProfiles(in: store).reduce(CGFloat(0)) { height, profile in
+    static func height(for store: ClaudeProfileStore, isCollapsed: Bool = false) -> CGFloat {
+        guard !isCollapsed else { return headerHeight }
+        return headerHeight + detailsHeight + (hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18) + visibleProfiles(in: store).reduce(CGFloat(0)) { height, profile in
             height + rowHeight + (store.statuses[profile.id]?.usage?.modelWeekly == nil ? 0 : 16)
         } + footerHeight
     }
@@ -385,44 +389,52 @@ struct ClaudeMenuSectionView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Claude Code").font(.system(size: 12, weight: .semibold))
-                    Spacer()
+            HStack(spacing: 0) {
+                ProviderSectionHeaderView(title: "Claude Code", isCollapsed: self.isCollapsed, onToggle: self.onToggle)
+                if !self.isCollapsed {
                     Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).disabled(store.isRefreshing)
                         .accessibilityLabel("Refresh Claude usage")
-                }
-                Text(store.isRefreshing ? "Reading Claude accounts…" : "Accounts for new terminal sessions")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                ClaudeQuotaControls(showsModelWeek: visibleProfiles.contains { store.statuses[$0.id]?.usage?.modelWeekly != nil })
-                if let error = store.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 10)).foregroundStyle(Palette.warning)
-                        .lineLimit(1).help(error)
+                        .padding(.trailing, 10)
+                        .frame(height: Self.headerHeight)
                 }
             }
-            .padding(.horizontal, 10)
-            .frame(height: Self.headerHeight + (Self.hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18))
-            ForEach(visibleProfiles) { profile in
-                ClaudeMenuProfileRow(profile: profile, status: store.statuses[profile.id],
-                                     selected: profile.id == store.selectedID,
-                                     onChoose: { store.select(id: profile.id) },
-                                     onOpen: { onOpen(profile.id) })
-                    .frame(height: Self.rowHeight + (store.statuses[profile.id]?.usage?.modelWeekly == nil ? 0 : 16))
-            }
-            Button(action: onSettings) {
-                HStack {
-                    Text("Manage all Claude accounts (\(store.profiles.count))…")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.system(size: 9))
+            if !self.isCollapsed {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(store.isRefreshing ? "Reading Claude accounts…" : "Accounts for new terminal sessions")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                    }
+                    ClaudeQuotaControls(showsModelWeek: visibleProfiles.contains { store.statuses[$0.id]?.usage?.modelWeekly != nil })
+                    if let error = store.error {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 10)).foregroundStyle(Palette.warning)
+                            .lineLimit(1).help(error)
+                    }
                 }
-                .font(.system(size: 11)).padding(.horizontal, 10)
+                .padding(.horizontal, 10)
+                .frame(height: Self.detailsHeight + (Self.hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18))
+                ForEach(visibleProfiles) { profile in
+                    ClaudeMenuProfileRow(profile: profile, status: store.statuses[profile.id],
+                                         selected: profile.id == store.selectedID,
+                                         onChoose: { store.select(id: profile.id) },
+                                         onOpen: { onOpen(profile.id) })
+                        .frame(height: Self.rowHeight + (store.statuses[profile.id]?.usage?.modelWeekly == nil ? 0 : 16))
+                }
+                Button(action: onSettings) {
+                    HStack {
+                        Text("Manage all Claude accounts (\(store.profiles.count))…")
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.system(size: 9))
+                    }
+                    .font(.system(size: 11)).padding(.horizontal, 10)
+                }
+                .buttonStyle(.plain)
+                .frame(height: Self.footerHeight)
             }
-            .buttonStyle(.plain)
-            .frame(height: Self.footerHeight)
         }
-        .frame(width: 290, height: Self.height(for: store), alignment: .topLeading)
+        .frame(width: 290, height: Self.height(for: store, isCollapsed: self.isCollapsed), alignment: .topLeading)
     }
 }
 

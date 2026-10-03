@@ -402,7 +402,10 @@ struct ProfilesTab: View {
                     }
 
                     if let snapshot = status.snapshot {
-                        ProfileQuotaView(snapshot: snapshot, cached: status.usageIsCached && !self.store.isUsingLiveUsage(profile.id))
+                        ProfileQuotaView(snapshot: snapshot,
+                            cached: (status.usageIsCached && !self.store.isUsingLiveUsage(profile.id))
+                                || UsageFreshness.isCached(fetchedAt: snapshot.fetchedAt, isActive: isActive))
+                            .help("Quota observed \(snapshot.fetchedAt.formatted(date: .abbreviated, time: .standard))")
                         if self.store.isUsingLiveUsage(profile.id),
                            self.store.cache.renewalStates[profile.id]?.renewalAction == .rejected {
                             Text("Current desktop usage. Saved sign-in needs re-authentication.")
@@ -672,7 +675,15 @@ struct GeneralTab: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
 
-                Picker("Refresh interval", selection: self.$refreshPreferences.interval) {
+                Toggle("Keep active Codex usage up to date",
+                       isOn: self.$refreshPreferences.refreshActiveAccountAutomatically)
+                    .onChange(of: self.refreshPreferences.refreshActiveAccountAutomatically) { _, _ in
+                        self.actions.refreshScheduleChanged()
+                    }
+                Text("When enabled, the active Codex account refreshes every \(Int(RefreshPreferences.activeAccountRefreshInterval)) seconds. The interval below controls the other accounts.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+
+                Picker("Other accounts refresh interval", selection: self.$refreshPreferences.interval) {
                     ForEach(RefreshInterval.allCases) { interval in
                         Text(self.refreshIntervalLabel(interval)).tag(interval)
                     }
@@ -683,14 +694,17 @@ struct GeneralTab: View {
                 }
 
                 Toggle(
-                    "Refresh when the menu opens",
+                    "Refresh active Codex account when the menu opens",
                     isOn: self.$refreshPreferences.refreshWhenMenuOpens)
+                    .onChange(of: self.refreshPreferences.refreshWhenMenuOpens) { _, _ in
+                        self.actions.refreshScheduleChanged()
+                    }
                 Toggle("Show time until weekly reset", isOn: self.$showWeeklyResetCountdown)
                     .font(.system(size: 12))
                     .help("Show days and hours next to the weekly quota when the plan reports only a weekly window.")
 
                 if self.refreshPreferences.interval == .manual {
-                    Text("Automatic background refresh is off. Refresh from the menu or press Command-R.")
+                    Text("Automatic refresh for other accounts is off. Refresh them from the menu or press Command-R.")
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
                 }
