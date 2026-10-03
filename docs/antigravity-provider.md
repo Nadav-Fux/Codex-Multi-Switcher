@@ -11,3 +11,9 @@ References:
 - [CLI headless mode](https://www.antigravity.google/docs/cli/headless)
 - [CLI model quotas (`/usage`)](https://www.antigravity.google/docs/cli/commands/usage)
 - [Antigravity CLI changelog](https://www.antigravity.google/changelog?tab=cli)
+
+The menu bar and provider header use the Antigravity app mark on a transparent background. The display asset was derived from the black-background logo in the installed Antigravity IDE bundle; only its background was removed. Google/Antigravity branding identifies the quota source and does not imply affiliation.
+
+## Reset countdown colors
+
+Across Codex, Claude Code, Antigravity, and GLM, fresh future refill times are jade in the last hour, amber from one to five hours, and muted rose from five to 24 hours. Longer windows, expired/unknown times, and stale observations are neutral. These colors describe proximity to the reported refill; they do not claim the quota has already reset. Banked reset card expiry dates keep their separate expiry semantics.

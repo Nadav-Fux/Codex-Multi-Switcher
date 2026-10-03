@@ -2,7 +2,7 @@
 
 ## Connect a key
 
-Open **Settings → GLM / Z.ai**, enter your **personal Z.ai Coding Plan API key** in the SecureField, then choose **Save Key & Refresh**. You must enter the key yourself; the app does not obtain or add it for you. The key is stored in this app's dedicated Keychain item. Use **Remove Saved Key** to delete it.
+Open **Settings → GLM / Z.ai**, enter your **personal Z.ai Coding Plan API key** in the SecureField, then choose **Save Key & Refresh**. The app accepts a key you enter here, or an explicitly authorized import from your password manager/KV. It does not search your credentials automatically. The key is stored in this app's dedicated Keychain item. Use **Remove Saved Key** to delete it.
 
 The app does not read ZCode's account credential or OAuth token. ZCode documents `~/.zcode/v2/credentials.json` as encrypted per device, and documents account authorization and API-key mode as separate connection methods. A one-time read-only request using a locally stored ZCode value was rejected; that response does not establish that the credential expired or that the stored value was a usable API key. The app does not infer expiry or try undocumented authentication routes.
 
@@ -21,3 +21,9 @@ References:
 - [ZCode FAQ: credential storage and account authorization](https://zcode.z.ai/en/docs/qa)
 - [Z.ai Usage Query Plugin](https://docs.z.ai/devpack/extension/usage-query-plugin)
 - [Official quota query script](https://github.com/zai-org/zai-coding-plugins/blob/main/plugins/glm-plan-usage/skills/usage-query-skill/scripts/query-usage.mjs)
+
+## Authorized import from a password manager or KV
+
+A trusted retrieval tool can pipe the key to the installed app executable using `--import-glm-key-from-stdin`. The key is read from standard input, never from a command-line argument, and saved directly to the same app-specific Keychain item used by Settings. The importer prints only a fixed success or failure message, accepts at most 8 KB, and does not save an intermediate file. Restart the app or refresh GLM after importing.
+
+Use the executable from the installed app bundle so its Keychain service matches that app. Do not paste the key into a shell command, a chat message, or the repository. The app does not retain Cloudflare access credentials or continuously connect to KV.

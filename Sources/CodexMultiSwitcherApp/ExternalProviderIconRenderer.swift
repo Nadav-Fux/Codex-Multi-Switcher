@@ -3,6 +3,15 @@ import CodexProfileCore
 
 /// Compact quota rows retain the provider's separate model/window semantics.
 enum ExternalProviderIconRenderer {
+    static let antigravityLogo: NSImage? = {
+        let name = "antigravity-menu.png"
+        for url in [Bundle.main.resourceURL?.appendingPathComponent(name),
+                    Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(name)].compactMap({ $0 }) {
+            if let image = NSImage(contentsOf: url) { return image }
+        }
+        return nil
+    }()
+
     static func render(provider: ProviderID, snapshot: ProviderUsageSnapshot?) -> NSImage {
         let buckets = ProviderQuotaPresentation.selectedBuckets(snapshot)
         let rows = buckets.map { bucket -> (NSAttributedString, NSAttributedString) in
@@ -21,10 +30,17 @@ enum ExternalProviderIconRenderer {
             font: .systemFont(ofSize: 10, weight: .bold), color: .white))
         let numberWidth = rows.map { $0.0.size().width }.max() ?? 8
         let labelWidth = rows.map { $0.1.size().width }.max() ?? 0
-        let prefixWidth = identifier.size().width + 5
+        let logo = provider == .antigravity ? antigravityLogo : nil
+        let prefixWidth = logo != nil ? CGFloat(26) : identifier.size().width + 5
         let size = NSSize(width: ceil(prefixWidth + numberWidth + labelWidth + 5), height: 23)
         let image = NSImage(size: size, flipped: true) { _ in
-            identifier.draw(at: NSPoint(x: 0, y: (23 - identifier.size().height) / 2))
+            if let logo {
+                logo.draw(in: NSRect(x: 0, y: 0, width: 23, height: 23), from: .zero,
+                          operation: .sourceOver, fraction: 1, respectFlipped: true,
+                          hints: [.interpolation: NSImageInterpolation.high])
+            } else {
+                identifier.draw(at: NSPoint(x: 0, y: (23 - identifier.size().height) / 2))
+            }
             if rows.isEmpty {
                 let unknown = NSAttributedString(string: "?", attributes: IconRenderer.quotaTextAttributes(
                     font: .systemFont(ofSize: 10, weight: .semibold), color: IconRenderer.cachedQuotaColor))

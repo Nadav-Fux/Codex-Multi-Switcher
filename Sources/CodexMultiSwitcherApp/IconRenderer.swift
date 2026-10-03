@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import SwiftUI
 
 enum IconRenderer {
     private static let iconHeight: CGFloat = 23
@@ -79,10 +80,13 @@ enum IconRenderer {
         let color = cached ? Self.cachedQuotaColor : remaining.map(Self.color(for:)) ?? Self.cachedQuotaColor
         let number = NSAttributedString(string: value.map { "\($0)%" } ?? "—",
             attributes: Self.quotaTextAttributes(font: .monospacedDigitSystemFont(ofSize: 12, weight: .bold), color: color))
-        var suffix = "w"
-        if showResetCountdown, let countdown = Self.weeklyCountdown(resetAt) { suffix += " · " + countdown }
-        let detail = NSAttributedString(string: suffix,
+        let detail = NSMutableAttributedString(string: "w",
             attributes: Self.quotaTextAttributes(font: .monospacedDigitSystemFont(ofSize: 8, weight: .medium), color: color))
+        if showResetCountdown, let countdown = Self.weeklyCountdown(resetAt) {
+            detail.append(NSAttributedString(string: " · " + countdown,
+                attributes: Self.quotaTextAttributes(font: .monospacedDigitSystemFont(ofSize: 8, weight: .medium),
+                    color: NSColor(ResetCountdownColor.color(for: resetAt, isStale: cached)))))
+        }
         let width = ceil(number.size().width + detail.size().width + 7)
         let image = NSImage(size: NSSize(width: width, height: Self.iconHeight), flipped: true) { _ in
             number.draw(at: NSPoint(x: 2, y: (Self.iconHeight - number.size().height) / 2))

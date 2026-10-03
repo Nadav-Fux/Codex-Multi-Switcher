@@ -15,6 +15,10 @@ struct ExternalProviderMenuSection: View {
                 Button(action: onToggle) {
                     HStack(spacing: 6) {
                         Image(systemName: isCollapsed ? "chevron.right" : "chevron.down").font(.system(size: 9, weight: .semibold))
+                        if provider == .antigravity, let logo = ExternalProviderIconRenderer.antigravityLogo {
+                            Image(nsImage: logo).resizable().scaledToFit().frame(width: 20, height: 20)
+                                .accessibilityHidden(true)
+                        }
                         Text(provider.displayName).font(.system(size: 12, weight: .semibold))
                     }.contentShape(Rectangle())
                 }.buttonStyle(.plain).accessibilityValue(isCollapsed ? "Collapsed" : "Expanded")
@@ -58,7 +62,15 @@ struct ExternalProviderSettings: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
-                    Label(provider.displayName, systemImage: provider.symbolName).font(.system(size: 18, weight: .semibold))
+                    HStack(spacing: 6) {
+                        if provider == .antigravity, let logo = ExternalProviderIconRenderer.antigravityLogo {
+                            Image(nsImage: logo).resizable().scaledToFit().frame(width: 28, height: 28)
+                                .accessibilityHidden(true)
+                            Text(provider.displayName)
+                        } else {
+                            Label(provider.displayName, systemImage: provider.symbolName)
+                        }
+                    }.font(.system(size: 18, weight: .semibold))
                     Spacer()
                     Button("Refresh") { store.refresh(provider, force: true) }
                         .disabled(store.refreshing.contains(provider))
@@ -210,7 +222,11 @@ private struct ProviderQuotaRow: View {
             Text(bucket.resetAt.map {
                 $0 > now ? (compact ? "Resets \(resetCountdown(from: $0))" : "Resets \($0.formatted(date: .abbreviated, time: .standard)) · \(resetCountdown(from: $0))") : "Reset due · refresh needed"
             } ?? "Reset time unavailable")
-                .font(.system(size: compact ? 9 : 11)).foregroundStyle(.secondary)
+                .font(.system(size: compact ? 9 : 11))
+                .foregroundStyle(ResetCountdownColor.color(
+                    for: bucket.resetAt,
+                    now: now,
+                    isStale: snapshot?.isCurrent(at: now) != true))
                 .help(bucket.resetAt.map { $0.formatted(date: .complete, time: .standard) } ?? "Reset time unavailable")
         }
     }

@@ -35,3 +35,11 @@ SOFTWARE.
 ChatGPT application (`chatgptTemplate@2x.png`). The app renders its alpha mask
 in white as the Codex provider identifier. ChatGPT and OpenAI marks belong
 to OpenAI.
+
+## Antigravity / Google product mark
+
+The Antigravity mark in `assets/antigravity-menu.png` is used solely to
+identify the Antigravity quota provider. It was derived from the installed
+Antigravity IDE's dark-background mark with the background removed.
+Antigravity and its product marks belong to Google LLC. This project is
+independent and is not affiliated with or endorsed by Google.
