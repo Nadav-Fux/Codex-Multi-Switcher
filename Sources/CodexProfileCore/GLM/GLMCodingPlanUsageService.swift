@@ -4,13 +4,57 @@ public protocol GLMQuotaTransport: Sendable {
     func quota(authorizationValue: String) async throws -> Data
 }
 
-/// Calls only Z.ai's documented, read-only Coding Plan quota endpoint.
-public struct GLMHTTPSQuotaTransport: GLMQuotaTransport {
+/// The quota monitor and its companion read-only monitor endpoints share one bounded HTTPS transport.
+public protocol GLMMonitorTransport: Sendable {
+    func get(_ endpoint: GLMMonitorEndpoint, authorizationValue: String) async throws -> Data
+}
+
+public enum GLMMonitorEndpoint: Sendable {
+    case subscription
+    case modelUsage(start: Date, end: Date)
+    case toolUsage(start: Date, end: Date)
+
+    fileprivate var pathAndQuery: String {
+        switch self {
+        case .subscription:
+            return "/api/biz/subscription/list"
+        case let .modelUsage(start, end):
+            return "/api/monitor/usage/model-usage" + Self.query(start: start, end: end)
+        case let .toolUsage(start, end):
+            return "/api/monitor/usage/tool-usage" + Self.query(start: start, end: end)
+        }
+    }
+
+    private static func query(start: Date, end: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let startText = formatter.string(from: start)
+        let endText = formatter.string(from: end)
+        let valueCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.~"))
+        return "?startTime=\(startText.addingPercentEncoding(withAllowedCharacters: valueCharacters) ?? startText)"
+            + "&endTime=\(endText.addingPercentEncoding(withAllowedCharacters: valueCharacters) ?? endText)"
+    }
+}
+
+/// Calls Z.ai's read-only Coding Plan quota and monitor endpoints.
+public struct GLMHTTPSQuotaTransport: GLMQuotaTransport, GLMMonitorTransport {
     public init() {}
 
     public func quota(authorizationValue: String) async throws -> Data {
+        try await Self.get(pathAndQuery: "/api/monitor/usage/quota/limit",
+                           authorizationValue: authorizationValue)
+    }
+
+    public func get(_ endpoint: GLMMonitorEndpoint, authorizationValue: String) async throws -> Data {
+        try await Self.get(pathAndQuery: endpoint.pathAndQuery, authorizationValue: authorizationValue)
+    }
+
+    private static func get(pathAndQuery: String, authorizationValue: String) async throws -> Data {
         guard authorizationValue.utf8.count <= 65_536,
-              let url = URL(string: "https://api.z.ai/api/monitor/usage/quota/limit") else {
+              let url = URL(string: "https://api.z.ai\(pathAndQuery)"),
+              url.scheme == "https", url.host == "api.z.ai" else {
             throw GLMQuotaError.credentialUnavailable
         }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,

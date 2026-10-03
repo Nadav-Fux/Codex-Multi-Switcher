@@ -43,3 +43,16 @@ identify the Antigravity quota provider. It was derived from the installed
 Antigravity IDE's dark-background mark with the background removed.
 Antigravity and its product marks belong to Google LLC. This project is
 independent and is not affiliated with or endorsed by Google.
+
+## ZCode credential format compatibility
+
+The local read-only ZCode credential reader implements compatibility with
+ZCode's published `enc:v1` credential format in Swift. The format details were
+adapted from the official [ZCode credential cipher provider](https://github.com/zai-org/ZCode/blob/main/packages/services/src/credential/providers/credentialCipherProvider.ts)
+and [ZCode CLI credential cipher](https://github.com/zai-org/ZCode/blob/main/apps/zcode-cli/packages/adapters/src/auth/credential-cipher.ts).
+The upstream project is Copyright 2026 Z.AI Co., Ltd. and licensed under the
+Apache License, Version 2.0. The complete upstream license text is included in
+[`licenses/ZCode-Apache-2.0.txt`](licenses/ZCode-Apache-2.0.txt). The local
+reader changes the implementation for bounded, owner-private file access and
+in-memory read-only decoding; it does not include the ZCode application or
+perform ZCode credential refresh, account mutation, or reset redemption.

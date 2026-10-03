@@ -44,7 +44,8 @@ struct ExternalProviderMenuSection: View {
         guard !collapsed else { return 32 }
         let groups = Set(snapshot?.buckets.map(\.group) ?? []).count
         let rows = snapshot?.buckets.count ?? 0
-        return 40 + min(250, CGFloat(60 + rows * 58 + groups * 22))
+        let glmExtra = snapshot?.provider == .glm ? 250 : 0
+        return 40 + min(250, CGFloat(60 + rows * 58 + groups * 22 + glmExtra))
     }
 }
 
@@ -52,6 +53,7 @@ struct ExternalProviderSettings: View {
     @ObservedObject var store: ExternalProviderStore
     let provider: ProviderID
     @AppStorage(ProviderVisibility.key) private var visibleProviders = ""
+    @AppStorage("glmReadZCodeBenefits") private var readsZCodeBenefits = true
     @State private var glmKey = ""
     @State private var glmKeyStored = false
     @State private var credentialError: String?
@@ -95,9 +97,11 @@ struct ExternalProviderSettings: View {
                 Text("CONNECTION").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 Text(provider == .antigravity
                     ? "Sign in through Antigravity first. This section observes quota; account switching remains managed by Antigravity. Quotas may be shared by several models; shared pools are shown once when the service identifies them."
-                    : "ZCode encrypts its sign-in per device. Connect your Personal Z.ai Coding Plan API key below. The key stays in this app’s Keychain item. This quota source does not expose ZCode reset cards; redeem them in ZCode.")
+                    : "Connect your Personal Z.ai Coding Plan key for quota and usage. Its key stays in this app’s Keychain. Reset cards and Flash grants are read separately from your existing local ZCode sign-in; credentials are decoded only in memory using ZCode’s published format. Redeem cards in ZCode.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .glm {
+                    Toggle("Read reset cards and Start Plan / Flash balances from local ZCode sign-in", isOn: $readsZCodeBenefits)
+                        .onChange(of: readsZCodeBenefits) { _, _ in store.credentialsDidChange(.glm) }
                     SecureField("Z.ai Coding Plan API key", text: $glmKey)
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
@@ -177,6 +181,9 @@ private struct ProviderUsageContent: View {
                         ProviderQuotaRow(provider: provider, bucket: bucket, snapshot: snapshot, now: now, compact: compact)
                     }
                 }
+            }
+            if provider == .glm, let snapshot {
+                GLMUsageDetailsView(snapshot: snapshot, now: now, compact: compact)
             }
             if let observedAt = snapshot?.observedAt {
                 Text(snapshot?.isCurrent(at: now) == true ? updatedLabel(from: observedAt) : "Last observation · " + updatedLabel(from: observedAt))

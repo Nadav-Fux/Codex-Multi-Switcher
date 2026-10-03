@@ -398,6 +398,11 @@ if [[ "$REQUIRE_SIGNING" == "1" ]]; then
   cp "$APP_PROVISIONING_PROFILE" "$HELPER_APP_BUNDLE/Contents/embedded.provisionprofile"
 fi
 
+mkdir -p "$APP_BUNDLE/Contents/Resources/licenses"
+cp "$ROOT_DIR/LICENSE" "$APP_BUNDLE/Contents/Resources/licenses/Project-MIT.txt"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp "$ROOT_DIR/licenses/ZCode-Apache-2.0.txt" "$APP_BUNDLE/Contents/Resources/licenses/"
+
 log "Embedding Sparkle.framework..."
 cp -R "$SPARKLE_DIR/Sparkle.framework" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 for icon in \
