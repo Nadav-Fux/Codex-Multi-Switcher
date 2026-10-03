@@ -51,6 +51,10 @@ cp "$ROOT_DIR/assets/codex-multi-switcher-menu-icon-empty.png" "$STAGED_APP/Cont
 cp "$ROOT_DIR/assets/openai-knot-menu.png" "$STAGED_APP/Contents/Resources/"
 cp "$ROOT_DIR/assets/antigravity-menu.png" "$STAGED_APP/Contents/Resources/"
 cp "$ROOT_DIR/Scripts/ClaudeStatuslineBridge.py" "$STAGED_APP/Contents/Resources/ClaudeStatuslineBridge.py"
+mkdir -p "$STAGED_APP/Contents/Resources/licenses"
+cp "$ROOT_DIR/LICENSE" "$STAGED_APP/Contents/Resources/licenses/Project-MIT.txt"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$STAGED_APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp "$ROOT_DIR/licenses/ZCode-Apache-2.0.txt" "$STAGED_APP/Contents/Resources/licenses/"
 cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

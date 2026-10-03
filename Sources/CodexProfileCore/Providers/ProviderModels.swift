@@ -128,6 +128,9 @@ public struct ProviderUsageSnapshot: Codable, Equatable, Sendable {
     public let state: ProviderSnapshotState
     public let accountVerified: Bool
     public let isStale: Bool
+    /// GLM's separate read-only monitor data has its own observation timestamp.
+    public let glmMonitor: GLMMonitorUsageSnapshot?
+    public let glmAccountBenefits: GLMAccountBenefitsSnapshot?
 
     public init(
         provider: ProviderID,
@@ -139,7 +142,9 @@ public struct ProviderUsageSnapshot: Codable, Equatable, Sendable {
         source: String,
         state: ProviderSnapshotState = .available,
         accountVerified: Bool = false,
-        isStale: Bool = false
+        isStale: Bool = false,
+        glmMonitor: GLMMonitorUsageSnapshot? = nil,
+        glmAccountBenefits: GLMAccountBenefitsSnapshot? = nil
     ) {
         self.provider = provider
         self.account = account
@@ -151,6 +156,8 @@ public struct ProviderUsageSnapshot: Codable, Equatable, Sendable {
         self.state = state
         self.accountVerified = accountVerified
         self.isStale = isStale
+        self.glmMonitor = glmMonitor
+        self.glmAccountBenefits = glmAccountBenefits
     }
 
     /// Whether this observation is recent enough to present as current.
