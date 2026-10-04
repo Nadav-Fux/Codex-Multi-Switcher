@@ -77,16 +77,16 @@ struct AppFeatureSmoke {
         providerDefaults.set("invalid", forKey: MenuBarProviders.key)
         try Self.require(MenuBarProviders.selection(in: providerDefaults) == .both,
             "Invalid selection falls back to visible providers")
-        let combined = MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .both)
+        let combined = MenuBarCompositeRenderer.render(selected: [(weeklyBadge, "Codex"), (claudeBadge, "Claude Code")])
         try Self.require(combined.size.height == 23 && !combined.isTemplate &&
             combined.size.width == ceil(weeklyBadge.size.width) + ceil(claudeBadge.size.width) + 8 &&
             combined.accessibilityDescription?.contains("Codex") == true &&
             combined.accessibilityDescription?.contains("Claude Code") == true,
             "Both providers form one adjacent menu bar image with explicit identities")
-        try Self.require(MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .codex)
+        try Self.require(MenuBarCompositeRenderer.render(selected: [(weeklyBadge, "Codex")])
             .accessibilityDescription?.contains("Claude Code") == false,
             "Codex-only selection excludes Claude")
-        try Self.require(MenuBarCompositeRenderer.render(codex: weeklyBadge, claude: claudeBadge, providers: .claude)
+        try Self.require(MenuBarCompositeRenderer.render(selected: [(claudeBadge, "Claude Code")])
             .accessibilityDescription?.contains("Codex") == false,
             "Claude-only selection excludes Codex")
         try Self.require(QuotaDisplayPreferences.value(usedPercent: 101, showsUsed: false) == 0, "Clamp remaining")

@@ -292,7 +292,7 @@ private struct BankedResetCreditCard: View {
                 }
             }
             if let trigger = self.trigger {
-                Text(trigger <= Date() ? "Due now · enabling will run this reset immediately" : "Will run \(trigger.formatted(date: .abbreviated, time: .shortened))")
+                Text(trigger <= Date() ? "Due now · enabling will run this reset immediately" : "Will run \(trigger.formatted(date: .abbreviated, time: .standard))")
                     .font(.system(size: 11)).foregroundStyle(trigger <= Date() ? Palette.warning : Palette.accent)
             } else {
                 Text("No expiry date supplied. Choose a date & time instead.")
@@ -317,7 +317,7 @@ private struct BankedResetCreditCard: View {
                     Label("Used \(completed.formatted(date: .abbreviated, time: .shortened))", systemImage: "checkmark.circle")
                 } else if record.enabled {
                     Label(record.triggerDate(expiresAt: self.credit.expiresAt).map {
-                        "Scheduled \($0.formatted(date: .abbreviated, time: .shortened))"
+                        "Scheduled \($0.formatted(date: .abbreviated, time: .standard))"
                     } ?? "Scheduled", systemImage: "clock")
                     Spacer()
                     Button("Cancel") {

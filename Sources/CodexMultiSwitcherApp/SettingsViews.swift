@@ -22,6 +22,7 @@ enum SettingsWindow {
     private static var windowController: NSWindowController?
     private static var windowDelegate: SettingsWindowDelegate?
     private static var migrationLifecycle: SettingsMigrationLifecycle?
+    static var isVisible: Bool { self.windowController?.window?.isVisible == true }
 
     static func show(
         store: ProfileStore,
@@ -32,6 +33,7 @@ enum SettingsWindow {
         refreshPreferences: RefreshPreferences,
         actions: SettingsActions
     ) {
+        AppLogger.info("Reset diagnostic settings_open")
         Self.cancelActiveMigrationReview()
         let lifecycle = SettingsMigrationLifecycle()
         Self.migrationLifecycle = lifecycle
@@ -97,6 +99,7 @@ private final class SettingsWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        AppLogger.info("Reset diagnostic settings_closed")
         self.onClose()
     }
 }

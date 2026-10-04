@@ -12,7 +12,13 @@ final class BankedResetScheduler: ObservableObject {
     private var timer: Timer?
     private var operation: Task<Void, Never>?
     private var storageReadFailed = false
+    private var lastTimerTick: Date?
+    private var lastHeartbeat: Date?
+    private var lastGate: String?
+    private var diagnosticIDs: [String: String] = [:]
     var canRun: () -> Bool = { true }
+    var diagnosticContext: () -> [String: String] = { [:] }
+    var diagnosticBlockReason: () -> String? = { nil }
     var onCompletion: (() -> Void)?
 
     init(store: ProfileStore) {
@@ -40,9 +46,14 @@ final class BankedResetScheduler: ObservableObject {
     func start() {
         guard !AppInfo.isPreview else { return }
         self.timer?.invalidate()
-        self.timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkDueSchedules() }
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkDueSchedules(reason: "timer") }
         }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        self.trace("started", metadata: ["interval_seconds": "10", "run_loop": "common"])
+        self.checkDueSchedules(reason: "startup")
     }
 
     func schedule(for profileID: String, creditID: String) -> BankedResetSchedule? {
@@ -80,8 +91,9 @@ final class BankedResetScheduler: ObservableObject {
             minutesBeforeExpiry: storedMinutes, creditExpiresAt: credit.expiresAt,
             accountClaimFingerprints: AuthBlob.identityClaimFingerprints(from: data))
         try self.persist(record)
+        self.trace("saved", record: record)
         self.lastMessage = "Reset schedule saved."
-        self.checkDueSchedules()
+        self.checkDueSchedules(reason: "schedule_saved")
     }
 
     func cancelSchedule(profileID: String, creditID: String) throws {
@@ -90,6 +102,7 @@ final class BankedResetScheduler: ObservableObject {
         record.enabled = false
         record.lastError = nil
         try self.persist(record)
+        self.trace("cancelled", record: record)
     }
 
     func useNow(profileID: String, credit: BankedResetCredit) async throws {
@@ -113,13 +126,39 @@ final class BankedResetScheduler: ObservableObject {
         record.enabled = true
         record.retryAfter = nil
         try self.persist(record)
+        self.trace("manual_requested", record: record)
         await self.execute(record)
     }
 
-    func checkDueSchedules() {
-        guard !AppInfo.isPreview, !self.storageReadFailed, !self.isRunning, self.operation == nil,
-              !self.store.isAuthMutationInProgress(), self.canRun() else { return }
+    func checkDueSchedules(reason: String = "unspecified") {
         let now = Date()
+        let gate: String?
+        if AppInfo.isPreview { gate = "preview" }
+        else if self.storageReadFailed { gate = "storage_unreadable" }
+        else if self.isRunning || self.operation != nil { gate = "reset_in_progress" }
+        else if self.store.isAuthMutationInProgress() { gate = "auth_mutation" }
+        else if !self.canRun() { gate = self.diagnosticBlockReason() ?? "provider_busy" }
+        else { gate = nil }
+        let pending = self.schedules.values.filter { $0.enabled && $0.completedAt == nil }
+        let next = pending.min {
+            (self.trigger(for: $0) ?? .distantFuture) < (self.trigger(for: $1) ?? .distantFuture)
+        }
+        if reason == "timer" {
+            let gap = self.lastTimerTick.map { now.timeIntervalSince($0) }
+            self.lastTimerTick = now
+            if self.lastHeartbeat == nil || now.timeIntervalSince(self.lastHeartbeat!) >= 60 || (gap ?? 0) > 25 {
+                self.lastHeartbeat = now
+                self.trace("heartbeat", record: next, metadata: ["source": reason,
+                    "gate": gate ?? "none", "pending": String(pending.count),
+                    "tick_gap_seconds": gap.map { String(format: "%.3f", $0) } ?? "first"])
+            }
+        }
+        if self.lastGate != gate {
+            if let gate { self.trace("blocked", record: next, metadata: ["gate": gate, "source": reason]) }
+            else if let previous = self.lastGate { self.trace("unblocked", record: next, metadata: ["previous_gate": previous, "source": reason]) }
+            self.lastGate = gate
+        }
+        guard gate == nil else { return }
         let due = self.schedules.values.filter { record in
             let credit = self.store.statuses[record.profileID]?.snapshot?.bankedResetCredits?
                 .first(where: { $0.id == record.creditID })
@@ -128,16 +167,22 @@ final class BankedResetScheduler: ObservableObject {
                     && (record.retryAfter.map { $0 <= now } ?? true))
         }.sorted { $0.scheduledAt < $1.scheduledAt }
         guard let record = due.first else { return }
+        self.trace("due_observed", record: record, metadata: ["source": reason])
         self.operation = Task { [weak self] in
             guard let self else { return }
             await self.execute(record)
             self.operation = nil
-            self.checkDueSchedules()
+            self.checkDueSchedules(reason: "previous_operation_finished")
         }
     }
 
     private func execute(_ initial: BankedResetSchedule) async {
-        guard !self.isRunning, self.canRun(), !self.store.isAuthMutationInProgress() else { return }
+        guard !self.isRunning, self.canRun(), !self.store.isAuthMutationInProgress() else {
+            self.trace("execution_deferred", record: initial, metadata: ["gate": self.isRunning
+                ? "reset_in_progress" : self.store.isAuthMutationInProgress()
+                ? "auth_mutation" : self.diagnosticBlockReason() ?? "provider_busy"])
+            return
+        }
         self.isRunning = true
         self.store.beginAuthMutation()
         defer {
@@ -146,6 +191,7 @@ final class BankedResetScheduler: ObservableObject {
             self.onCompletion?()
         }
         var record = initial
+        self.trace("execution_started", record: record)
         var capturedAuth: Data?
         let source = self.store.usageAuthSource()
         let lease = LeaseReservation(token: UUID().uuidString, home: "",
@@ -154,8 +200,10 @@ final class BankedResetScheduler: ObservableObject {
             record.retryAfter = Date().addingTimeInterval(60)
             record.lastError = "Profile is in use; will retry."
             try? self.persist(record)
+            self.trace("lease_busy", record: record)
             return
         }
+        self.trace("lease_acquired", record: record)
         do {
             let profileID = record.profileID
             guard var auth = try await Task.detached(operation: {
@@ -164,6 +212,7 @@ final class BankedResetScheduler: ObservableObject {
             capturedAuth = auth
             guard record.matchesAccount(authData: auth) else { throw ResetError.accountChanged }
             if record.lastAttemptAt == nil {
+                self.trace("preflight_started", record: record)
                 let preflight = try await CLIUsageFetcher.fetchResult(profileId: record.profileID,
                     authData: auth, codexConfigURL: self.store.codexConfigURL(),
                     environment: source.paths.environment, clientVersion: AppInfo.version)
@@ -180,16 +229,19 @@ final class BankedResetScheduler: ObservableObject {
                       credit.isRedeemable() else {
                     throw ResetError.unavailable
                 }
+                self.trace("preflight_finished", record: record)
             }
             // Journal BEFORE the network operation. Crash/timeout retries use this key.
             record.lastAttemptAt = Date()
             record.retryAfter = Date().addingTimeInterval(300)
             record.lastError = nil
             try self.persist(record)
+            self.trace("request_journaled", record: record)
             let result = try await CLIUsageFetcher.consumeReset(profileId: record.profileID,
                 authData: auth, codexConfigURL: self.store.codexConfigURL(),
                 creditId: record.creditID, idempotencyKey: record.idempotencyKey,
                 environment: source.paths.environment, clientVersion: AppInfo.version)
+            self.trace("operation_returned", record: record, metadata: ["outcome": result.outcome.rawValue])
             if let updated = result.updatedAuthData {
                 do {
                     if try await Self.persistAuth(original: auth, updated: updated, record: record, source: source) {
@@ -222,6 +274,8 @@ final class BankedResetScheduler: ObservableObject {
                 self.lastMessage = "This reset is no longer available for \(self.label(for: record.profileID))."
             }
             try self.persist(record)
+            self.trace(record.completedAt == nil ? "not_consumed" : "confirmed", record: record,
+                metadata: ["outcome": result.outcome.rawValue])
         } catch {
             if let operationError = error as? CLIUsageOperationError,
                let original = capturedAuth {
@@ -241,10 +295,37 @@ final class BankedResetScheduler: ObservableObject {
             }
             self.lastMessage = record.lastError
             try? self.persist(record)
+            self.trace("failed", record: record, metadata: ["error_type": String(describing: type(of: error)),
+                "retry": record.enabled ? "scheduled" : "disabled"])
             AppLogger.warning("Reset operation deferred", metadata: ["profile": record.profileID, "error": record.lastError ?? "unknown"])
         }
         await UsageProvider.removeLease(profileIDs: [record.profileID], expectedToken: lease.token, paths: source.paths)
         self.store.flushCacheIfDirty()
+    }
+
+    private func trigger(for record: BankedResetSchedule) -> Date? {
+        let expiry = self.store.statuses[record.profileID]?.snapshot?.bankedResetCredits?
+            .first(where: { $0.id == record.creditID })?.expiresAt
+        return record.triggerDate(expiresAt: expiry)
+    }
+
+    /// Local bounded log; omit account names, credit IDs, credentials and request keys.
+    private func trace(_ event: String, record: BankedResetSchedule? = nil,
+                       metadata: [String: String] = [:]) {
+        var fields = self.diagnosticContext().merging(metadata) { _, new in new }
+        if let record {
+            if self.diagnosticIDs[record.id] == nil {
+                self.diagnosticIDs[record.id] = "r\(self.diagnosticIDs.count + 1)"
+            }
+            fields["schedule"] = self.diagnosticIDs[record.id]
+            fields["mode"] = record.mode.rawValue
+            if let trigger = self.trigger(for: record) {
+                fields["due_at"] = trigger.ISO8601Format()
+                fields["lag_seconds"] = String(format: "%.3f", Date().timeIntervalSince(trigger))
+            }
+            if let retry = record.retryAfter { fields["retry_at"] = retry.ISO8601Format() }
+        }
+        AppLogger.info("Reset diagnostic \(event)", metadata: fields)
     }
 
     @discardableResult

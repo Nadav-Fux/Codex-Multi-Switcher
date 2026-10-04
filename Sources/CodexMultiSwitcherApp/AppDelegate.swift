@@ -102,6 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return false }
             return !self.usageProvider.isRefreshing && !self.isRenewing
         }
+        self.resetScheduler.diagnosticBlockReason = { [weak self] in
+            guard let self else { return "app_unavailable" }
+            if self.isRenewing { return "renewal" }
+            return self.usageProvider.isRefreshing ? "usage_refresh" : nil
+        }
+        self.resetScheduler.diagnosticContext = { [weak self] in
+            guard let self else { return [:] }
+            return ["settings_visible": String(SettingsWindow.isVisible),
+                "menu_open": String(self.isMenuOpen)]
+        }
         self.resetScheduler.onCompletion = { [weak self] in
             guard let self else { return }
             self.updateIcon()
@@ -406,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func handleSystemWake() {
         guard self.store != nil, self.usageProvider != nil else { return }
         AppLogger.info("System woke; forcing usage refresh")
+        self.resetScheduler.checkDueSchedules(reason: "system_wake")
         self.externalStore.refresh(force: true)
         self.claudeStore.refresh()
         self.syncActiveProfile(force: true)
@@ -432,7 +443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.refreshMenuItem?.setEnabled(true)
         }
         self.updateIcon()
-        self.resetScheduler.checkDueSchedules()
+        self.resetScheduler.checkDueSchedules(reason: "refresh_complete")
         guard self.isMenuOpen else { return }
         self.rebuildMenu()
     }
