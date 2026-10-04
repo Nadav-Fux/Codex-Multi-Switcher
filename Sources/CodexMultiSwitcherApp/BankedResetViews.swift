@@ -226,10 +226,27 @@ private struct BankedResetCreditCard: View {
             if let record = self.record {
                 self.scheduleStatus(record)
             }
-            DisclosureGroup("Schedule automatic reset", isExpanded: self.$expanded) {
+            Button {
+                self.expanded.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: self.expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Schedule automatic reset")
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 12))
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Schedule automatic reset")
+            .accessibilityValue(self.expanded ? "Expanded" : "Collapsed")
+            .help("Click anywhere on this row to show or hide the schedule settings.")
+            if self.expanded {
                 self.editor.padding(.top, 8)
             }
-            .font(.system(size: 12))
         }
         .padding(12).frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
