@@ -25,6 +25,17 @@ struct BankedResetScheduleTests {
         #expect(record.triggerDate(expiresAt: self.now.addingTimeInterval(48 * 3600)) == self.now.addingTimeInterval(24 * 3600))
     }
 
+    @Test func minuteOffsetsPreserveExpirySeconds() {
+        let expiry = self.now.addingTimeInterval(3600 + 25)
+        let record = BankedResetSchedule(profileID: "fixture", creditID: "fixture-credit",
+            accountFingerprint: "fixture-account", mode: .beforeExpiry, scheduledAt: self.now,
+            hoursBeforeExpiry: 1, minutesBeforeExpiry: 4, creditExpiresAt: expiry)
+        let target = expiry.addingTimeInterval(-64 * 60)
+        #expect(record.triggerDate(expiresAt: nil) == target)
+        #expect(!record.isDue(expiresAt: nil, now: target.addingTimeInterval(-0.001)))
+        #expect(record.isDue(expiresAt: nil, now: target))
+    }
+
     @Test func disabledCompletedAndBackedOffRequestsDoNotRun() {
         var record = self.record()
         record.enabled = false

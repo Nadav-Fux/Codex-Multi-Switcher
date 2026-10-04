@@ -630,7 +630,9 @@ public enum CLIUsageFetcher {
                 throw CLIUsageError.invalidResponse("The selected reset type is unsupported")
             }
 
+            CoreLogger.info("Reset diagnostic rpc_dispatch")
             let outcome = try await rpc.consumeReset(creditId: creditId, idempotencyKey: idempotencyKey)
+            CoreLogger.info("Reset diagnostic rpc_reply", metadata: ["outcome": outcome.rawValue])
             var snapshot: UsageSnapshot?
             var refreshError: String?
             do {
