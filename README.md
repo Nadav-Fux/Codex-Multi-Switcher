@@ -133,8 +133,7 @@ the indicator shows its symbol and `?`. Settings show cached observations with
 their source and timestamp. A legacy statusline
 cache cannot identify its account and is always labelled unverified. For the
 default Claude account, the app can read current quota through Claude’s OAuth
-profile and usage endpoints even when Claude Code is closed. It reads the existing native credential without a Keychain
-prompt and verifies the server account against the CLI identity. If the service rejects an expired sign-in with HTTP 401,
+profile and usage endpoints even when Claude Code is closed. Use **Settings → Claude Code → Connect Claude Account…** to authorize reading the existing native sign-in in the foreground. macOS may ask for Keychain permission. Background reads stay disabled until this exact executable completes that read; choose **Always Allow** for unattended refresh. Local ad hoc builds change identity on rebuild, so a new build may need connection again. No password or access token is stored in preferences; only the executable's SHA256 authorization marker is recorded, and macOS still enforces access. Subsequent silent reads verify the server account against the CLI identity. If the service rejects an expired sign-in with HTTP 401,
 it can renew using Claude's existing refresh token and the official CLI's OAuth endpoint/client ID. Renewal preserves the
 account and existing scopes, coordinates the CLI's refresh/storage locks, and updates only the unchanged native Keychain item
 after verifying the renewed identity. It does not sign into another account or alter Claude settings. When macOS denies access,

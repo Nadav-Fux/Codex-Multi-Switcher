@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import LocalAuthentication
 import Security
@@ -75,44 +76,68 @@ struct ClaudeNativeCredentialItem {
     let oauth: [String: Any]
     let accessToken: String
 
-    static func read(captureReference: Bool = false, reference: SecKeychainItem? = nil) throws -> Self {
-        try ClaudeNativeKeychainInteraction.withoutUI {
-            try Self.readWithoutUI(captureReference: captureReference, reference: reference)
+    static func read(captureReference: Bool = false, reference: SecKeychainItem? = nil,
+                     allowInteraction: Bool = false) throws -> Self {
+        try ClaudeNativeKeychainInteraction.withPolicy(allowInteraction: allowInteraction) {
+            try Self.readItem(captureReference: captureReference, reference: reference,
+                              allowInteraction: allowInteraction)
         }
     }
 
-    private static func readWithoutUI(captureReference: Bool, reference: SecKeychainItem?) throws -> Self {
+    private static func readItem(captureReference: Bool, reference: SecKeychainItem?,
+                                 allowInteraction: Bool = false) throws -> Self {
         var matchedReference = reference
         if captureReference {
             // Metadata lookup only. Never combine returning secret data and item references.
-            var lookup = Self.query()
+            var lookup = Self.query(allowInteraction: allowInteraction)
             lookup[kSecReturnRef as String] = true
             lookup[kSecMatchLimit as String] = kSecMatchLimitOne
             var result: CFTypeRef?
-            guard SecItemCopyMatching(lookup as CFDictionary, &result) == errSecSuccess,
-                  let result, CFGetTypeID(result) == SecKeychainItemGetTypeID() else {
+            ClaudeNativeKeychainDiagnostics.begin(stage: "reference_lookup")
+            let status = SecItemCopyMatching(lookup as CFDictionary, &result)
+            guard status == errSecSuccess else {
+                ClaudeNativeKeychainDiagnostics.failure(stage: "reference_lookup", status: status)
+                throw ClaudeCurrentUsageError.credentialRenewalUnavailable
+            }
+            guard let result, CFGetTypeID(result) == SecKeychainItemGetTypeID() else {
+                ClaudeNativeKeychainDiagnostics.invalid(stage: "reference_type")
                 throw ClaudeCurrentUsageError.credentialRenewalUnavailable
             }
             matchedReference = (result as! SecKeychainItem)
         }
-        var query = Self.query(reference: matchedReference)
+        var query = Self.query(reference: matchedReference, allowInteraction: allowInteraction)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              data.count <= 1_048_576,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String, validToken(token) else {
+        ClaudeNativeKeychainDiagnostics.begin(stage: "data_lookup")
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess else {
+            ClaudeNativeKeychainDiagnostics.failure(stage: "data_lookup", status: status)
+            if status == errSecInteractionNotAllowed { throw ClaudeCurrentUsageError.credentialInteractionRequired }
+            throw ClaudeCurrentUsageError.credentialUnavailable
+        }
+        guard let data = result as? Data, data.count <= 1_048_576 else {
+            ClaudeNativeKeychainDiagnostics.invalid(stage: "data_type_or_size")
+            throw ClaudeCurrentUsageError.credentialUnavailable
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            ClaudeNativeKeychainDiagnostics.invalid(stage: "credential_json")
+            throw ClaudeCurrentUsageError.credentialUnavailable
+        }
+        guard let oauth = json["claudeAiOauth"] as? [String: Any] else {
+            ClaudeNativeKeychainDiagnostics.invalid(stage: "oauth_object")
+            throw ClaudeCurrentUsageError.credentialUnavailable
+        }
+        guard let token = oauth["accessToken"] as? String, validToken(token) else {
+            ClaudeNativeKeychainDiagnostics.invalid(stage: "access_token_shape")
             throw ClaudeCurrentUsageError.credentialUnavailable
         }
         return Self(data: data, reference: matchedReference, json: json, oauth: oauth, accessToken: token)
     }
 
-    private static func query(reference: SecKeychainItem? = nil) -> [String: Any] {
+    private static func query(reference: SecKeychainItem? = nil, allowInteraction: Bool = false) -> [String: Any] {
         let context = LAContext()
-        context.interactionNotAllowed = true
+        context.interactionNotAllowed = !allowInteraction
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -131,16 +156,19 @@ struct ClaudeNativeCredentialItem {
     /// reference only; do not recreate, delete, or overwrite a newer sign-in.
     func updateIfUnchanged(_ updated: [String: Any]) throws {
         guard let reference = self.reference else { throw ClaudeCurrentUsageError.credentialRenewalUnavailable }
-        try ClaudeNativeKeychainInteraction.withoutUI {
-            let current = try Self.readWithoutUI(captureReference: false, reference: reference)
+        try ClaudeNativeKeychainInteraction.withPolicy(allowInteraction: false) {
+            let current = try Self.readItem(captureReference: false, reference: reference)
             guard current.data == self.data else { throw ClaudeCurrentUsageError.accountChanged }
             let bytes = try JSONSerialization.data(withJSONObject: updated, options: [.sortedKeys])
             guard bytes.count <= 1_048_576 else { throw ClaudeCurrentUsageError.invalidResponse }
             let status = bytes.withUnsafeBytes { buffer in
                 SecKeychainItemModifyAttributesAndData(reference, nil, UInt32(buffer.count), buffer.baseAddress)
             }
-            guard status == errSecSuccess else { throw ClaudeCurrentUsageError.credentialRenewalUnavailable }
-            let after = try Self.readWithoutUI(captureReference: false, reference: reference)
+            guard status == errSecSuccess else {
+                ClaudeNativeKeychainDiagnostics.failure(stage: "credential_update", status: status)
+                throw ClaudeCurrentUsageError.credentialRenewalUnavailable
+            }
+            let after = try Self.readItem(captureReference: false, reference: reference)
             guard after.data == bytes else { throw ClaudeCurrentUsageError.accountChanged }
         }
     }
@@ -151,16 +179,77 @@ struct ClaudeNativeCredentialItem {
 private enum ClaudeNativeKeychainInteraction {
     private static let lock = NSLock()
 
-    static func withoutUI<T>(_ operation: () throws -> T) throws -> T {
+    static func withPolicy<T>(allowInteraction: Bool, _ operation: () throws -> T) throws -> T {
         self.lock.lock()
         defer { self.lock.unlock() }
         var previous: DarwinBoolean = false
-        guard SecKeychainGetUserInteractionAllowed(&previous) == errSecSuccess,
-              SecKeychainSetUserInteractionAllowed(false) == errSecSuccess else {
+        ClaudeNativeKeychainDiagnostics.begin(stage: "get_interaction_policy")
+        let getStatus = SecKeychainGetUserInteractionAllowed(&previous)
+        guard getStatus == errSecSuccess else {
+            ClaudeNativeKeychainDiagnostics.failure(stage: "get_interaction_policy", status: getStatus)
             throw ClaudeCurrentUsageError.credentialUnavailable
         }
-        defer { _ = SecKeychainSetUserInteractionAllowed(previous.boolValue) }
+        ClaudeNativeKeychainDiagnostics.begin(stage: allowInteraction ? "enable_foreground_interaction" : "disable_interaction")
+        let setStatus = SecKeychainSetUserInteractionAllowed(allowInteraction)
+        guard setStatus == errSecSuccess else {
+            ClaudeNativeKeychainDiagnostics.failure(stage: "set_interaction_policy", status: setStatus)
+            throw ClaudeCurrentUsageError.credentialUnavailable
+        }
+        defer {
+            ClaudeNativeKeychainDiagnostics.begin(stage: "restore_interaction_policy")
+            let status = SecKeychainSetUserInteractionAllowed(previous.boolValue)
+            if status != errSecSuccess {
+                ClaudeNativeKeychainDiagnostics.failure(stage: "restore_interaction_policy", status: status)
+            }
+        }
         return try operation()
+    }
+}
+
+/// An ad hoc rebuild has a new Keychain identity. Obtain consent for this exact
+/// executable before any background read can stall waiting for its first grant.
+/// The stored value identifies the executable; it contains no account or credential.
+enum ClaudeNativeCredentialAuthorization {
+    private static let preferenceKey = "claudeNativeCredentialAuthorizedExecutableSHA256"
+    private static let executableDigest: String? = {
+        guard let executable = Bundle.main.executableURL,
+              let values = try? executable.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size > 0, size <= 268_435_456,
+              let bytes = try? Data(contentsOf: executable, options: [.mappedIfSafe]) else { return nil }
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+    }()
+
+    static func requireBackgroundAccess() throws {
+        guard let digest = self.executableDigest,
+              UserDefaults.standard.string(forKey: self.preferenceKey) == digest else {
+            throw ClaudeCurrentUsageError.credentialInteractionRequired
+        }
+    }
+
+    static func authorize() throws {
+        guard let digest = self.executableDigest else { throw ClaudeCurrentUsageError.credentialUnavailable }
+        // Read only the existing native Claude item. macOS controls any grant;
+        // no ACL, access group, item, or sign-in is created or altered here.
+        _ = try ClaudeNativeCredentialItem.read(allowInteraction: true)
+        UserDefaults.standard.set(digest, forKey: self.preferenceKey)
+    }
+}
+
+/// Diagnostics contain only fixed operation names and Security.framework status codes.
+/// Never pass query dictionaries, Keychain result objects, or credential JSON here.
+private enum ClaudeNativeKeychainDiagnostics {
+    static func begin(stage: String) {
+        CoreLogger.info("Claude native Keychain operation", metadata: ["stage": stage])
+    }
+
+    static func failure(stage: String, status: OSStatus) {
+        CoreLogger.warning("Claude native Keychain operation failed", metadata: [
+            "stage": stage, "osstatus": String(status),
+        ])
+    }
+
+    static func invalid(stage: String) {
+        CoreLogger.warning("Claude native credential format unsupported", metadata: ["stage": stage])
     }
 }
 

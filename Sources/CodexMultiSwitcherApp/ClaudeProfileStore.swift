@@ -11,6 +11,7 @@ final class ClaudeProfileStore: ObservableObject {
     @Published private(set) var selectedID = ClaudeProfileRegistry.defaultID
     @Published private(set) var error: String?
     @Published private(set) var isRefreshing = false
+    @Published private(set) var isAuthorizingCredential = false
     var onChange: (() -> Void)?
 
     private let registry: ClaudeProfileRegistry
@@ -38,7 +39,7 @@ final class ClaudeProfileStore: ObservableObject {
     }
 
     func refresh() {
-        guard !self.isRefreshing else { return }
+        guard !self.isRefreshing, !self.isAuthorizingCredential else { return }
         self.error = nil
         do { self.apply(try self.registry.load()) }
         catch { self.error = error.localizedDescription; self.onChange?(); return }
@@ -126,6 +127,40 @@ final class ClaudeProfileStore: ObservableObject {
     func select(id: String) { self.mutate { try self.registry.select(id: id) } }
     func signIn(id: String) { self.launch(id: id, login: true) }
     func openSession(id: String) { self.launch(id: id, login: false) }
+
+    func supportsNativeUsage(_ profile: ClaudeProfile) -> Bool { self.currentUsage.supports(profile) }
+
+    /// The click authorizes only an existing native Claude credential read.
+    /// Run Security off the main actor so the macOS consent dialog stays usable.
+    func connectNativeAccount(id: String) {
+        guard !self.isRefreshing, !self.isAuthorizingCredential,
+              let profile = self.profile(id), self.currentUsage.supports(profile) else { return }
+        self.error = nil
+        self.isAuthorizingCredential = true
+        self.statuses[id]?.busy = true
+        NSApp.activate(ignoringOtherApps: true)
+        let currentUsage = self.currentUsage
+        Task { [weak self] in
+            do {
+                try await Task.detached {
+                    try currentUsage.authorizeNativeCredentialAccess(profile: profile)
+                }.value
+                guard let self else { return }
+                self.isAuthorizingCredential = false
+                self.statuses[id]?.busy = false
+                self.statuses[id]?.error = nil
+                self.refresh()
+            } catch {
+                guard let self else { return }
+                self.isAuthorizingCredential = false
+                self.statuses[id]?.busy = false
+                self.statuses[id]?.error = error.localizedDescription
+                self.error = error.localizedDescription
+                self.onChange?()
+            }
+        }
+        self.onChange?()
+    }
 
     func installBridge(id: String) {
         self.error = nil

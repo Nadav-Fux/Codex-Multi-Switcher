@@ -56,6 +56,10 @@ enum Main {
         let app = NSApplication.shared
         let showInDock = UserDefaults.standard.object(forKey: "showInDock") as? Bool ?? true
         app.setActivationPolicy(showInDock ? .regular : .accessory)
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            app.applicationIconImage = icon
+        }
 
         let appMenu = NSMenu()
         appMenu.addItem(
