@@ -60,24 +60,40 @@ final class ClaudeProfileStore: ObservableObject {
                     group.addTask {
                         var status = ClaudeProfileStatus()
                         do { status.auth = try cli.authStatus(profile: profile) }
-                        catch { status.error = error.localizedDescription }
+                        catch {
+                            status.error = error.localizedDescription
+                            CoreLogger.warning("Claude quota unavailable", metadata: ["category": "auth_status_unavailable"])
+                        }
                         let usage = ClaudeUsageReader.read(profile: profile, auth: status.auth)
                         status.usage = usage.snapshot
                         if let warning = usage.warning { status.error = warning }
-                        let freshNative = status.usage?.source == .nativeBridge
-                            && status.usage?.isStale == false && status.usage?.accountMatched == true
-                        if !freshNative, currentUsage.supports(profile), let auth = status.auth,
+                        // The native account refreshes directly even when no Claude session
+                        // is running. Bridge observations remain a fallback for managed accounts.
+                        if currentUsage.supports(profile), let auth = status.auth,
                            ClaudeUsageReader.accountFingerprint(auth) != nil {
                             do {
                                 status.usage = try await currentUsage.fetch(profile: profile, authBefore: auth,
                                     authAfter: { try cli.authStatus(profile: profile) })
                                 status.error = nil
                             } catch {
-                                // No mismatched observation is used as current usage.
+                                let category = (error as? ClaudeCurrentUsageError).map { String(describing: $0) } ?? "request_failed"
+                                CoreLogger.warning("Claude quota unavailable", metadata: ["category": category])
+                                // Recheck CLI identity after failed network/renewal attempts before
+                                // reusing any observation; an account switch can happen in flight.
                                 if case ClaudeCurrentUsageError.accountChanged = error {
                                     status.usage = nil
                                 } else {
-                                    status.usage = currentUsage.cached(profile: profile, auth: auth) ?? usage.snapshot
+                                    if let after = try? cli.authStatus(profile: profile),
+                                       ClaudeUsageReader.accountFingerprint(after) == ClaudeUsageReader.accountFingerprint(auth) {
+                                        status.auth = after
+                                        let bridge = ClaudeUsageReader.read(profile: profile, auth: after).snapshot
+                                        let cached = currentUsage.cached(profile: profile, auth: after)
+                                        let observations = [cached, bridge].compactMap { $0 }
+                                        let matched = observations.filter(\.accountMatched)
+                                        status.usage = (matched.isEmpty ? observations : matched).max { $0.observedAt < $1.observedAt }
+                                    } else {
+                                        status.usage = nil
+                                    }
                                 }
                                 status.error = error.localizedDescription
                             }

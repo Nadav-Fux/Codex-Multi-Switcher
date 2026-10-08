@@ -400,10 +400,12 @@ struct ClaudeMenuSectionView: View {
                 ProviderSectionHeaderView(title: "Claude Code", isCollapsed: self.isCollapsed, onToggle: self.onToggle)
                 if !self.isCollapsed {
                     Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless).disabled(store.isRefreshing)
+                        .buttonStyle(.borderless)
+                        .frame(width: 32, height: Self.headerHeight)
+                        .contentShape(Rectangle())
+                        .disabled(store.isRefreshing)
                         .accessibilityLabel("Refresh Claude usage")
-                        .padding(.trailing, 10)
-                        .frame(height: Self.headerHeight)
+                        .help("Refresh Claude usage")
                 }
             }
             if !self.isCollapsed {

@@ -3,12 +3,17 @@ import Foundation
 import Security
 
 public enum ClaudeCurrentUsageError: LocalizedError {
-    case unsupportedProfile, credentialUnavailable, credentialRejected, accountChanged, invalidResponse, requestFailed
+    case unsupportedProfile, credentialUnavailable, credentialRejected, accessDenied, credentialRenewalUnavailable, credentialRenewalFailed, refreshInProgress, rateLimited, accountChanged, invalidResponse, requestFailed
     public var errorDescription: String? {
         switch self {
         case .unsupportedProfile: return "Automatic usage is available for the existing native Claude account. Isolated accounts can use their native usage bridge."
-        case .credentialUnavailable: return "Claude credentials could not be read without prompting. Open Claude Code, then refresh."
+        case .credentialUnavailable: return "Claude credentials are unavailable to this app. Check the Claude sign-in and macOS Keychain access for Codex Multi Switcher, then refresh."
         case .credentialRejected: return "Current Claude usage is unavailable for this sign-in. Usage can appear when the account becomes available; the statusline bridge is also supported."
+        case .accessDenied: return "Claude denied quota access for this sign-in. Check this account in Claude Code."
+        case .credentialRenewalUnavailable: return "Claude could not renew this sign-in without a Keychain prompt. Open Claude Code to renew it, then refresh."
+        case .credentialRenewalFailed: return "Claude sign-in renewal failed. Refresh again in a few minutes; sign in through Claude Code if it continues."
+        case .refreshInProgress: return "Another Claude process is updating sign-in. Usage will refresh automatically."
+        case .rateLimited: return "Claude temporarily limited quota requests. Usage will refresh automatically."
         case .accountChanged: return "Claude account identity could not be confirmed. Refresh after signing in."
         case .invalidResponse: return "Claude returned an unsupported usage response."
         case .requestFailed: return "Current Claude usage could not be fetched. Try refreshing again in a few minutes."
@@ -18,30 +23,27 @@ public enum ClaudeCurrentUsageError: LocalizedError {
 
 public protocol ClaudeUsageCredentialLoading: Sendable {
     func accessToken() throws -> String
+    func renewAccessToken(rejectedToken: String, auth: ClaudeAuthInfo,
+                          authAfter: @Sendable () throws -> ClaudeAuthInfo) async throws -> String
 }
 
-/// Reads exactly Claude's native item. No security CLI, enumeration, prompts, or token refresh.
+public extension ClaudeUsageCredentialLoading {
+    func renewAccessToken(rejectedToken: String, auth: ClaudeAuthInfo,
+                          authAfter: @Sendable () throws -> ClaudeAuthInfo) async throws -> String {
+        throw ClaudeCurrentUsageError.credentialRejected
+    }
+}
+
+/// Reads exactly Claude's native item. Renewal updates only that existing item, without prompts.
 public struct ClaudeNativeCredentialLoader: ClaudeUsageCredentialLoading {
     public init() {}
     public func accessToken() throws -> String {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecAttrAccount as String: NSUserName(),
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail,
-        ]
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data, data.count <= 1_048_576,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty, token.utf8.count <= 65_536 else {
-            throw ClaudeCurrentUsageError.credentialUnavailable
-        }
-        return token
+        try ClaudeNativeCredentialReadWorker.shared.accessToken()
+    }
+
+    public func renewAccessToken(rejectedToken: String, auth: ClaudeAuthInfo,
+                                 authAfter: @Sendable () throws -> ClaudeAuthInfo) async throws -> String {
+        try await ClaudeNativeCredentialRenewal.renew(rejectedToken: rejectedToken, auth: auth, authAfter: authAfter)
     }
 }
 
@@ -64,7 +66,11 @@ public struct ClaudeHTTPSUsageTransport: ClaudeUsageTransport {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("Codex-Multi-Switcher/0.2.2", forHTTPHeaderField: "User-Agent")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await Self.perform(request)
+    }
+
+    static func perform(_ request: URLRequest) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
             let delegate = BoundedClaudeResponse(continuation: continuation)
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForRequest = 5
@@ -95,6 +101,8 @@ private final class BoundedClaudeResponse: NSObject, URLSessionDataDelegate, @un
                     didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 401 { self.failure = .credentialRejected }
+        if status == 403 { self.failure = .accessDenied }
+        if status == 429 { self.failure = .rateLimited }
         self.valid = status == 200
             && response.expectedContentLength <= 1_048_576
         completionHandler(self.valid ? .allow : .cancel)
@@ -126,7 +134,9 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
     private let attemptLock = NSLock()
     private var retryAfter = Date.distantPast
     private var lastFailure = ClaudeCurrentUsageError.requestFailed
-    public static let cacheFreshness: TimeInterval = 60
+    private var attemptIdentity: String?
+    // Keep a successful sample usable across the minute polling boundary.
+    public static let cacheFreshness: TimeInterval = 120
 
     public init(root: URL, nativeHome: URL = FileManager.default.homeDirectoryForCurrentUser,
                 credentialLoader: any ClaudeUsageCredentialLoading = ClaudeNativeCredentialLoader(),
@@ -167,7 +177,8 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
                       authAfter: @Sendable () throws -> ClaudeAuthInfo,
                       now: Date = Date()) async throws -> ClaudeUsageSnapshot {
         guard self.supports(profile) else { throw ClaudeCurrentUsageError.unsupportedProfile }
-        if let cached = self.cached(profile: profile, auth: authBefore, now: now), !cached.isStale {
+        if let cached = self.cached(profile: profile, auth: authBefore, now: now),
+           !cached.isStale, now.timeIntervalSince(cached.observedAt) < 60 {
             let after = try authAfter()
             guard ClaudeUsageReader.accountFingerprint(after) == ClaudeUsageReader.accountFingerprint(authBefore),
                   self.cached(profile: profile, auth: after, now: now) != nil else {
@@ -175,9 +186,21 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
             }
             return cached
         }
-        try self.beginAttempt(now: now)
+        guard let identity = ClaudeUsageReader.accountFingerprint(authBefore) else {
+            throw ClaudeCurrentUsageError.accountChanged
+        }
+        let token = try self.loader.accessToken()
+        try self.beginAttempt(now: now, identity: identity + Self.credentialDigest(token))
         do {
-            let result = try await self.fetchUncached(profile: profile, authBefore: authBefore, authAfter: authAfter, now: now)
+            let result: ClaudeUsageSnapshot
+            do {
+                result = try await self.fetchUncached(profile: profile, authBefore: authBefore,
+                    authAfter: authAfter, token: token, now: now)
+            } catch ClaudeCurrentUsageError.credentialRejected {
+                let renewed = try await self.loader.renewAccessToken(rejectedToken: token, auth: authBefore, authAfter: authAfter)
+                result = try await self.fetchUncached(profile: profile, authBefore: authBefore,
+                    authAfter: authAfter, token: renewed, now: Date())
+            }
             self.finishAttempt()
             return result
         } catch {
@@ -187,10 +210,11 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         }
     }
 
-    private func beginAttempt(now: Date) throws {
+    private func beginAttempt(now: Date, identity: String) throws {
         self.attemptLock.lock()
         defer { self.attemptLock.unlock() }
-        guard now >= self.retryAfter else { throw self.lastFailure }
+        guard identity != self.attemptIdentity || now >= self.retryAfter else { throw self.lastFailure }
+        self.attemptIdentity = identity
         // Errors retain this backoff, including HTTP429. Success clears it.
         self.retryAfter = now.addingTimeInterval(300)
         self.lastFailure = .requestFailed
@@ -200,6 +224,9 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         self.attemptLock.lock()
         defer { self.attemptLock.unlock() }
         self.lastFailure = failure
+        if case .refreshInProgress = failure {
+            self.retryAfter = min(self.retryAfter, Date().addingTimeInterval(30))
+        }
     }
 
     private func finishAttempt() {
@@ -210,11 +237,10 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
 
     private func fetchUncached(profile: ClaudeProfile, authBefore: ClaudeAuthInfo,
                                authAfter: @Sendable () throws -> ClaudeAuthInfo,
-                               now: Date) async throws -> ClaudeUsageSnapshot {
+                               token: String, now: Date) async throws -> ClaudeUsageSnapshot {
         guard let identity = ClaudeUsageReader.accountFingerprint(authBefore) else {
             throw ClaudeCurrentUsageError.accountChanged
         }
-        let token = try self.loader.accessToken()
         let profileData = try await self.transport.get(path: "profile", accessToken: token)
         guard let linked = try? JSONSerialization.jsonObject(with: profileData) as? [String: Any],
               Self.matches(linked, auth: authBefore) else { throw ClaudeCurrentUsageError.accountChanged }
@@ -260,7 +286,7 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func matches(_ linked: [String: Any], auth: ClaudeAuthInfo) -> Bool {
+    static func matches(_ linked: [String: Any], auth: ClaudeAuthInfo) -> Bool {
         guard auth.loggedIn == true, let account = linked["account"] as? [String: Any],
               let uuid = account["uuid"] as? String, !uuid.isEmpty,
               let email = account["email"] as? String, !email.isEmpty,
