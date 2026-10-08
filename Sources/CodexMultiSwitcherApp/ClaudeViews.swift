@@ -190,8 +190,21 @@ struct ClaudeProfilesTab: View {
                 HStack {
                     Text("Claude usage").font(.system(size: 13, weight: .semibold))
                     Spacer()
-                    Button("Refresh") { store.refresh() }.disabled(store.isRefreshing)
+                    Button("Refresh") { store.refresh() }
+                        .disabled(store.isRefreshing || store.isAuthorizingCredential)
                         .controlSize(.small)
+                }
+                if store.supportsNativeUsage(profile) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Button(store.isAuthorizingCredential ? "Waiting for macOS permission…" : "Connect Claude Account…") {
+                            store.connectNativeAccount(id: profile.id)
+                        }
+                        .disabled(store.isRefreshing || store.isAuthorizingCredential)
+                        Text("macOS may ask permission to read your existing Claude sign-in. Choose Always Allow to enable automatic usage refresh. A new app build may need permission again.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text("After connecting, an expired sign-in can be renewed in the same Keychain item for this account.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
                 }
                 ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil)
                 ClaudeUsageDetail(snapshot: status?.usage)

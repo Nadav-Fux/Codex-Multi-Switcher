@@ -3,11 +3,12 @@ import Foundation
 import Security
 
 public enum ClaudeCurrentUsageError: LocalizedError {
-    case unsupportedProfile, credentialUnavailable, credentialRejected, accessDenied, credentialRenewalUnavailable, credentialRenewalFailed, refreshInProgress, rateLimited, accountChanged, invalidResponse, requestFailed
+    case unsupportedProfile, credentialUnavailable, credentialInteractionRequired, credentialRejected, accessDenied, credentialRenewalUnavailable, credentialRenewalFailed, refreshInProgress, rateLimited, accountChanged, invalidResponse, requestFailed
     public var errorDescription: String? {
         switch self {
         case .unsupportedProfile: return "Automatic usage is available for the existing native Claude account. Isolated accounts can use their native usage bridge."
         case .credentialUnavailable: return "Claude credentials are unavailable to this app. Check the Claude sign-in and macOS Keychain access for Codex Multi Switcher, then refresh."
+        case .credentialInteractionRequired: return "Connect your Claude account in Settings → Claude to authorize Keychain access for this app version."
         case .credentialRejected: return "Current Claude usage is unavailable for this sign-in. Usage can appear when the account becomes available; the statusline bridge is also supported."
         case .accessDenied: return "Claude denied quota access for this sign-in. Check this account in Claude Code."
         case .credentialRenewalUnavailable: return "Claude could not renew this sign-in without a Keychain prompt. Open Claude Code to renew it, then refresh."
@@ -38,7 +39,13 @@ public extension ClaudeUsageCredentialLoading {
 public struct ClaudeNativeCredentialLoader: ClaudeUsageCredentialLoading {
     public init() {}
     public func accessToken() throws -> String {
-        try ClaudeNativeCredentialReadWorker.shared.accessToken()
+        try ClaudeNativeCredentialAuthorization.requireBackgroundAccess()
+        return try ClaudeNativeCredentialReadWorker.shared.accessToken()
+    }
+
+    /// Call only after the user explicitly chooses to connect the native account.
+    public func authorizeAccess() throws {
+        try ClaudeNativeCredentialAuthorization.authorize()
     }
 
     public func renewAccessToken(rejectedToken: String, auth: ClaudeAuthInfo,
@@ -151,6 +158,16 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         profile.isDefault && profile.id == ClaudeProfileRegistry.defaultID
             && URL(fileURLWithPath: profile.configDirectory).standardizedFileURL
                 == self.nativeHome.appendingPathComponent(".claude").standardizedFileURL
+    }
+
+    /// Foreground consent for the existing native item; no network request or
+    /// credential write occurs until the following ordinary usage refresh.
+    public func authorizeNativeCredentialAccess(profile: ClaudeProfile) throws {
+        guard self.supports(profile), let native = self.loader as? ClaudeNativeCredentialLoader else {
+            throw ClaudeCurrentUsageError.unsupportedProfile
+        }
+        try native.authorizeAccess()
+        self.finishAttempt()
     }
 
     /// Only observations bound to the same current CLI identity are reusable.
