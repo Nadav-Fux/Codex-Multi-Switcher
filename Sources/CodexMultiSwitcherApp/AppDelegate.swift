@@ -137,12 +137,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.statusItem.menu = self.menu
         self.updateClaudeIcon()
         self.claudeStore.refresh()
-        self.claudeRefreshTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        let claudeTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.claudeStore.refresh()
                 self?.updateIcon()
             }
         }
+        RunLoop.main.add(claudeTimer, forMode: .common)
+        self.claudeRefreshTimer = claudeTimer
         self.externalStore.refresh()
         let externalTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.externalStore.refresh(); self?.updateIcon() }
@@ -533,7 +535,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let usage = status?.usage, !usage.isStale, usage.accountVerified {
             self.claudeMenuTooltip = "Claude Code · \(label) · Last observed usage · \(usage.observedAt.formatted(date: .abbreviated, time: .shortened))"
         } else {
-            self.claudeMenuTooltip = "Claude Code · \(label) · No current usage observed. Open Settings → Claude Code for usage details and the statusline connection."
+            let reason = status?.error ?? "Waiting for current quota."
+            self.claudeMenuTooltip = "Claude Code · \(label) · \(reason) Open Settings → Claude Code for details."
         }
         self.updateCombinedIcon()
     }

@@ -597,6 +597,7 @@ struct ProfilesTab: View {
 }
 
 struct GeneralTab: View {
+    @AppStorage("showInDock") private var showInDock = true
     @AppStorage(ProviderVisibility.key) private var menuBarProviders = ""
     @AppStorage("showClaudeInMenuBar") private var legacyShowClaude = true
     @AppStorage("showWeeklyResetCountdown") private var showWeeklyResetCountdown = true
@@ -639,6 +640,13 @@ struct GeneralTab: View {
                     .accessibilityValue(self.launchAtLoginAccessibilityValue)
 
                 self.launchAtLoginDescription
+
+                Toggle("Show app in Dock", isOn: self.$showInDock)
+                    .onChange(of: self.showInDock) { _, visible in
+                        NSApp.setActivationPolicy(visible ? .regular : .accessory)
+                    }
+                Text("Keep the app in the Dock to reopen Settings. Closing Settings keeps the menu bar app running.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
 
                 HStack {
                     Text("Credential renewal")

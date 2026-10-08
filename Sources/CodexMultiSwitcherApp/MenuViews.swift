@@ -429,20 +429,23 @@ struct ProviderSectionHeaderView: View {
     var body: some View {
         Button(action: self.onToggle) {
             HStack(spacing: 7) {
+                Image(systemName: self.isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.primary)
                 Text(self.title)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 0)
-                Image(systemName: self.isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.secondary)
             }
-            .contentShape(Rectangle())
             .padding(.horizontal, 10)
             .frame(maxWidth: .infinity, minHeight: Self.height, maxHeight: Self.height, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityHint(self.isCollapsed ? "Expand section" : "Collapse section")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(self.title)
+        .accessibilityValue(self.isCollapsed ? "Collapsed" : "Expanded")
+        .accessibilityHint("Toggle section")
     }
 }
 

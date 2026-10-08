@@ -71,7 +71,7 @@ come from Codex's response and can reflect the service's own reporting delay.
 Refresh also reads supplied banked reset inventory; it does not redeem a reset.
 
 Click any provider menu heading (**Codex**, **Claude Code**, **Antigravity**, or **GLM / Z.ai**) to collapse or expand that
-provider's details. Each choice is saved across launches. Collapsing a section
+provider's details. A chevron before each title indicates whether it is open or closed; the whole heading is clickable. Each choice is saved across launches. Collapsing a section
 does not stop its usage updates or change the providers shown in the menu bar.
 You can also open it from **File → Show Usage Menu** while Settings is focused.
 
@@ -103,6 +103,8 @@ To run the command line helper in a development build, use the built `codex-prof
 
 ## Claude Code accounts
 
+The local app can show a regular Dock icon. **Settings → General → Show app in Dock** controls it; it is enabled by default. Closing Settings leaves the menu bar app running. On this installation, `/Applications/Codex Multi Switcher.app` is a shortcut to the installed bundle in `~/Applications`, so both entry points open the same app.
+
 **Settings → Claude Code** manages an independent group of Claude accounts. The
 existing `~/.claude` directory appears automatically. Use **+**, rename the new
 profile, and **Sign In…** to sign in through the official Claude CLI in a separate
@@ -131,9 +133,14 @@ the indicator shows its symbol and `?`. Settings show cached observations with
 their source and timestamp. A legacy statusline
 cache cannot identify its account and is always labelled unverified. For the
 default Claude account, the app can read current quota through Claude’s OAuth
-profile and usage endpoints. It reads the existing credential without a Keychain
-prompt, verifies the server account against the CLI identity, and never renews
-or writes credentials. This path is unavailable when macOS denies the read.
+profile and usage endpoints even when Claude Code is closed. It reads the existing native credential without a Keychain
+prompt and verifies the server account against the CLI identity. If the service rejects an expired sign-in with HTTP 401,
+it can renew using Claude's existing refresh token and the official CLI's OAuth endpoint/client ID. Renewal preserves the
+account and existing scopes, coordinates the CLI's refresh/storage locks, and updates only the unchanged native Keychain item
+after verifying the renewed identity. It does not sign into another account or alter Claude settings. When macOS denies access,
+the refresh token cannot be renewed, or another process is updating it, the app shows the reason and retries conservatively.
+Quota is polled roughly every minute; a 120-second freshness allowance keeps the last verified observation visible while a refresh finishes.
+Normal credential reads have a five-second caller deadline and only one outstanding worker, so a stalled macOS Keychain service cannot leave the refresh controls busy indefinitely. A timeout or denied read is reported; it does not grant new Keychain access. Credential writes stay synchronous under the CLI's storage lock.
 Separate managed accounts use native `rate_limits` statusline data, normally
 after a model response. **Refresh** checks saved observations, authentication
 status, and eligible default-account usage. Project

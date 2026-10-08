@@ -54,7 +54,8 @@ enum Main {
             unsetenv("CLAUDE_PROFILE_USER_HOME")
         #endif
         let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
+        let showInDock = UserDefaults.standard.object(forKey: "showInDock") as? Bool ?? true
+        app.setActivationPolicy(showInDock ? .regular : .accessory)
 
         let appMenu = NSMenu()
         appMenu.addItem(
