@@ -11,7 +11,7 @@ public enum ClaudeUsageReader {
     public static let staleAfter: TimeInterval = 300
 
     public static func accountFingerprint(_ auth: ClaudeAuthInfo?) -> String? {
-        guard let auth, auth.loggedIn == true,
+        guard let auth, auth.loggedIn == true || auth.authenticationMethod == "account_metadata",
               auth.email != nil || auth.accountID != nil else { return nil }
         let identity = ["email": auth.email?.lowercased() ?? "",
                         "accountID": auth.accountID ?? "", "organizationID": auth.organizationID ?? ""]

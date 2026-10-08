@@ -1,7 +1,6 @@
-import Darwin
 import Foundation
 
-/// Runs only the CLI's token-free auth status command. Never reads Keychain credentials.
+/// Reads account identity from Claude's local metadata. CLI execution is reserved for user-launched sessions.
 public struct ClaudeCLIService: Sendable {
     public let environment: [String: String]
     public let userHome: URL
@@ -49,60 +48,58 @@ public struct ClaudeCLIService: Sendable {
             nativeHome.appendingPathComponent(".claude", isDirectory: true).path
     }
 
+    /// Compatibility entry point: no subprocess is started and no credential is read.
+    /// Local metadata remembers an identity; it cannot attest that its credential is valid.
     public func authStatus(profile: ClaudeProfile, timeout: TimeInterval = 6) throws -> ClaudeAuthInfo {
-        guard let executable = self.discoverExecutable() else { throw ClaudeIntegrationError.cliMissing }
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = ["auth", "status", "--json"]
-        process.environment = self.sanitizedEnvironment(profile: profile)
-        process.currentDirectoryURL = self.userHome
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        let fd = pipe.fileHandleForReading.fileDescriptor
-        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
-        try process.run()
-        try? pipe.fileHandleForWriting.close()
-        defer { try? pipe.fileHandleForReading.close() }
-        let deadline = Date().addingTimeInterval(min(max(timeout, 0.1), 30))
-        var output = Data()
-        var buffer = [UInt8](repeating: 0, count: 8192)
-        var observedExit = false
-        while true {
-            let length = Darwin.read(fd, &buffer, buffer.count)
-            if length > 0 {
-                guard output.count + length <= 65_536 else {
-                    Self.stop(process)
-                    throw ClaudeIntegrationError.invalidStatus
-                }
-                output.append(contentsOf: buffer.prefix(length))
-                continue
-            }
-            if length < 0 && errno == EINTR { continue }
-            if observedExit { break }
-            if !process.isRunning {
-                // The child may have written its final JSON between the EAGAIN read
-                // above and this exit observation. Drain once more after exit, then
-                // stop at EOF/EAGAIN even if a descendant kept the pipe open.
-                observedExit = true
-                continue
-            }
-            if Date() >= deadline {
-                Self.stop(process)
-                throw ClaudeIntegrationError.timeout
-            }
-            Thread.sleep(forTimeInterval: 0.02)
+        try self.identityMetadata(profile: profile)
+    }
+
+    public func identityMetadata(profile: ClaudeProfile, fileManager: FileManager = .default) throws -> ClaudeAuthInfo {
+        let metadataURL: URL
+        if profile.isDefault {
+            // The native account's metadata lives beside ~/.claude, not inside it.
+            // Use the configured home so isolated previews cannot read the real account.
+            metadataURL = self.userHome.appendingPathComponent(".claude.json")
+        } else {
+            let directory = URL(fileURLWithPath: profile.configDirectory, isDirectory: true)
+            // Claude Code 2.1.260's installed source prefers this legacy config file
+            // when present, otherwise its production OAuth metadata is .claude.json.
+            let legacy = directory.appendingPathComponent(".config.json")
+            metadataURL = fileManager.fileExists(atPath: legacy.path)
+                ? legacy : directory.appendingPathComponent(".claude.json")
         }
-        guard let json = try? JSONSerialization.jsonObject(with: output) as? [String: Any],
-              let loggedIn = json["loggedIn"] as? Bool else { throw ClaudeIntegrationError.invalidStatus }
-        // Extract a fixed list of non-secret fields; never persist or log the raw response.
-        return ClaudeAuthInfo(loggedIn: loggedIn, email: Self.safeString(json["email"]),
-                              organization: Self.safeString(json["orgName"]),
-                              subscription: Self.safeString(json["subscriptionType"]),
-                              authenticationMethod: Self.safeString(json["authMethod"]),
-                              accountID: Self.safeString(json["accountUuid"] ?? json["accountId"]),
-                              organizationID: Self.safeString(json["orgId"] ?? json["orgUuid"]))
+        guard fileManager.fileExists(atPath: metadataURL.path) else {
+            return ClaudeAuthInfo(loggedIn: nil)
+        }
+        guard let size = try? metadataURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size <= 16_777_216 else { throw ClaudeIntegrationError.invalidStatus }
+        let document: IdentityDocument
+        do {
+            let data = try Data(contentsOf: metadataURL)
+            guard data.count <= 16_777_216 else { throw ClaudeIntegrationError.invalidStatus }
+            // Decode only oauthAccount identity fields. Ignore credentials and all other settings.
+            document = try JSONDecoder().decode(IdentityDocument.self, from: data)
+        } catch { throw ClaudeIntegrationError.invalidStatus }
+        guard let account = document.oauthAccount else { return ClaudeAuthInfo(loggedIn: nil) }
+        let email = Self.safeString(account.emailAddress)
+        let accountID = Self.safeString(account.accountUuid)
+        guard email != nil || accountID != nil else { return ClaudeAuthInfo(loggedIn: nil) }
+        return ClaudeAuthInfo(loggedIn: nil, email: email,
+                              organization: Self.safeString(account.organizationName),
+                              authenticationMethod: "account_metadata",
+                              accountID: accountID,
+                              organizationID: Self.safeString(account.organizationUuid))
+    }
+
+    private struct IdentityDocument: Decodable {
+        let oauthAccount: AccountMetadata?
+    }
+
+    private struct AccountMetadata: Decodable {
+        let accountUuid: String?
+        let emailAddress: String?
+        let organizationName: String?
+        let organizationUuid: String?
     }
 
     /// Generates a private launcher for a NEW Terminal process. It never retargets a live session.
@@ -144,11 +141,4 @@ public struct ClaudeCLIService: Sendable {
         return value
     }
 
-    private static func stop(_ process: Process) {
-        guard process.isRunning else { return }
-        process.terminate()
-        let deadline = Date().addingTimeInterval(0.2)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
-        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-    }
 }

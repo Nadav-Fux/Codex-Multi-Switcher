@@ -1,6 +1,7 @@
 import Foundation
 import LocalAuthentication
 import Security
+import CodexProfileCore
 
 /// A user-supplied Coding Plan key lives in this app's own Keychain item.
 /// ZCode's encrypted credentials are never copied or decrypted.
@@ -16,6 +17,14 @@ enum GLMCredentialStore {
     }
 
     static func load(allowInteraction: Bool = false) throws -> String? {
+        do {
+            return try KeychainInteractionPolicy.withInteraction(allowed: allowInteraction) {
+                try self.read(allowInteraction: allowInteraction)
+            }
+        } catch { throw Failure.unavailable }
+    }
+
+    private static func read(allowInteraction: Bool) throws -> String? {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne

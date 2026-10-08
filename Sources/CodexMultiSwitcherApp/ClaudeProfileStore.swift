@@ -54,13 +54,13 @@ final class ClaudeProfileStore: ObservableObject {
         let cli = self.cli
         let currentUsage = self.currentUsage
         self.refreshTask = Task { [weak self] in
-            // Bound CLI concurrency so a large registry cannot spawn arbitrary processes.
+            // Bound concurrent metadata and usage reads for large profile registries.
             await withTaskGroup(of: (String, ClaudeProfileStatus).self) { group in
                 var pending = profiles.makeIterator()
                 func enqueue(_ profile: ClaudeProfile) {
                     group.addTask {
                         var status = ClaudeProfileStatus()
-                        do { status.auth = try cli.authStatus(profile: profile) }
+                        do { status.auth = try cli.identityMetadata(profile: profile) }
                         catch {
                             status.error = error.localizedDescription
                             CoreLogger.warning("Claude quota unavailable", metadata: ["category": "auth_status_unavailable"])
@@ -74,17 +74,17 @@ final class ClaudeProfileStore: ObservableObject {
                            ClaudeUsageReader.accountFingerprint(auth) != nil {
                             do {
                                 status.usage = try await currentUsage.fetch(profile: profile, authBefore: auth,
-                                    authAfter: { try cli.authStatus(profile: profile) })
+                                    authAfter: { try cli.identityMetadata(profile: profile) })
                                 status.error = nil
                             } catch {
                                 let category = (error as? ClaudeCurrentUsageError).map { String(describing: $0) } ?? "request_failed"
                                 CoreLogger.warning("Claude quota unavailable", metadata: ["category": category])
-                                // Recheck CLI identity after failed network/renewal attempts before
+                                // Recheck local identity after failed network/renewal attempts before
                                 // reusing any observation; an account switch can happen in flight.
                                 if case ClaudeCurrentUsageError.accountChanged = error {
                                     status.usage = nil
                                 } else {
-                                    if let after = try? cli.authStatus(profile: profile),
+                                    if let after = try? cli.identityMetadata(profile: profile),
                                        ClaudeUsageReader.accountFingerprint(after) == ClaudeUsageReader.accountFingerprint(auth) {
                                         status.auth = after
                                         let bridge = ClaudeUsageReader.read(profile: profile, auth: after).snapshot
@@ -184,10 +184,10 @@ final class ClaudeProfileStore: ObservableObject {
             }
             do {
                 // Verify the current identity at installation, rather than using an older UI status.
-                let auth = try await Task.detached { try cli.authStatus(profile: profile) }.value
+                let auth = try await Task.detached { try cli.identityMetadata(profile: profile) }.value
                 guard self.profiles.contains(where: { $0.id == id }) else { return }
-                guard auth.loggedIn == true else {
-                    self.error = "Sign in to this Claude profile before installing its usage bridge."
+                guard auth.email != nil || auth.accountID != nil else {
+                    self.error = "Sign in to this Claude profile so its account metadata is available before installing its usage bridge."
                     return
                 }
                 try self.installer.install(profile: profile, auth: auth)
