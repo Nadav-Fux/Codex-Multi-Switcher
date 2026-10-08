@@ -75,7 +75,9 @@ struct ExternalProviderSettings: View {
                         }
                     }.font(.system(size: 18, weight: .semibold))
                     Spacer()
-                    Button("Refresh") { store.refresh(provider, force: true) }
+                    Button(provider == .antigravity ? "Read quota once" : "Refresh") {
+                        store.refresh(provider, force: true, manual: provider == .antigravity)
+                    }
                         .disabled(store.refreshing.contains(provider))
                 }
                 Toggle("Show in menu bar", isOn: Binding(
@@ -83,7 +85,7 @@ struct ExternalProviderSettings: View {
                     set: { ProviderVisibility.set(provider, visible: $0) }))
                     .disabled(ProviderVisibility.selection().count == 1 && ProviderVisibility.selection().contains(provider))
                 Text(provider == .antigravity
-                     ? "Reads the existing Antigravity account. Gemini and other model quotas remain separate. Choose which model or pool from each group appears in the menu bar."
+                     ? "Antigravity quota is read only when you choose Read quota once. Its CLI can run your configured statusline, so automatic checks are paused. Gemini and other model quotas remain separate."
                      : "Reads your Z.ai GLM Coding Plan subscription quota. Local token counts and pay-as-you-go API balance are separate from subscription limits.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .antigravity {

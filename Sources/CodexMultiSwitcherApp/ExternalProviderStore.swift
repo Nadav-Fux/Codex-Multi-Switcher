@@ -19,9 +19,18 @@ final class ExternalProviderStore: ObservableObject {
         self.adapters = Dictionary(adapters.map { ($0.providerID, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
-    func refresh(_ provider: ProviderID? = nil, force: Bool = false) {
+    func refresh(_ provider: ProviderID? = nil, force: Bool = false, manual: Bool = false) {
         for id in provider.map({ [$0] }) ?? [.antigravity, .glm] {
             guard let adapter = adapters[id] else { continue }
+            // agy may execute the user's statusline even for /usage. Never start
+            // it from timers, app launch, menu opening, wake, or a global refresh.
+            if id == .antigravity && !manual {
+                if snapshots[id] == nil {
+                    snapshots[id] = ProviderUsageSnapshot(provider: id,
+                        source: "Antigravity quota · manual refresh only", state: .unavailable)
+                }
+                continue
+            }
             if refreshing.contains(id) {
                 if force { pendingForced.insert(id) }
                 continue
@@ -37,7 +46,7 @@ final class ExternalProviderStore: ObservableObject {
                 guard let self, !Task.isCancelled else { return }
                 defer {
                     self.refreshing.remove(id); self.tasks[id] = nil; self.onChange?()
-                    if self.pendingForced.remove(id) != nil { self.refresh(id, force: true) }
+                    if self.pendingForced.remove(id) != nil { self.refresh(id, force: true, manual: id == .antigravity) }
                 }
                 guard snapshot.provider == id, self.credentialGeneration[id, default: 0] == generation else { return }
                 // Failed reads replace the observation. Old-account numbers never
@@ -98,7 +107,7 @@ enum ProviderQuotaPresentation {
         case .signedOut: return "Sign in to \(provider == .glm ? "ZCode / Z.ai" : "Antigravity") to read your subscription quota."
         case .unavailable: return provider == .glm
             ? "Z.ai returned no Coding Plan quota windows for this key. Check the plan and key, or try refreshing later."
-            : "No supported quota source was found. See settings for connection details."
+            : "Antigravity refresh is manual. Open Settings → Antigravity and choose Read quota once."
         case .error(let error):
             switch error {
             case .credentialAccessUnsupported: return "Connect a Z.ai Coding Plan API key in settings. ZCode keeps its sign-in encrypted."

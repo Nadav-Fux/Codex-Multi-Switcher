@@ -49,7 +49,7 @@ enum CodexProfileCLI {
     private static let paths = AppPaths()
     private static let configStore = ProfileConfigStore(paths: Self.paths)
     private static let vault = Self.makeVault()
-    private static let version = "0.3.9"
+    private static let version = "0.3.10"
     private static let signedSmokeServicePrefix = "com.codexmultiswitcher.app.auth.smoke."
     private static let signedSmokeLegacyServicePrefix = "com.codexmultiswitcher.app.auth.legacy-smoke."
 
