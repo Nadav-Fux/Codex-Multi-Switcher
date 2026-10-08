@@ -4,8 +4,9 @@ import CryptoKit
 import Foundation
 
 /// Reads Antigravity's live quota snapshot through the official read-only CLI command.
-/// It reads only the known CLI ID-token identity claims for account binding, changes no local
-/// auth/settings state, and never falls back to a model prompt.
+/// Runs with a disposable private home and working directory so user statusline commands,
+/// hooks, plugins, and project settings cannot run. Only the known cached auth metadata is
+/// copied; real auth/settings state is never written and no model prompt fallback is used.
 public struct AntigravityUsageReader: Sendable {
     private static let minimumSafeCLI = [1, 2, 11]
     private static let maximumOutputBytes = 1_048_576
@@ -30,13 +31,21 @@ public struct AntigravityUsageReader: Sendable {
         guard let executable = executableURL ?? Self.resolveExecutable() else {
             throw AntigravityUsageError.cliMissing
         }
-        guard let identityBefore = Self.currentAccountIdentity() else {
+        let realTokenURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
+        guard let token = Self.cachedToken(at: realTokenURL),
+              let identityBefore = Self.accountIdentity(token) else {
             throw AntigravityUsageError.accountUnavailable
+        }
+        let isolated = try IsolatedHome(token: token)
+        defer { isolated.remove() }
+        guard Self.currentAccountIdentity(at: isolated.tokenURL) == identityBefore else {
+            throw AntigravityUsageError.accountChanged
         }
 
         let versionData: Data
         do {
-            versionData = try Self.run(executable: executable, arguments: ["--version"], timeout: timeout)
+            versionData = try Self.run(executable: executable, arguments: ["--version"], home: isolated, timeout: timeout)
         } catch AntigravityUsageError.timedOut {
             throw AntigravityUsageError.timedOut
         } catch {
@@ -52,30 +61,44 @@ public struct AntigravityUsageReader: Sendable {
         let response: Data
         do {
             response = try Self.run(executable: executable,
-                                    arguments: ["-p", "/usage", "--output-format", "json"],
-                                    timeout: timeout)
+                                    arguments: ["-p", "/usage", "--output-format", "json",
+                                                "--print-timeout", "\(Int(ceil(timeout)))s"],
+                                    home: isolated, timeout: timeout)
         } catch AntigravityUsageError.timedOut {
             throw AntigravityUsageError.timedOut
         } catch {
             throw AntigravityUsageError.commandFailed
         }
-        guard let identityAfter = Self.currentAccountIdentity() else {
+        guard let identityAfter = Self.currentAccountIdentity(at: realTokenURL),
+              identityBefore == identityAfter,
+              Self.currentAccountIdentity(at: isolated.tokenURL) == identityAfter else {
             throw AntigravityUsageError.accountChanged
         }
-        guard identityBefore == identityAfter else { throw AntigravityUsageError.accountChanged }
         return try Self.parse(response, observedAt: Date(), accountIdentity: identityAfter)
     }
 
-    /// Reads only the known Antigravity CLI token's ID-token issuer and subject. Token material,
-    /// email, and all other claims remain in memory and are never returned or logged.
-    private static func currentAccountIdentity() -> String? {
-        let tokenURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
-        guard let values = try? tokenURL.resourceValues(forKeys: [.fileSizeKey]),
+    /// Loads just the official CLI's known token metadata. Unknown top-level fields are not
+    /// copied, and credentials are never included in errors or diagnostic output.
+    private static func cachedToken(at url: URL) -> [String: Any]? {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+              values.isRegularFile == true,
               let size = values.fileSize, size > 0, size <= Self.maximumOutputBytes,
-              let data = try? Data(contentsOf: tokenURL), data.count <= Self.maximumOutputBytes,
+              let data = try? Data(contentsOf: url), data.count <= Self.maximumOutputBytes,
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let idToken = root["id_token"] as? String else { return nil }
+              let method = root["auth_method"] as? String, !method.isEmpty,
+              let idToken = root["id_token"] as? String,
+              let token = root["token"] as? [String: Any], !token.isEmpty else { return nil }
+        return ["auth_method": method, "id_token": idToken, "token": token]
+    }
+
+    private static func currentAccountIdentity(at url: URL) -> String? {
+        guard let token = Self.cachedToken(at: url) else { return nil }
+        return Self.accountIdentity(token)
+    }
+
+    /// Hashes the ID-token issuer and subject; no token or other claim is returned.
+    private static func accountIdentity(_ token: [String: Any]) -> String? {
+        guard let idToken = token["id_token"] as? String else { return nil }
         let parts = idToken.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3 else { return nil }
         var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+")
@@ -106,56 +129,164 @@ public struct AntigravityUsageReader: Sendable {
         return candidates.first { manager.isExecutableFile(atPath: $0.path) }
     }
 
-    private static func run(executable: URL, arguments: [String], timeout: TimeInterval) throws -> Data {
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            throw AntigravityUsageError.commandFailed
-        }
+    private struct IsolatedHome {
+        let url: URL
+        let tokenURL: URL
 
-        let timeoutFlag = TimeoutFlag()
-        let timer = DispatchWorkItem {
-            guard process.isRunning else { return }
-            timeoutFlag.set()
-            process.terminate()
-            let pid = process.processIdentifier
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-                if process.isRunning { _ = kill(pid, SIGKILL) }
-            }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: timer)
-        var data = Data()
-        var outputExceededLimit = false
-        while true {
-            let chunk: Data?
+        init(token: [String: Any]) throws {
+            // mkdtemp creates the parent atomically with mode 0700, before credentials exist.
+            var template = Array(FileManager.default.temporaryDirectory
+                .appendingPathComponent("codex-agy-quota-XXXXXX").path.utf8CString)
+            guard let path = mkdtemp(&template) else { throw AntigravityUsageError.commandFailed }
+            let root = URL(fileURLWithPath: String(cString: path), isDirectory: true)
+            let cli = root.appendingPathComponent(".gemini/antigravity-cli", isDirectory: true)
+            let tokenURL = cli.appendingPathComponent("antigravity-oauth-token")
             do {
-                chunk = try output.fileHandleForReading.read(upToCount: 16_384)
+                let manager = FileManager.default
+                for directory in [cli, root.appendingPathComponent(".gemini/config"),
+                                  root.appendingPathComponent(".agents"),
+                                  root.appendingPathComponent("tmp")] {
+                    try manager.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+                }
+                let settings: [String: Any] = [
+                    "statusLine": ["enabled": false],
+                    "title": ["enabled": false],
+                    "hooks": [:], "mcpServers": [:],
+                    "notifications": false, "enableTelemetry": false,
+                ]
+                for (file, data) in [
+                    (tokenURL, try JSONSerialization.data(withJSONObject: token)),
+                    (cli.appendingPathComponent("settings.json"),
+                     try JSONSerialization.data(withJSONObject: settings)),
+                    (root.appendingPathComponent(".gemini/config/hooks.json"), Data("{}".utf8)),
+                    (root.appendingPathComponent(".agents/hooks.json"), Data("{}".utf8)),
+                ] {
+                    guard manager.createFile(atPath: file.path, contents: data,
+                                             attributes: [.posixPermissions: 0o600]) else {
+                        throw AntigravityUsageError.commandFailed
+                    }
+                }
             } catch {
-                process.terminate()
-                process.waitUntilExit()
-                timer.cancel()
+                try? FileManager.default.removeItem(at: root)
                 throw AntigravityUsageError.commandFailed
             }
-            guard let chunk, !chunk.isEmpty else { break }
-            guard data.count + chunk.count <= Self.maximumOutputBytes else {
-                outputExceededLimit = true
-                process.terminate()
+            self.url = root
+            self.tokenURL = tokenURL
+        }
+
+        var environment: [String: String] {
+            // Do not inherit provider keys, host-auth switches, config paths, or shell setup.
+            ["HOME": url.path, "CFFIXED_USER_HOME": url.path,
+             "XDG_CONFIG_HOME": url.appendingPathComponent(".config").path,
+             "XDG_CACHE_HOME": url.appendingPathComponent(".cache").path,
+             "XDG_DATA_HOME": url.appendingPathComponent(".local/share").path,
+             "TMPDIR": url.appendingPathComponent("tmp").path,
+             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8",
+             "TERM": "dumb", "NO_COLOR": "1", "CI": "true",
+             "BROWSER": "/usr/bin/false", "GIT_CONFIG_GLOBAL": "/dev/null",
+             "GIT_CONFIG_NOSYSTEM": "1"]
+        }
+
+        func remove() { try? FileManager.default.removeItem(at: url) }
+    }
+
+    private static func run(executable: URL, arguments: [String], home: IsolatedHome,
+                            timeout: TimeInterval) throws -> Data {
+        var descriptors: [Int32] = [0, 0]
+        guard pipe(&descriptors) == 0 else { throw AntigravityUsageError.commandFailed }
+        defer { close(descriptors[0]); close(descriptors[1]) }
+        var actions: posix_spawn_file_actions_t?
+        var attributes: posix_spawnattr_t?
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            throw AntigravityUsageError.commandFailed
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        guard posix_spawnattr_init(&attributes) == 0 else { throw AntigravityUsageError.commandFailed }
+        defer { posix_spawnattr_destroy(&attributes) }
+        // A new process group owns all inherited descendants; kill it on every exit path.
+        guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0,
+              posix_spawnattr_setpgroup(&attributes, 0) == 0,
+              posix_spawn_file_actions_addchdir_np(&actions, home.url.path) == 0,
+              posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0,
+              posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0,
+              posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO) == 0,
+              posix_spawn_file_actions_addclose(&actions, descriptors[0]) == 0,
+              posix_spawn_file_actions_addclose(&actions, descriptors[1]) == 0 else {
+            throw AntigravityUsageError.commandFailed
+        }
+        let argv = ([executable.path] + arguments).map { strdup($0) }
+        let envp = home.environment.map { strdup("\($0.key)=\($0.value)") }
+        defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
+        var pid: pid_t = 0
+        let launch = (argv + [nil]).withUnsafeBufferPointer { argvPointer in
+            (envp + [nil]).withUnsafeBufferPointer { envPointer in
+                posix_spawn(&pid, executable.path, &actions, &attributes,
+                            UnsafeMutablePointer(mutating: argvPointer.baseAddress!),
+                            UnsafeMutablePointer(mutating: envPointer.baseAddress!))
+            }
+        }
+        guard launch == 0 else { throw AntigravityUsageError.commandFailed }
+        var reaped = false
+        defer {
+            _ = kill(-pid, SIGKILL)
+            if !reaped {
+                var status: Int32 = 0
+                while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+            }
+        }
+        guard fcntl(descriptors[0], F_SETFL, O_NONBLOCK) != -1 else {
+            throw AntigravityUsageError.commandFailed
+        }
+        // Parent must not keep the writing end alive. Mark it closed for the outer defer.
+        close(descriptors[1])
+        descriptors[1] = -1
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        var exitStatus: Int32 = 0
+        while true {
+            while true {
+                let count = Darwin.read(descriptors[0], &buffer, buffer.count)
+                if count > 0 {
+                    guard data.count + count <= Self.maximumOutputBytes else {
+                        throw AntigravityUsageError.invalidResponse
+                    }
+                    data.append(contentsOf: buffer.prefix(count))
+                } else if count == -1 && errno == EINTR {
+                    continue
+                } else if count == -1 && errno != EAGAIN && errno != EWOULDBLOCK {
+                    throw AntigravityUsageError.commandFailed
+                } else {
+                    break
+                }
+                guard ProcessInfo.processInfo.systemUptime < deadline else {
+                    throw AntigravityUsageError.timedOut
+                }
+            }
+            let result = waitpid(pid, &exitStatus, WNOHANG)
+            if result == pid {
+                reaped = true
+                _ = kill(-pid, SIGKILL)
+                // Read remaining buffered output, without waiting for descendants to close it.
+                while true {
+                    let count = Darwin.read(descriptors[0], &buffer, buffer.count)
+                    guard count > 0 else { break }
+                    guard data.count + count <= Self.maximumOutputBytes else {
+                        throw AntigravityUsageError.invalidResponse
+                    }
+                    data.append(contentsOf: buffer.prefix(count))
+                }
                 break
             }
-            data.append(chunk)
+            guard result != -1 || errno == EINTR else { throw AntigravityUsageError.commandFailed }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                throw AntigravityUsageError.timedOut
+            }
+            var pollDescriptor = pollfd(fd: descriptors[0], events: Int16(POLLIN), revents: 0)
+            _ = poll(&pollDescriptor, 1, 20)
         }
-        process.waitUntilExit()
-        timer.cancel()
-
-        guard !outputExceededLimit else { throw AntigravityUsageError.invalidResponse }
-        if timeoutFlag.value { throw AntigravityUsageError.timedOut }
-        guard process.terminationStatus == 0 else { throw AntigravityUsageError.commandFailed }
+        guard exitStatus == 0 else { throw AntigravityUsageError.commandFailed }
         return data
     }
 
@@ -237,20 +368,5 @@ public struct AntigravityUsageReader: Sendable {
             formatter.formatOptions = [.withInternetDateTime]
             return formatter.date(from: value)
         }()
-    }
-}
-
-private final class TimeoutFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var didTimeout = false
-    func set() {
-        self.lock.lock()
-        self.didTimeout = true
-        self.lock.unlock()
-    }
-    var value: Bool {
-        self.lock.lock()
-        defer { self.lock.unlock() }
-        return self.didTimeout
     }
 }

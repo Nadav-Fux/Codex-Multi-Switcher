@@ -186,9 +186,8 @@ private enum ClaudeNativeKeychainInteraction {
     }
 }
 
-/// An ad hoc rebuild has a new Keychain identity. Obtain consent for this exact
-/// executable before any background read can stall waiting for its first grant.
-/// The stored value identifies the executable; it contains no account or credential.
+/// Remembers the user's explicit connection intent. macOS still enforces access
+/// to the exact Keychain item for every silent read; a build hash is not an ACL.
 enum ClaudeNativeCredentialAuthorization {
     private static let preferenceKey = "claudeNativeCredentialAuthorizedExecutableSHA256"
     private static let executableDigest: String? = {
@@ -200,8 +199,7 @@ enum ClaudeNativeCredentialAuthorization {
     }()
 
     static func requireBackgroundAccess() throws {
-        guard let digest = self.executableDigest,
-              UserDefaults.standard.string(forKey: self.preferenceKey) == digest else {
+        guard UserDefaults.standard.string(forKey: self.preferenceKey)?.isEmpty == false else {
             throw ClaudeCurrentUsageError.credentialInteractionRequired
         }
     }
