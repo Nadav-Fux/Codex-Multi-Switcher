@@ -55,6 +55,7 @@ public enum GLMQuotaError: LocalizedError, Equatable {
     case credentialRejected
     case accountChanged
     case invalidResponse
+    case quotaUnavailable
     case requestFailed
 
     public var errorDescription: String? {
@@ -71,6 +72,8 @@ public enum GLMQuotaError: LocalizedError, Equatable {
             return "The selected ZCode Coding Plan changed during the quota refresh. Refresh again."
         case .invalidResponse:
             return "Z.ai returned an unsupported Coding Plan quota response."
+        case .quotaUnavailable:
+            return "Z.ai returned no Coding Plan quota windows for this key. Check the plan and key, or try refreshing later."
         case .requestFailed:
             return "Current GLM Coding Plan quota could not be fetched. Try refreshing again in a few minutes."
         }

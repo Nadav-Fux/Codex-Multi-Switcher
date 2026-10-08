@@ -15,16 +15,19 @@ enum GLMCredentialStore {
         }
     }
 
-    static func load() throws -> String? {
+    static func load(allowInteraction: Bool = false) throws -> String? {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         let context = LAContext()
-        context.interactionNotAllowed = true
+        context.interactionNotAllowed = !allowInteraction
         query[kSecUseAuthenticationContext as String] = context
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
+        if status != errSecSuccess {
+            AppLogger.warning("GLM Keychain read failed", metadata: ["osstatus": String(status)])
+        }
         guard status == errSecSuccess, let data = result as? Data,
               let value = String(data: data, encoding: .utf8), valid(value) else { throw Failure.unavailable }
         return value

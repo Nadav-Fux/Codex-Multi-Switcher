@@ -57,6 +57,7 @@ struct ExternalProviderSettings: View {
     @State private var glmKey = ""
     @State private var glmKeyStored = false
     @State private var credentialError: String?
+    @State private var connectingKey = false
     @AppStorage("antigravityMenuBucket.gemini") private var geminiBucket = ""
     @AppStorage("antigravityMenuBucket.other") private var otherBucket = ""
 
@@ -100,6 +101,24 @@ struct ExternalProviderSettings: View {
                     : "Connect your Personal Z.ai Coding Plan key for quota and usage. Its key stays in this app’s Keychain. Reset cards and Flash grants are read separately from your existing local ZCode sign-in; credentials are decoded only in memory using ZCode’s published format. Redeem cards in ZCode.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .glm {
+                    Button(connectingKey ? "Waiting for macOS permission…" : "Connect Saved Z.ai Key…") {
+                        connectingKey = true
+                        credentialError = nil
+                        NSApp.activate(ignoringOtherApps: true)
+                        Task { @MainActor in
+                            defer { connectingKey = false }
+                            do {
+                                let exists = try await Task.detached {
+                                    try GLMCredentialStore.load(allowInteraction: true) != nil
+                                }.value
+                                glmKeyStored = exists
+                                if exists { store.credentialsDidChange(.glm) }
+                                else { credentialError = "No saved Coding Plan key was found. Add your key below." }
+                            } catch { credentialError = error.localizedDescription }
+                        }
+                    }.disabled(connectingKey)
+                    Text("Reconnect the existing saved key after an app update if macOS requests Keychain permission. This does not replace the key.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                     Toggle("Read reset cards and Start Plan / Flash balances from local ZCode sign-in", isOn: $readsZCodeBenefits)
                         .onChange(of: readsZCodeBenefits) { _, _ in store.credentialsDidChange(.glm) }
                     SecureField("Z.ai Coding Plan API key", text: $glmKey)
