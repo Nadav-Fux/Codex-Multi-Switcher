@@ -72,14 +72,16 @@ struct GLMProviderAdapter: UsageProviderAdapter {
                 accountVerified: usage.accountVerified, glmMonitor: monitor, glmAccountBenefits: benefits)
         } catch {
             let state: ProviderSnapshotState
+            AppLogger.warning("GLM quota read failed", metadata: ["category": String(describing: type(of: error))])
             switch error as? GLMQuotaError {
             case .credentialUnavailable: state = .signedOut
             case .credentialRejected: state = .error(.authenticationRequired)
             case .unsupportedPlan: state = .error(.unsupported)
             case .encryptedCredentialUnsupported: state = .error(.credentialAccessUnsupported)
             case .invalidResponse: state = .error(.malformedResponse)
+            case .quotaUnavailable: state = .unavailable
             case .accountChanged: state = .error(.authenticationRequired)
-            default: state = .error(.networkUnavailable)
+            default: state = error is GLMCredentialStore.Failure ? .error(.credentialAccessUnsupported) : .error(.networkUnavailable)
             }
             return ProviderUsageSnapshot(provider: providerID, source: "Z.ai Coding Plan quota", state: state, glmAccountBenefits: await GLMAccountBenefitsCache.shared.validate(await accountBenefits))
         }

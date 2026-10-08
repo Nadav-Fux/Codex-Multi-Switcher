@@ -96,7 +96,9 @@ enum ProviderQuotaPresentation {
             if !snapshot.isCurrent() { return "Observation is out of date. Refresh to read current quota." }
             return snapshot.buckets.isEmpty ? "The service did not report quota windows." : ""
         case .signedOut: return "Sign in to \(provider == .glm ? "ZCode / Z.ai" : "Antigravity") to read your subscription quota."
-        case .unavailable: return "No supported quota source was found. See settings for connection details."
+        case .unavailable: return provider == .glm
+            ? "Z.ai returned no Coding Plan quota windows for this key. Check the plan and key, or try refreshing later."
+            : "No supported quota source was found. See settings for connection details."
         case .error(let error):
             switch error {
             case .credentialAccessUnsupported: return "Connect a Z.ai Coding Plan API key in settings. ZCode keeps its sign-in encrypted."

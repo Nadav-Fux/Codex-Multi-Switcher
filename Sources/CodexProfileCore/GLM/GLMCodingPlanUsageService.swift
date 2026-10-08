@@ -140,8 +140,11 @@ public final class GLMCodingPlanUsageService: @unchecked Sendable {
     private static func parse(_ data: Data, planKind: GLMCodingPlanKind,
                               observedAt: Date, source: GLMQuotaSource,
                               accountVerified: Bool) throws -> GLMQuotaSnapshot {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw GLMQuotaError.invalidResponse
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            throw Self.invalidResponse(stage: "json", root: nil)
+        }
+        guard let root = object as? [String: Any] else {
+            throw Self.invalidResponse(stage: "root", root: object)
         }
         if let success = root["success"] as? NSNumber,
            CFGetTypeID(success) == CFBooleanGetTypeID(), !success.boolValue {
@@ -149,13 +152,23 @@ public final class GLMCodingPlanUsageService: @unchecked Sendable {
             throw GLMQuotaError.requestFailed
         }
         if let rawCode = root["code"] {
-            guard let code = Self.integer(rawCode) else { throw GLMQuotaError.invalidResponse }
+            guard let code = Self.integer(rawCode) else {
+                throw Self.invalidResponse(stage: "code", root: root)
+            }
             if code == 401 { throw GLMQuotaError.credentialRejected }
             guard code == 0 || code == 200 else { throw GLMQuotaError.requestFailed }
         }
         let payload = root["data"] as? [String: Any] ?? root
+        guard !payload.isEmpty else {
+            CoreLogger.warning("GLM quota not reported", metadata: ["reason": "empty_data"])
+            throw GLMQuotaError.quotaUnavailable
+        }
         guard let limits = payload["limits"] as? [[String: Any]] else {
-            throw GLMQuotaError.invalidResponse
+            throw Self.invalidResponse(stage: "limits", root: root)
+        }
+        guard !limits.isEmpty else {
+            CoreLogger.warning("GLM quota not reported", metadata: ["reason": "empty_limits"])
+            throw GLMQuotaError.quotaUnavailable
         }
 
         var fiveHour: GLMQuotaWindow?
@@ -169,21 +182,94 @@ public final class GLMCodingPlanUsageService: @unchecked Sendable {
                 .joined(separator: " ").lowercased()
             let window = GLMQuotaWindow(usedPercentage: percentage,
                                         resetsAt: Self.resetDate(in: limit))
-            if description.contains("week") || type.contains("week") {
+            let unit = Self.integer(limit["unit"])
+            let number = Self.integer(limit["number"])
+            let codingPlanLimit = type == "tokens_limit" || type == "credit_limit"
+            if description.contains("week") || type.contains("week")
+                || codingPlanLimit && unit == 6 && number == 1 {
                 if weekly == nil { weekly = window }
             } else if type == "time_limit" || description.contains("mcp")
                         || description.contains("tool") && description.contains("month") {
                 if monthlyTool == nil { monthlyTool = window }
-            } else if description.contains("hour") || type == "tokens_limit" {
+            } else if description.contains("hour") || type == "tokens_limit"
+                        || type == "credit_limit" && unit == 3 && number == 5 {
                 if fiveHour == nil { fiveHour = window }
             }
         }
         guard fiveHour != nil || weekly != nil || monthlyTool != nil else {
-            throw GLMQuotaError.invalidResponse
+            throw Self.invalidResponse(stage: "windows", root: root)
         }
         return GLMQuotaSnapshot(fiveHour: fiveHour, weekly: weekly, monthlyTool: monthlyTool,
                                 observedAt: observedAt, source: source, planKind: planKind,
                                 accountVerified: accountVerified)
+    }
+
+    /// Records only structural states and allowlisted quota fields, never arbitrary response text.
+    private static func invalidResponse(stage: String, root: Any?) -> GLMQuotaError {
+        let rootObject = root as? [String: Any]
+        let payload = rootObject?["data"] as? [String: Any] ?? rootObject
+        let rawLimits = payload?["limits"]
+        let limits = rawLimits as? [Any]
+        var metadata = [
+            "stage": stage,
+            "root_shape": Self.shape(root),
+            "data_shape": Self.shape(rootObject?["data"]),
+            "limits_shape": Self.shape(rawLimits),
+            "limits_count": limits.map { String($0.count) } ?? "unavailable",
+            "data_fields": (payload?.keys.filter { key in
+                (1...40).contains(key.utf8.count) && key.utf8.allSatisfy {
+                    (65...90).contains($0) || (97...122).contains($0) || $0 == 95
+                }
+            }.sorted().prefix(16).joined(separator: ",")) ?? "unavailable",
+        ]
+        for (index, value) in (limits ?? []).prefix(8).enumerated() {
+            let prefix = "limit_\(index)_"
+            guard let limit = value as? [String: Any] else {
+                metadata[prefix + "shape"] = Self.shape(value)
+                continue
+            }
+            if let type = limit["type"] as? String, (1...64).contains(type.utf8.count),
+               type.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || $0 == 95 }) {
+                metadata[prefix + "type"] = type
+            } else {
+                metadata[prefix + "type"] = limit["type"] == nil ? "missing" : "unknown"
+            }
+            for key in ["unit", "number"] {
+                if let number = limit[key] as? NSNumber,
+                   CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
+                   (0...100).contains(number.doubleValue) {
+                    metadata[prefix + key] = number.stringValue
+                } else {
+                    metadata[prefix + key] = Self.shape(limit[key])
+                }
+            }
+            if Self.percentage(limit["percentage"]) != nil {
+                metadata[prefix + "percentage"] = "valid"
+            } else if let number = limit["percentage"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID() {
+                metadata[prefix + "percentage"] = "out_of_range"
+            } else {
+                metadata[prefix + "percentage"] = Self.shape(limit["percentage"])
+            }
+            if let number = limit["percentage"] as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite {
+                metadata[prefix + "percentage_value"] = number.stringValue
+            }
+        }
+        CoreLogger.warning("GLM quota response unsupported", metadata: metadata)
+        return .invalidResponse
+    }
+
+    private static func shape(_ value: Any?) -> String {
+        guard let value else { return "missing" }
+        if value is NSNull { return "null" }
+        if value is [String: Any] { return "object" }
+        if value is [Any] { return "array" }
+        if let number = value as? NSNumber {
+            return CFGetTypeID(number) == CFBooleanGetTypeID() ? "boolean" : "number"
+        }
+        if value is String { return "string" }
+        return "unknown"
     }
 
     private static func percentage(_ value: Any?) -> Double? {
