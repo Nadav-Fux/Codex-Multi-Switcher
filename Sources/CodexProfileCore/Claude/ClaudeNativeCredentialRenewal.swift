@@ -177,32 +177,12 @@ struct ClaudeNativeCredentialItem {
 /// Legacy macOS Keychain authorization can ignore the modern LAContext policy.
 /// Suppress optional interaction only for each synchronous operation, then restore it.
 private enum ClaudeNativeKeychainInteraction {
-    private static let lock = NSLock()
-
     static func withPolicy<T>(allowInteraction: Bool, _ operation: () throws -> T) throws -> T {
-        self.lock.lock()
-        defer { self.lock.unlock() }
-        var previous: DarwinBoolean = false
-        ClaudeNativeKeychainDiagnostics.begin(stage: "get_interaction_policy")
-        let getStatus = SecKeychainGetUserInteractionAllowed(&previous)
-        guard getStatus == errSecSuccess else {
-            ClaudeNativeKeychainDiagnostics.failure(stage: "get_interaction_policy", status: getStatus)
+        do {
+            return try KeychainInteractionPolicy.withInteraction(allowed: allowInteraction, operation)
+        } catch is KeychainInteractionPolicy.Failure {
             throw ClaudeCurrentUsageError.credentialUnavailable
         }
-        ClaudeNativeKeychainDiagnostics.begin(stage: allowInteraction ? "enable_foreground_interaction" : "disable_interaction")
-        let setStatus = SecKeychainSetUserInteractionAllowed(allowInteraction)
-        guard setStatus == errSecSuccess else {
-            ClaudeNativeKeychainDiagnostics.failure(stage: "set_interaction_policy", status: setStatus)
-            throw ClaudeCurrentUsageError.credentialUnavailable
-        }
-        defer {
-            ClaudeNativeKeychainDiagnostics.begin(stage: "restore_interaction_policy")
-            let status = SecKeychainSetUserInteractionAllowed(previous.boolValue)
-            if status != errSecSuccess {
-                ClaudeNativeKeychainDiagnostics.failure(stage: "restore_interaction_policy", status: status)
-            }
-        }
-        return try operation()
     }
 }
 

@@ -105,6 +105,8 @@ To run the command line helper in a development build, use the built `codex-prof
 
 ## Claude Code accounts
 
+Background identity checks read only the remembered `oauthAccount` metadata in Claude's local configuration. They never run `claude auth status` or spawn `security` subprocesses. Remembered identity is not proof of a valid sign-in: live quota still requires a matching authenticated server profile. Claude and GLM native Keychain calls share one serialized interaction policy; background calls suppress prompts, while explicit connection actions can request consent.
+
 The local app can show a regular Dock icon. **Settings → General → Show app in Dock** controls it; it is enabled by default. Closing Settings leaves the menu bar app running. On this installation, `/Applications/Codex Multi Switcher.app` is a shortcut to the installed bundle in `~/Applications`, so both entry points open the same app.
 
 **Settings → Claude Code** manages an independent group of Claude accounts. The

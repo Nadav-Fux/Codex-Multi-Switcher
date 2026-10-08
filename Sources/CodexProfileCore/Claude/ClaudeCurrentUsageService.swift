@@ -304,7 +304,8 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
     }
 
     static func matches(_ linked: [String: Any], auth: ClaudeAuthInfo) -> Bool {
-        guard auth.loggedIn == true, let account = linked["account"] as? [String: Any],
+        guard auth.loggedIn == true || auth.authenticationMethod == "account_metadata",
+              let account = linked["account"] as? [String: Any],
               let uuid = account["uuid"] as? String, !uuid.isEmpty,
               let email = account["email"] as? String, !email.isEmpty,
               let organization = linked["organization"] as? [String: Any],
