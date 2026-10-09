@@ -3,230 +3,218 @@ import CoreFoundation
 import CryptoKit
 import Foundation
 
-/// Reads Antigravity's live quota snapshot through the official read-only CLI command.
-/// Runs with a disposable private home and working directory so user statusline commands,
-/// hooks, plugins, and project settings cannot run. Only the known cached auth metadata is
-/// copied; real auth/settings state is never written and no model prompt fallback is used.
+/// Reads the quota-summary API with the existing usage helper's account. Never launches
+/// Antigravity, opens a browser, or accesses Keychain. Google verifies the helper bearer
+/// belongs to the same subject/email as the current Antigravity CLI ID-token metadata.
 public struct AntigravityUsageReader: Sendable {
-    private static let minimumSafeCLI = [1, 2, 11]
-    private static let maximumOutputBytes = 1_048_576
-
-    private let explicitExecutableURL: URL?
+    private static let maximumBytes = 1_048_576
     private let timeout: TimeInterval
 
     public init(executableURL: URL? = nil, timeout: TimeInterval = 8) {
-        self.explicitExecutableURL = executableURL
+        // Retain source compatibility; an AGY executable must never be invoked here.
         self.timeout = min(max(timeout, 1), 30)
     }
 
-    /// Performs a fresh `/usage` fetch. Antigravity's CLI refreshes quota state for this command.
     public func read() async throws -> AntigravityUsageSnapshot {
-        try await Task.detached(priority: .utility) {
-            try Self.readSynchronously(executableURL: self.explicitExecutableURL,
-                                       timeout: self.timeout)
-        }.value
-    }
-
-    private static func readSynchronously(executableURL: URL?, timeout: TimeInterval) throws -> AntigravityUsageSnapshot {
-        guard let executable = executableURL ?? Self.resolveExecutable() else {
-            throw AntigravityUsageError.cliMissing
-        }
-        let realTokenURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
-        guard let token = Self.cachedToken(at: realTokenURL),
-              let identityBefore = Self.accountIdentity(token) else {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let identityURL = home.appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
+        let helperDirectory = home.appendingPathComponent("Library/Application Support/antigravity-usage")
+        let configURL = helperDirectory.appendingPathComponent("config.json")
+        guard let identity = Self.identity(at: identityURL),
+              let active = Self.activeAccount(at: configURL), active.lowercased() == identity.email else {
             throw AntigravityUsageError.accountUnavailable
         }
-        let isolated = try IsolatedHome(token: token)
-        defer { isolated.remove() }
-        guard Self.currentAccountIdentity(at: isolated.tokenURL) == identityBefore else {
-            throw AntigravityUsageError.accountChanged
+        // Match the existing helper's account-directory sanitization, without enumerating accounts.
+        let safeEmail = active.map { character -> Character in
+            character.isASCII && (character.isLetter || character.isNumber || "@._-".contains(character)) ? character : "_"
         }
+        let tokenURL = helperDirectory.appendingPathComponent("accounts")
+            .appendingPathComponent(String(safeEmail)).appendingPathComponent("tokens.json")
+        var credential = try Self.credential(at: tokenURL, email: active)
+        if credential.expiresAt <= Date().addingTimeInterval(300) {
+            try await Task.detached(priority: .utility) {
+                try Self.refreshHelperAccount(email: active, home: home)
+            }.value
+            credential = try Self.credential(at: tokenURL, email: active)
+        }
+        guard credential.expiresAt > Date(),
+              Self.activeAccount(at: configURL) == active,
+              Self.identity(at: identityURL) == identity else { throw AntigravityUsageError.accountChanged }
 
-        let versionData: Data
-        do {
-            versionData = try Self.run(executable: executable, arguments: ["--version"], home: isolated, timeout: timeout)
-        } catch AntigravityUsageError.timedOut {
-            throw AntigravityUsageError.timedOut
-        } catch {
-            throw AntigravityUsageError.commandFailed
-        }
-        guard let versionText = String(data: versionData, encoding: .utf8),
-              let version = Self.version(in: versionText),
-              Self.isSafeVersion(version) else {
-            // Older builds may treat `/usage` as a user prompt. Do not invoke them.
-            throw AntigravityUsageError.unsupportedCLIVersion
-        }
-
-        let response: Data
-        do {
-            response = try Self.run(executable: executable,
-                                    arguments: ["-p", "/usage", "--output-format", "json",
-                                                "--print-timeout", "\(Int(ceil(timeout)))s"],
-                                    home: isolated, timeout: timeout)
-        } catch AntigravityUsageError.timedOut {
-            throw AntigravityUsageError.timedOut
-        } catch {
-            throw AntigravityUsageError.commandFailed
-        }
-        guard let identityAfter = Self.currentAccountIdentity(at: realTokenURL),
-              identityBefore == identityAfter,
-              Self.currentAccountIdentity(at: isolated.tokenURL) == identityAfter else {
-            throw AntigravityUsageError.accountChanged
-        }
-        return try Self.parse(response, observedAt: Date(), accountIdentity: identityAfter)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.timeoutIntervalForRequest = self.timeout
+        configuration.timeoutIntervalForResource = self.timeout
+        let session = URLSession(configuration: configuration, delegate: AntigravityNoRedirect(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let user = try await Self.request(url: "https://www.googleapis.com/oauth2/v2/userinfo",
+                                          accessToken: credential.accessToken, session: session)
+        guard let userRoot = try? JSONSerialization.jsonObject(with: user) as? [String: Any],
+              userRoot["id"] as? String == identity.subject,
+              let verified = userRoot["verified_email"] as? Bool, verified,
+              let email = userRoot["email"] as? String,
+              email.lowercased() == identity.email else { throw AntigravityUsageError.accountChanged }
+        let response = try await Self.request(
+            url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            accessToken: credential.accessToken, session: session, post: true)
+        guard Self.activeAccount(at: configURL) == active,
+              Self.identity(at: identityURL) == identity,
+              let latest = Self.readFile(at: tokenURL, privateFile: true),
+              Self.digest(latest) == credential.digest else { throw AntigravityUsageError.accountChanged }
+        return try Self.parse(response, observedAt: Date(), identity: identity.digest)
     }
 
-    /// Loads just the official CLI's known token metadata. Unknown top-level fields are not
-    /// copied, and credentials are never included in errors or diagnostic output.
-    private static func cachedToken(at url: URL) -> [String: Any]? {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
-              values.isRegularFile == true,
-              let size = values.fileSize, size > 0, size <= Self.maximumOutputBytes,
-              let data = try? Data(contentsOf: url), data.count <= Self.maximumOutputBytes,
+    private struct Identity: Equatable {
+        let issuer: String
+        let subject: String
+        let email: String
+        var digest: String { "sha256:" + AntigravityUsageReader.digest(Data((issuer + "\u{0}" + subject).utf8)) }
+    }
+
+    private struct Credential {
+        let accessToken: String
+        let expiresAt: Date
+        let digest: String
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Reads only known paths, with size and ownership checks. Credential files must be 0600.
+    private static func readFile(at url: URL, privateFile: Bool = false) -> Data? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(), info.st_size > 0, info.st_size <= maximumBytes,
+              !privateFile || info.st_mode & 0o777 == 0o600,
+              let data = try? Data(contentsOf: url), data.count <= maximumBytes else { return nil }
+        return data
+    }
+
+    private static func activeAccount(at url: URL) -> String? {
+        guard let data = readFile(at: url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let method = root["auth_method"] as? String, !method.isEmpty,
-              let idToken = root["id_token"] as? String,
-              let token = root["token"] as? [String: Any], !token.isEmpty else { return nil }
-        return ["auth_method": method, "id_token": idToken, "token": token]
+              let email = root["activeAccount"] as? String, !email.isEmpty, email.count <= 320,
+              email.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
+        return email
     }
 
-    private static func currentAccountIdentity(at url: URL) -> String? {
-        guard let token = Self.cachedToken(at: url) else { return nil }
-        return Self.accountIdentity(token)
-    }
-
-    /// Hashes the ID-token issuer and subject; no token or other claim is returned.
-    private static func accountIdentity(_ token: [String: Any]) -> String? {
-        guard let idToken = token["id_token"] as? String else { return nil }
-        let parts = idToken.split(separator: ".", omittingEmptySubsequences: false)
+    private static func identity(at url: URL) -> Identity? {
+        guard let data = readFile(at: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = root["id_token"] as? String else { return nil }
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3 else { return nil }
-        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
         payload += String(repeating: "=", count: (4 - payload.utf8.count % 4) % 4)
-        guard let payloadData = Data(base64Encoded: payload),
-              let claims = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-              let issuer = claims["iss"] as? String, !issuer.isEmpty,
-              let subject = claims["sub"] as? String, !subject.isEmpty else { return nil }
-        let digest = SHA256.hash(data: Data((issuer + "\u{0}" + subject).utf8))
-            .map { String(format: "%02x", $0) }.joined()
-        return "sha256:" + digest
+        guard let claimsData = Data(base64Encoded: payload),
+              let claims = try? JSONSerialization.jsonObject(with: claimsData) as? [String: Any],
+              let issuer = claims["iss"] as? String,
+              ["https://accounts.google.com", "accounts.google.com"].contains(issuer),
+              let subject = claims["sub"] as? String, !subject.isEmpty,
+              let email = claims["email"] as? String, !email.isEmpty else { return nil }
+        return Identity(issuer: issuer, subject: subject, email: email.lowercased())
     }
 
-    private static func resolveExecutable() -> URL? {
-        let manager = FileManager.default
-        let home = manager.homeDirectoryForCurrentUser
-        var candidates = [
-            home.appendingPathComponent(".local/bin/agy"),
-            URL(fileURLWithPath: "/opt/homebrew/bin/agy"),
-            URL(fileURLWithPath: "/usr/local/bin/agy"),
-            URL(fileURLWithPath: "/usr/bin/agy"),
-        ]
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        candidates.append(contentsOf: path.split(separator: ":").map {
-            URL(fileURLWithPath: String($0), isDirectory: true).appendingPathComponent("agy")
-        })
-        return candidates.first { manager.isExecutableFile(atPath: $0.path) }
+    private static func credential(at url: URL, email: String) throws -> Credential {
+        guard let data = readFile(at: url, privateFile: true),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let storedEmail = root["email"] as? String, storedEmail.lowercased() == email.lowercased(),
+              let accessToken = root["accessToken"] as? String, !accessToken.isEmpty,
+              accessToken.utf8.count <= 65_536,
+              accessToken.rangeOfCharacter(from: .controlCharacters) == nil,
+              let expiry = root["expiresAt"] as? NSNumber,
+              CFGetTypeID(expiry) != CFBooleanGetTypeID(), expiry.doubleValue.isFinite,
+              expiry.doubleValue > 0 else { throw AntigravityUsageError.accountUnavailable }
+        return Credential(accessToken: accessToken,
+                          expiresAt: Date(timeIntervalSince1970: expiry.doubleValue / 1000), digest: digest(data))
     }
 
-    private struct IsolatedHome {
-        let url: URL
-        let tokenURL: URL
-
-        init(token: [String: Any]) throws {
-            // mkdtemp creates the parent atomically with mode 0700, before credentials exist.
-            var template = Array(FileManager.default.temporaryDirectory
-                .appendingPathComponent("codex-agy-quota-XXXXXX").path.utf8CString)
-            guard let path = mkdtemp(&template) else { throw AntigravityUsageError.commandFailed }
-            let root = URL(fileURLWithPath: String(cString: path), isDirectory: true)
-            let cli = root.appendingPathComponent(".gemini/antigravity-cli", isDirectory: true)
-            let tokenURL = cli.appendingPathComponent("antigravity-oauth-token")
-            do {
-                let manager = FileManager.default
-                for directory in [cli, root.appendingPathComponent(".gemini/config"),
-                                  root.appendingPathComponent(".agents"),
-                                  root.appendingPathComponent("tmp")] {
-                    try manager.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-                }
-                let settings: [String: Any] = [
-                    "statusLine": ["enabled": false],
-                    "title": ["enabled": false],
-                    "hooks": [:], "mcpServers": [:],
-                    "notifications": false, "enableTelemetry": false,
-                ]
-                for (file, data) in [
-                    (tokenURL, try JSONSerialization.data(withJSONObject: token)),
-                    (cli.appendingPathComponent("settings.json"),
-                     try JSONSerialization.data(withJSONObject: settings)),
-                    (root.appendingPathComponent(".gemini/config/hooks.json"), Data("{}".utf8)),
-                    (root.appendingPathComponent(".agents/hooks.json"), Data("{}".utf8)),
-                ] {
-                    guard manager.createFile(atPath: file.path, contents: data,
-                                             attributes: [.posixPermissions: 0o600]) else {
-                        throw AntigravityUsageError.commandFailed
-                    }
-                }
-            } catch {
-                try? FileManager.default.removeItem(at: root)
-                throw AntigravityUsageError.commandFailed
+    private static func request(url: String, accessToken: String, session: URLSession,
+                                post: Bool = false) async throws -> Data {
+        var request = URLRequest(url: URL(string: url)!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
+        request.httpMethod = post ? "POST" : "GET"
+        request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+        if post {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("{}".utf8)
+        }
+        do {
+            let (bytes, response) = try await session.bytes(for: request)
+            guard let response = response as? HTTPURLResponse, response.statusCode == 200,
+                  response.expectedContentLength <= maximumBytes else { throw AntigravityUsageError.commandFailed }
+            var data = Data()
+            for try await byte in bytes {
+                guard data.count < maximumBytes else { throw AntigravityUsageError.invalidResponse }
+                data.append(byte)
             }
-            self.url = root
-            self.tokenURL = tokenURL
+            return data
+        } catch let error as AntigravityUsageError { throw error }
+        catch {
+            if (error as NSError).code == NSURLErrorTimedOut { throw AntigravityUsageError.timedOut }
+            throw AntigravityUsageError.commandFailed
         }
-
-        var environment: [String: String] {
-            // Do not inherit provider keys, host-auth switches, config paths, or shell setup.
-            ["HOME": url.path, "CFFIXED_USER_HOME": url.path,
-             "XDG_CONFIG_HOME": url.appendingPathComponent(".config").path,
-             "XDG_CACHE_HOME": url.appendingPathComponent(".cache").path,
-             "XDG_DATA_HOME": url.appendingPathComponent(".local/share").path,
-             "TMPDIR": url.appendingPathComponent("tmp").path,
-             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "en_US.UTF-8",
-             "TERM": "dumb", "NO_COLOR": "1", "CI": "true",
-             "BROWSER": "/usr/bin/false", "GIT_CONFIG_GLOBAL": "/dev/null",
-             "GIT_CONFIG_NOSYSTEM": "1"]
-        }
-
-        func remove() { try? FileManager.default.removeItem(at: url) }
     }
 
-    private static func run(executable: URL, arguments: [String], home: IsolatedHome,
-                            timeout: TimeInterval) throws -> Data {
-        var descriptors: [Int32] = [0, 0]
-        guard pipe(&descriptors) == 0 else { throw AntigravityUsageError.commandFailed }
-        defer { close(descriptors[0]); close(descriptors[1]) }
+    /// The installed helper's explicit account-refresh branch only refreshes OAuth and saves
+    /// that account's token/last-used metadata. It never selects login or changes activeAccount.
+    private static func refreshHelperAccount(email: String, home: URL) throws {
+        let manager = FileManager.default
+        let helperCandidates = [home.appendingPathComponent(".local/bin/antigravity-usage"),
+                                URL(fileURLWithPath: "/opt/homebrew/bin/antigravity-usage"),
+                                URL(fileURLWithPath: "/usr/local/bin/antigravity-usage")]
+        guard let helper = helperCandidates.first(where: { manager.isExecutableFile(atPath: $0.path) }) else {
+            throw AntigravityUsageError.cliMissing
+        }
+        let script = helper.resolvingSymlinksInPath()
+        // npm's bin symlink resolves into <prefix>/lib/node_modules/<package>/dist/index.js.
+        var nodeCandidates: [URL] = []
+        var ancestor = script.deletingLastPathComponent()
+        for _ in 0..<6 {
+            nodeCandidates.append(ancestor.appendingPathComponent("bin/node"))
+            ancestor.deleteLastPathComponent()
+        }
+        nodeCandidates += [home.appendingPathComponent(".local/opt/node-v24.16.0-darwin-arm64/bin/node"),
+                           URL(fileURLWithPath: "/opt/homebrew/bin/node"), URL(fileURLWithPath: "/usr/local/bin/node")]
+        nodeCandidates += (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map {
+            URL(fileURLWithPath: String($0)).appendingPathComponent("node")
+        }
+        guard let node = nodeCandidates.first(where: { manager.isExecutableFile(atPath: $0.path) }) else {
+            throw AntigravityUsageError.cliMissing
+        }
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
-        guard posix_spawn_file_actions_init(&actions) == 0 else {
-            throw AntigravityUsageError.commandFailed
-        }
+        guard posix_spawn_file_actions_init(&actions) == 0 else { throw AntigravityUsageError.commandFailed }
         defer { posix_spawn_file_actions_destroy(&actions) }
         guard posix_spawnattr_init(&attributes) == 0 else { throw AntigravityUsageError.commandFailed }
         defer { posix_spawnattr_destroy(&attributes) }
-        // A new process group owns all inherited descendants; kill it on every exit path.
         guard posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0,
-              posix_spawn_file_actions_addchdir_np(&actions, home.url.path) == 0,
+              posix_spawn_file_actions_addchdir_np(&actions, "/") == 0,
               posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0,
-              posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0,
-              posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO) == 0,
-              posix_spawn_file_actions_addclose(&actions, descriptors[0]) == 0,
-              posix_spawn_file_actions_addclose(&actions, descriptors[1]) == 0 else {
+              posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) == 0,
+              posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
             throw AntigravityUsageError.commandFailed
         }
-        let argv = ([executable.path] + arguments).map { strdup($0) }
-        let envp = home.environment.map { strdup("\($0.key)=\($0.value)") }
+        let argv = [node.path, script.path, "accounts", "refresh", email].map { strdup($0) }
+        // Keep the real home for file-backed helper storage; exclude shell/config injection.
+        let env = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CI": "true",
+                   "NO_COLOR": "1", "BROWSER": "/usr/bin/false"]
+        let envp = env.map { strdup("\($0.key)=\($0.value)") }
         defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
         var pid: pid_t = 0
-        let launch = (argv + [nil]).withUnsafeBufferPointer { argvPointer in
-            (envp + [nil]).withUnsafeBufferPointer { envPointer in
-                posix_spawn(&pid, executable.path, &actions, &attributes,
-                            UnsafeMutablePointer(mutating: argvPointer.baseAddress!),
-                            UnsafeMutablePointer(mutating: envPointer.baseAddress!))
+        let result = (argv + [nil]).withUnsafeBufferPointer { arguments in
+            (envp + [nil]).withUnsafeBufferPointer { environment in
+                posix_spawn(&pid, node.path, &actions, &attributes,
+                            UnsafeMutablePointer(mutating: arguments.baseAddress!),
+                            UnsafeMutablePointer(mutating: environment.baseAddress!))
             }
         }
-        guard launch == 0 else { throw AntigravityUsageError.commandFailed }
+        guard result == 0 else { throw AntigravityUsageError.commandFailed }
         var reaped = false
         defer {
             _ = kill(-pid, SIGKILL)
@@ -235,138 +223,76 @@ public struct AntigravityUsageReader: Sendable {
                 while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
             }
         }
-        guard fcntl(descriptors[0], F_SETFL, O_NONBLOCK) != -1 else {
-            throw AntigravityUsageError.commandFailed
-        }
-        // Parent must not keep the writing end alive. Mark it closed for the outer defer.
-        close(descriptors[1])
-        descriptors[1] = -1
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 16_384)
-        var exitStatus: Int32 = 0
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
         while true {
-            while true {
-                let count = Darwin.read(descriptors[0], &buffer, buffer.count)
-                if count > 0 {
-                    guard data.count + count <= Self.maximumOutputBytes else {
-                        throw AntigravityUsageError.invalidResponse
-                    }
-                    data.append(contentsOf: buffer.prefix(count))
-                } else if count == -1 && errno == EINTR {
-                    continue
-                } else if count == -1 && errno != EAGAIN && errno != EWOULDBLOCK {
-                    throw AntigravityUsageError.commandFailed
-                } else {
-                    break
-                }
-                guard ProcessInfo.processInfo.systemUptime < deadline else {
-                    throw AntigravityUsageError.timedOut
-                }
-            }
-            let result = waitpid(pid, &exitStatus, WNOHANG)
-            if result == pid {
+            var status: Int32 = 0
+            let waited = waitpid(pid, &status, WNOHANG)
+            if waited == pid {
                 reaped = true
-                _ = kill(-pid, SIGKILL)
-                // Read remaining buffered output, without waiting for descendants to close it.
-                while true {
-                    let count = Darwin.read(descriptors[0], &buffer, buffer.count)
-                    guard count > 0 else { break }
-                    guard data.count + count <= Self.maximumOutputBytes else {
-                        throw AntigravityUsageError.invalidResponse
-                    }
-                    data.append(contentsOf: buffer.prefix(count))
-                }
-                break
+                guard status == 0 else { throw AntigravityUsageError.commandFailed }
+                return
             }
-            guard result != -1 || errno == EINTR else { throw AntigravityUsageError.commandFailed }
-            guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw AntigravityUsageError.timedOut
-            }
-            var pollDescriptor = pollfd(fd: descriptors[0], events: Int16(POLLIN), revents: 0)
-            _ = poll(&pollDescriptor, 1, 20)
-        }
-        guard exitStatus == 0 else { throw AntigravityUsageError.commandFailed }
-        return data
-    }
-
-    private static func version(in value: String) -> [Int]? {
-        let pattern = #"(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:$|\s)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
-              match.numberOfRanges == 4 else { return nil }
-        return (1...3).compactMap { index in
-            guard let range = Range(match.range(at: index), in: value) else { return nil }
-            return Int(value[range])
+            guard waited != -1 || errno == EINTR else { throw AntigravityUsageError.commandFailed }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw AntigravityUsageError.timedOut }
+            usleep(20_000)
         }
     }
 
-    private static func isSafeVersion(_ value: [Int]) -> Bool {
-        for index in 0..<minimumSafeCLI.count {
-            let current = index < value.count ? value[index] : 0
-            if current != minimumSafeCLI[index] { return current > minimumSafeCLI[index] }
-        }
-        return true
-    }
-
-    private static func parse(_ data: Data, observedAt: Date,
-                              accountIdentity: String) throws -> AntigravityUsageSnapshot {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              root["status"] as? String == "SUCCESS",
-              let numTurns = root["num_turns"] as? Int, numTurns == 0,
-              let command = root["command"] as? [String: Any],
-              command["name"] as? String == "usage",
-              let commandData = command["data"] as? [String: Any],
-              let groups = commandData["groups"] as? [[String: Any]] else {
+    private static func parse(_ data: Data, observedAt: Date, identity: String) throws -> AntigravityUsageSnapshot {
+        guard let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AntigravityUsageError.invalidResponse
         }
-
+        let root = envelope["response"] as? [String: Any] ?? envelope
+        guard let groups = root["groups"] as? [[String: Any]] else { throw AntigravityUsageError.invalidResponse }
         var buckets: [AntigravityQuotaBucket] = []
-        var seenIDs = Set<String>()
+        var seen = Set<String>()
         for group in groups {
-            guard let familyLabel = group["name"] as? String, !familyLabel.isEmpty,
-                  let rawBuckets = group["buckets"] as? [[String: Any]] else {
-                throw AntigravityUsageError.invalidResponse
-            }
-            let family: AntigravityQuotaFamily = familyLabel.localizedCaseInsensitiveContains("gemini")
-                ? .gemini : .nonGemini
-            let description = group["description"] as? String
-            for bucket in rawBuckets {
-                guard let id = bucket["id"] as? String, !id.isEmpty,
-                      seenIDs.insert(id).inserted,
-                      let windowLabel = bucket["name"] as? String, !windowLabel.isEmpty,
-                      let window = bucket["window"] as? String, !window.isEmpty,
-                      let fractionNumber = bucket["remaining_fraction"] as? NSNumber,
-                      CFGetTypeID(fractionNumber) != CFBooleanGetTypeID(),
-                      fractionNumber.doubleValue.isFinite,
-                      (0...1).contains(fractionNumber.doubleValue),
-                      let resetText = bucket["reset_time"] as? String,
-                      let resetsAt = Self.parseDate(resetText) else {
+            guard let entries = group["buckets"] as? [[String: Any]] else { throw AntigravityUsageError.invalidResponse }
+            for entry in entries {
+                guard let id = (entry["bucketId"] ?? entry["bucket_id"]) as? String else {
                     throw AntigravityUsageError.invalidResponse
                 }
-                buckets.append(AntigravityQuotaBucket(
-                    id: id,
-                    familyLabel: familyLabel,
-                    family: family,
-                    modelDescription: description,
-                    windowLabel: windowLabel,
-                    window: window,
-                    remainingFraction: fractionNumber.doubleValue,
-                    resetsAt: resetsAt
-                ))
+                let family: AntigravityQuotaFamily
+                let window: String
+                switch id {
+                case "gemini-5h": family = .gemini; window = "5h"
+                case "gemini-weekly": family = .gemini; window = "weekly"
+                case "3p-5h": family = .nonGemini; window = "5h"
+                case "3p-weekly": family = .nonGemini; window = "weekly"
+                default: continue
+                }
+                guard seen.insert(id).inserted,
+                      let fraction = (entry["remainingFraction"] ?? entry["remaining_fraction"]) as? NSNumber,
+                      CFGetTypeID(fraction) != CFBooleanGetTypeID(), fraction.doubleValue.isFinite,
+                      (0...1).contains(fraction.doubleValue),
+                      let reset = (entry["resetTime"] ?? entry["reset_time"]) as? String,
+                      let date = parseDate(reset) else { throw AntigravityUsageError.invalidResponse }
+                buckets.append(AntigravityQuotaBucket(id: id,
+                    familyLabel: family == .gemini ? "Gemini Models" : "Claude + GPT Models",
+                    family: family, windowLabel: window == "5h" ? "5-Hour Limit Remaining" : "Weekly Limit Remaining",
+                    window: window, remainingFraction: fraction.doubleValue, resetsAt: date))
             }
         }
         guard !buckets.isEmpty else { throw AntigravityUsageError.noQuotaData }
-        return AntigravityUsageSnapshot(buckets: buckets, observedAt: observedAt,
-                                        accountIdentity: accountIdentity, accountVerified: true)
+        return AntigravityUsageSnapshot(buckets: buckets, observedAt: observedAt, source: .quotaSummaryAPI,
+            accountProvenance: "Google verified usage-helper bearer matches current Antigravity CLI subject and email",
+            accountIdentity: identity, accountVerified: true)
     }
 
     private static func parseDate(_ value: String) -> Date? {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value) ?? {
-            formatter.formatOptions = [.withInternetDateTime]
-            return formatter.date(from: value)
-        }()
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
+}
+
+private final class AntigravityNoRedirect: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }

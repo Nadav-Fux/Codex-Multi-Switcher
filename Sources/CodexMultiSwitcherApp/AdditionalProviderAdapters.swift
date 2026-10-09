@@ -18,7 +18,7 @@ struct AntigravityProviderAdapter: UsageProviderAdapter {
             return ProviderUsageSnapshot(provider: providerID,
                 account: ProviderAccount(displayName: "Current Antigravity CLI account"),
                 buckets: buckets, observedAt: usage.observedAt,
-                source: "Official Antigravity CLI /usage · account used by agy; IDE account may differ",
+                source: "Antigravity quota API · verified statusline helper account",
                 accountVerified: usage.accountVerified)
         } catch {
             let state: ProviderSnapshotState
@@ -30,7 +30,7 @@ struct AntigravityProviderAdapter: UsageProviderAdapter {
             case .timedOut: state = .error(.networkUnavailable)
             default: state = .error(.authenticationRequired)
             }
-            return ProviderUsageSnapshot(provider: providerID, source: "Official Antigravity CLI /usage", state: state)
+            return ProviderUsageSnapshot(provider: providerID, source: "Antigravity quota API", state: state)
         }
     }
 }
