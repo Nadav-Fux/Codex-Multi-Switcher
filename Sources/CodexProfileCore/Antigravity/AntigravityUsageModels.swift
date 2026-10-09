@@ -7,18 +7,18 @@ public enum AntigravityQuotaFamily: String, Codable, Equatable, Sendable {
     case unknown
 }
 
-/// A quota window returned by Antigravity's read-only `/usage` command.
+/// A quota window returned by Antigravity's read-only quota API.
 public struct AntigravityQuotaBucket: Codable, Equatable, Identifiable, Sendable {
-    /// Stable identifier derived from the family and the CLI's window label.
+    /// Stable identifier derived from the family and the service's window label.
     public let id: String
-    /// The original family heading from the CLI, such as "Gemini Models".
+    /// The original family heading from the service, such as "Gemini Models".
     public let familyLabel: String
     public let family: AntigravityQuotaFamily
-    /// The CLI's description of which models share this family quota.
+    /// The service's description of which models share this family quota.
     public let modelDescription: String?
     /// The original quota window label, such as "Weekly Limit Remaining".
     public let windowLabel: String
-    /// The original machine-readable window from the CLI, such as "weekly" or "5h".
+    /// The original machine-readable window from the service, such as "weekly" or "5h".
     public let window: String
     /// Remaining fraction as directly reported by Antigravity, in the range 0...1.
     public let remainingFraction: Double
@@ -42,12 +42,12 @@ public struct AntigravityQuotaBucket: Codable, Equatable, Identifiable, Sendable
 }
 
 public enum AntigravityUsageSource: String, Codable, Equatable, Sendable {
-    case antigravityCLIUsageCommand
+    case antigravityCLIUsageCommand // Retained for decoding older snapshots.
+    case quotaSummaryAPI
 }
 
-/// A live quota observation. `/usage` reports shared model-family buckets, remaining fractions,
-/// and reset times; it does not report absolute quota amounts. Account provenance is bound to
-/// the same local CLI ID-token issuer/subject observed before and after the request.
+/// A live quota observation of shared model-family buckets, fractions, and reset times.
+/// The server-verified helper account must match local CLI identity before and after the read.
 public struct AntigravityUsageSnapshot: Codable, Equatable, Sendable {
     public let buckets: [AntigravityQuotaBucket]
     public let observedAt: Date
@@ -85,9 +85,9 @@ public enum AntigravityUsageError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .cliMissing:
-            return "Antigravity CLI was not found. Install or configure the official `agy` CLI, then refresh."
+            return "The existing antigravity-usage helper or Node runtime was not found. Restore the statusline helper, then refresh."
         case .accountUnavailable:
-            return "The current Antigravity CLI sign-in could not be identified safely. Sign in with Antigravity, then refresh."
+            return "A matching Antigravity sign-in and antigravity-usage helper account are required. Check the existing connections, then refresh."
         case .accountChanged:
             return "The Antigravity CLI sign-in changed during quota refresh. Try again."
         case .unsupportedCLIVersion:
@@ -95,7 +95,7 @@ public enum AntigravityUsageError: LocalizedError, Equatable {
         case .timedOut:
             return "Antigravity quota refresh timed out. Try again in a few minutes."
         case .commandFailed:
-            return "Antigravity could not refresh quota data. Check the current Antigravity CLI sign-in, then try again."
+            return "Antigravity could not refresh quota data. Check the existing antigravity-usage connection, then try again."
         case .invalidResponse:
             return "Antigravity returned an unsupported quota response."
         case .noQuotaData:

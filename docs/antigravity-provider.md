@@ -1,10 +1,16 @@
 # Antigravity quota provider
 
-The provider runs the installed Antigravity CLI's read-only `-p /usage --output-format json` command to fetch current quotas. The current local CLI is v1.2.12. The official changelog documents `/usage` in print mode as a read-only command that returns without starting an agent turn or spending quota. The reader requires CLI v1.2.11 or newer before invoking `/usage`, uses a bounded process timeout and stdout limit, and discards stderr. It accepts data only when the JSON result reports success, `command.name=usage`, and zero turns.
+The provider calls Google's read-only quota-summary API through the user's existing `antigravity-usage` statusline helper connection. It does not launch `agy`, read or write Keychain items, open a browser, or execute statusline hooks. The earlier temporary-HOME CLI reader was removed: an expired CLI token could make its credential-store subprocess look for a nonexistent default Keychain.
 
-The structured response groups models that share quota, then reports each bucket's ID, title, window, remaining fraction, and reset time. The provider preserves those values and labels as returned. Gemini groups are separated from other named model groups. It does not infer percentages, absolute quota totals, reset dates, or per-model quotas that Antigravity did not provide.
+The reader requires the helper's active account to match the email in Antigravity's locally cached CLI ID token. It reads only the matching helper account's owner-owned, regular, private (`0600`) token file. Google userinfo must independently verify that the bearer belongs to the same subject and verified email. The active account, local CLI identity, and credential fingerprint are checked again before publishing any quota. Token contents and emails are not returned or logged.
 
-The CLI response does not include an account identifier. To bind an observation to the active sign-in, the reader reads only the known local Antigravity CLI OAuth file's ID token, derives a pseudonymous SHA-256 key from its issuer and subject claims, and checks that key again after the command. Token contents, email, and other claims are not returned or logged. If the identity is unavailable or changes during refresh, the provider returns an error instead of quota data.
+An expired helper token is renewed only through the helper's explicit `accounts refresh <matching-account>` operation. This refresh does not log in or switch accounts; it updates that account's existing OAuth token and last-used metadata. Its process has null input/output, a minimal environment with the real home directory, and a five-second timeout with process-group cleanup. If the existing helper connection is absent or revoked, the provider reports unavailable data rather than opening a login flow.
+
+HTTPS uses an ephemeral session, no cookies or redirects, bounded timeouts, and a one-MiB response limit. The quota endpoint is `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`, with an empty JSON request body and the helper bearer. The `antigravity` User-Agent is required by the currently observed service behavior. Both bare and `response`-wrapped quota summaries are supported.
+
+The response has Gemini and other-model buckets (`gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`). Remaining fractions and reset times come directly from those buckets; percentages are unit conversions. Unknown buckets are ignored, malformed known buckets reject the observation, and an empty result is unavailable. No model request is made, and absolute quota totals or missing reset dates are not inferred.
+
+This integration depends on the existing helper installation and the observed Google quota API schema. The helper account must continue matching the CLI account, which can differ from the IDE account.
 
 References:
 
