@@ -200,9 +200,9 @@ struct ClaudeProfilesTab: View {
                             store.connectNativeAccount(id: profile.id)
                         }
                         .disabled(store.isRefreshing || store.isAuthorizingCredential)
-                        Text("macOS may ask permission to read your existing Claude sign-in. Choose Always Allow to enable automatic usage refresh. The app remembers your connection across updates; macOS may still request permission for a newly signed build.")
+                        Text("Connect authorizes the Claude usage helper. Choose Always Allow if macOS asks. We verify access in a separate silent process before confirming the connection. Background refresh never opens permission dialogs.")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
-                        Text("After connecting, an expired sign-in can be renewed in the same Keychain item for this account.")
+                        Text("The helper keeps its identity across interface updates. A helper update or a replaced Claude sign-in may require reconnecting once.")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }

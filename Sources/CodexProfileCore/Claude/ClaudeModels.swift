@@ -36,7 +36,7 @@ public struct ClaudeAuthInfo: Equatable, Sendable {
     }
 }
 
-public struct ClaudeUsageWindow: Equatable, Sendable {
+public struct ClaudeUsageWindow: Codable, Equatable, Sendable {
     public let usedPercentage: Double
     public let resetsAt: Date?
     public var remainingPercentage: Double { max(0, 100 - self.usedPercentage) }
@@ -47,13 +47,13 @@ public struct ClaudeUsageWindow: Equatable, Sendable {
     }
 }
 
-public enum ClaudeUsageSource: String, Equatable, Sendable {
+public enum ClaudeUsageSource: String, Codable, Equatable, Sendable {
     case nativeBridge
     case legacyStatusline
     case oauthUsage
 }
 
-public struct ClaudeUsageSnapshot: Equatable, Sendable {
+public struct ClaudeUsageSnapshot: Codable, Equatable, Sendable {
     public let fiveHour: ClaudeUsageWindow?
     public let sevenDay: ClaudeUsageWindow?
     public let modelWeekly: ClaudeUsageWindow?

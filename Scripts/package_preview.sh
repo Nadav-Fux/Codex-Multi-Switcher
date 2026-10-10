@@ -46,6 +46,22 @@ STAGED_APP="$STAGING/$APP_NAME.app"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Helpers" "$STAGED_APP/Contents/Resources"
 cp "$BIN_DIR/CodexMultiSwitcher" "$STAGED_APP/Contents/MacOS/CodexMultiSwitcher"
 cp "$BIN_DIR/codex-profile" "$STAGED_APP/Contents/Helpers/codex-profile"
+HELPER_REUSE_BUNDLE="${CODEX_CLAUDE_USAGE_HELPER_REUSE_BUNDLE:-$HOME/Applications/$APP_NAME.app}"
+if [[ -z "${CODEX_CLAUDE_USAGE_HELPER_REUSE_BUNDLE:-}" && ! -d "$HELPER_REUSE_BUNDLE" ]]; then
+  HELPER_REUSE_BUNDLE="/Applications/$APP_NAME.app"
+fi
+HELPER_PACKAGE_ARGS=(
+  --root "$ROOT_DIR"
+  --built-binary "$BIN_DIR/claude-usage-helper"
+  --destination "$STAGED_APP/Contents/Helpers"
+  --reuse-bundle "$HELPER_REUSE_BUNDLE"
+)
+for argument in "${BUILD_ARGS[@]}"; do
+  HELPER_PACKAGE_ARGS+=("--build-argument=$argument")
+done
+python3 "$ROOT_DIR/Scripts/package_claude_usage_helper.py" "${HELPER_PACKAGE_ARGS[@]}"
+# Helpers contains executable code only; JSON belongs to signed Resources.
+mv "$STAGED_APP/Contents/Helpers/claude-usage-helper.json" "$STAGED_APP/Contents/Resources/claude-usage-helper.json"
 cp "$ROOT_DIR/assets/AppIcon.icns" "$STAGED_APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT_DIR/assets/codex-multi-switcher-menu-icon-empty.png" "$STAGED_APP/Contents/Resources/"
 cp "$ROOT_DIR/assets/openai-knot-menu.png" "$STAGED_APP/Contents/Resources/"
@@ -73,6 +89,7 @@ cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$STAGED_APP/Contents/Info.plist"
 codesign --force --sign - "$STAGED_APP/Contents/Helpers/codex-profile"
+# Deliberately omit --deep: the usage helper's signed bytes preserve its grant.
 codesign --force --sign - "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
 mv "$STAGED_APP" "$APP_BUNDLE"
