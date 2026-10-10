@@ -74,8 +74,8 @@ enum ClaudeCurrentUsageChecks {
         try check(permissions.intValue & 0o777 == 0o600, "Observation cache created privately")
         _ = try await current.fetch(profile: profile, authBefore: auth, authAfter: { auth }, now: fixed.addingTimeInterval(20))
         try check(transport.calls == 2 && loader.calls == 4, "Fresh cache verifies credential before/after CLI without repeated network reads")
-        try check(current.cached(profile: profile, auth: auth, now: fixed.addingTimeInterval(61))?.isStale == true,
-                  "Cache becomes historical after60 seconds")
+        try check(current.cached(profile: profile, auth: auth, now: fixed.addingTimeInterval(ClaudeCurrentUsageService.cacheFreshness + 1))?.isStale == true,
+                  "Cache becomes historical after the configured freshness window")
         let other = ClaudeAuthInfo(loggedIn: true, email: "other@example.test", organizationID: "org-fixture")
         try check(current.cached(profile: profile, auth: other) == nil, "No cache reuse for another account")
         do {
@@ -163,8 +163,15 @@ enum ClaudeCurrentUsageChecks {
         nativeFirst.refresh()
         let nativeDeadline = Date().addingTimeInterval(10)
         while nativeFirst.isRefreshing && Date() < nativeDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
-        try check(nativeFirst.statuses[profile.id]?.usage?.source == .nativeBridge && untouchedLoader.calls == 0,
-                  "Fresh matched native snapshot preserves bridge priority without a credential read")
+        try check(nativeFirst.statuses[profile.id]?.usage?.source == .oauthUsage && untouchedTransport.calls == 2,
+                  "Current authenticated API observation updates even with a prior native bridge observation")
+        let fallback = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
+            currentUsageService: service("store-bridge-fallback", FakeLoader(), FakeTransport(fail: true)))
+        fallback.refresh()
+        let fallbackDeadline = Date().addingTimeInterval(10)
+        while fallback.isRefreshing && Date() < fallbackDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        try check(fallback.statuses[profile.id]?.usage?.source == .nativeBridge && fallback.statuses[profile.id]?.error != nil,
+                  "A failed live read preserves a matching bridge observation as fallback")
         print("Claude current usage checks passed (fake credentials/HTTPS, identity races, private cache, backoff, isolation, store priority).")
     }
 }

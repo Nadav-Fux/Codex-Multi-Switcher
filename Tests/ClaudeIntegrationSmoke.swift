@@ -34,6 +34,7 @@ struct ClaudeIntegrationSmoke {
         let fake = #"""
         #!/bin/sh
         if [ "$1" = auth ] && [ "$2" = status ]; then
+          printf 'auth-status-invoked\n' > "$TRACE_FILE"
           if [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$CLAUDE_SECURESTORAGE_CONFIG_DIR" ] || [ -n "$ANTHROPIC_UNKNOWN_OVERRIDE" ]; then
             printf 'bad environment'; exit 2
           fi
@@ -101,8 +102,14 @@ struct ClaudeIntegrationSmoke {
         try require(try String(contentsOf: previewLauncher, encoding: .utf8).contains(
             "export CLAUDE_CONFIG_DIR=" + ClaudeCLIService.shellQuote(previewRegistry.defaultProfile.configDirectory)),
                     "Preview default launcher explicitly selects its isolated directory")
+        let metadata: [String: Any] = ["oauthAccount": ["emailAddress": "fixture@example.test",
+            "organizationName": "Fixture Org", "organizationUuid": "org-fixture"]]
+        try writeJSON(metadata, dedicatedHome.appendingPathComponent(".claude.json"))
+        try writeJSON(metadata, URL(fileURLWithPath: managed.configDirectory).appendingPathComponent(".claude.json"))
         let auth = try cli.authStatus(profile: managed)
-        try require(auth.loggedIn == true && auth.email == "fixture@example.test", "Bounded sanitized auth status")
+        try require(auth.loggedIn == nil && auth.email == "fixture@example.test" && auth.authenticationMethod == "account_metadata",
+                    "Local metadata identifies the account without claiming live authentication")
+        try require(!fm.fileExists(atPath: trace.path), "Identity refresh never launches the CLI")
         let fingerprint = ClaudeUsageReader.accountFingerprint(auth)!
         let now = Date()
         let nativeURL = URL(fileURLWithPath: managed.configDirectory).appendingPathComponent(ClaudeUsageReader.nativeSnapshotName)
@@ -192,6 +199,7 @@ struct ClaudeIntegrationSmoke {
                     "Custom managed statusLine is preserved without importing default")
         try installer.restore(profile: managed)
 
+        try ClaudeUsageHelperChecks.run(root: root)
         try await ClaudeCurrentUsageChecks.run(root: root, home: dedicatedHome, environment: environment, bridge: bridge)
         let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge)
         var callbackCount = 0
@@ -222,26 +230,25 @@ struct ClaudeIntegrationSmoke {
                     "A pending bridge install does not modify a profile removed before auth completed")
         try require(!store.isRefreshing, "Refresh excluding pending profile completes normally")
 
-        // Authentication failures are bounded without a Keychain or network request.
-        try AtomicFileWriter.write(Data("#!/bin/sh\nprintf '{\"loggedIn\":true,\"email\":\"fast-exit@example.test\"}'\nexit 0\n".utf8), to: executable)
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        for _ in 0..<64 {
-            try require(try cli.authStatus(profile: defaultProfile).email == "fast-exit@example.test",
-                        "Fast-exiting auth status retains the child's final JSON output")
+        // Local identity parsing never starts the CLI, even if its executable is noisy or stuck.
+        let defaultMetadataURL = dedicatedHome.appendingPathComponent(".claude.json")
+        try writeJSON(["oauthAccount": ["emailAddress": "metadata@example.test", "organizationUuid": "org-fixture"]], defaultMetadataURL)
+        try? fm.removeItem(at: trace)
+        for script in ["#!/bin/sh\nwhile true; do printf '1234567890'; done\n",
+                       "#!/bin/sh\nexec /bin/sleep 5\n"] {
+            try AtomicFileWriter.write(Data(script.utf8), to: executable)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+            let start = Date()
+            try require(try cli.authStatus(profile: defaultProfile, timeout: 0.1).email == "metadata@example.test",
+                        "Identity comes only from local metadata")
+            try require(Date().timeIntervalSince(start) < 2, "Identity read does not wait for a CLI process")
         }
-        try AtomicFileWriter.write(Data("#!/bin/sh\nwhile true; do printf '1234567890'; done\n".utf8), to: executable)
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        let oversizedStart = Date()
-        try expectFailure("Auth status output cap must reject noisy CLI") { _ = try cli.authStatus(profile: defaultProfile) }
-        try require(Date().timeIntervalSince(oversizedStart) < 2, "Auth status output remains bounded at 65KB")
-        try AtomicFileWriter.write(Data("#!/bin/sh\nprintf '{\"loggedIn\":false}'\nexit 1\n".utf8), to: executable)
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        try require(try cli.authStatus(profile: defaultProfile).loggedIn == false, "Logged-out status remains valid at CLI exit1")
-        try AtomicFileWriter.write(Data("#!/bin/sh\nexec /bin/sleep 5\n".utf8), to: executable)
-        try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        let start = Date()
-        try expectFailure("Auth status must time out") { _ = try cli.authStatus(profile: defaultProfile, timeout: 0.1) }
-        try require(Date().timeIntervalSince(start) < 2, "Auth status timeout bounded")
+        try require(!fm.fileExists(atPath: trace.path), "Identity probes never execute CLI authentication")
+        try writeJSON([:], defaultMetadataURL)
+        try require(try cli.authStatus(profile: defaultProfile).loggedIn == nil, "Missing remembered account does not attest sign-in")
+        try AtomicFileWriter.write(Data("invalid metadata".utf8), to: defaultMetadataURL)
+        try expectFailure("Malformed identity metadata must fail closed") { _ = try cli.authStatus(profile: defaultProfile) }
+        try writeJSON(metadata, defaultMetadataURL)
         try AtomicFileWriter.write(Data("corrupt registry sentinel".utf8), to: registry.registryURL)
         try expectFailure("Corrupt registry must fail closed") { _ = try registry.add(label: "New") }
         try require(try String(contentsOf: registry.registryURL, encoding: .utf8) == "corrupt registry sentinel",

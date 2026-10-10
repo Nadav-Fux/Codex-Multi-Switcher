@@ -17,6 +17,9 @@ let package = Package(
         .executable(
             name: "codex-profile",
             targets: ["CodexProfileCLI"]),
+        .executable(
+            name: "claude-usage-helper",
+            targets: ["ClaudeUsageHelper"]),
     ],
     targets: [
         .target(
@@ -39,6 +42,11 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("Security"),
             ]),
+        .executableTarget(
+            name: "ClaudeUsageHelper",
+            dependencies: ["CodexProfileCore"],
+            path: "Sources/ClaudeUsageHelper",
+            linkerSettings: [.linkedFramework("Security")]),
         .testTarget(
             name: "AuthBlobTests",
             dependencies: ["CodexProfileCore"],

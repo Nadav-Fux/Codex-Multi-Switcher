@@ -30,7 +30,7 @@ final class ClaudeProfileStore: ObservableObject {
         self.cli = ClaudeCLIService(environment: environment, userHome: self.registry.defaultDirectory.deletingLastPathComponent())
         self.installer = ClaudeBridgeInstaller(root: self.registry.root, bridgeURL: bridgeURL)
         self.scriptsRoot = self.registry.root.appendingPathComponent("launchers", isDirectory: true)
-        self.currentUsage = currentUsageService ?? ClaudeCurrentUsageService(root: self.registry.root)
+        self.currentUsage = currentUsageService ?? ClaudeCurrentUsageService(root: self.registry.root, helper: ClaudeUsageHelperClient.bundled())
         do { self.apply(try self.registry.load()) }
         catch {
             self.profiles = [self.registry.defaultProfile]

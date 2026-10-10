@@ -2,13 +2,13 @@ import CryptoKit
 import Foundation
 import Security
 
-public enum ClaudeCurrentUsageError: LocalizedError {
+public enum ClaudeCurrentUsageError: String, Codable, LocalizedError {
     case unsupportedProfile, credentialUnavailable, credentialInteractionRequired, credentialRejected, accessDenied, credentialRenewalUnavailable, credentialRenewalFailed, refreshInProgress, rateLimited, accountChanged, invalidResponse, requestFailed
     public var errorDescription: String? {
         switch self {
         case .unsupportedProfile: return "Automatic usage is available for the existing native Claude account. Isolated accounts can use their native usage bridge."
         case .credentialUnavailable: return "Claude credentials are unavailable to this app. Check the Claude sign-in and macOS Keychain access for Codex Multi Switcher, then refresh."
-        case .credentialInteractionRequired: return "Connect your Claude account in Settings → Claude to authorize Keychain access for this app version."
+        case .credentialInteractionRequired: return "Connect Claude in Settings to authorize its usage helper. Background access is paused until a silent read succeeds."
         case .credentialRejected: return "Current Claude usage is unavailable for this sign-in. Usage can appear when the account becomes available; the statusline bridge is also supported."
         case .accessDenied: return "Claude denied quota access for this sign-in. Check this account in Claude Code."
         case .credentialRenewalUnavailable: return "Claude could not renew this sign-in without a Keychain prompt. Open Claude Code to renew it, then refresh."
@@ -134,6 +134,7 @@ private final class BoundedClaudeResponse: NSObject, URLSessionDataDelegate, @un
 }
 
 public final class ClaudeCurrentUsageService: @unchecked Sendable {
+    private let helper: ClaudeUsageHelperClient?
     private let loader: any ClaudeUsageCredentialLoading
     private let transport: any ClaudeUsageTransport
     private let nativeHome: URL
@@ -147,7 +148,9 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
 
     public init(root: URL, nativeHome: URL = FileManager.default.homeDirectoryForCurrentUser,
                 credentialLoader: any ClaudeUsageCredentialLoading = ClaudeNativeCredentialLoader(),
-                transport: any ClaudeUsageTransport = ClaudeHTTPSUsageTransport()) {
+                transport: any ClaudeUsageTransport = ClaudeHTTPSUsageTransport(),
+                helper: ClaudeUsageHelperClient? = nil) {
+        self.helper = helper
         self.cacheRoot = root.appendingPathComponent("usage-observations", isDirectory: true)
         self.nativeHome = nativeHome.standardizedFileURL
         self.loader = credentialLoader
@@ -163,6 +166,12 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
     /// Foreground consent for the existing native item; no network request or
     /// credential write occurs until the following ordinary usage refresh.
     public func authorizeNativeCredentialAccess(profile: ClaudeProfile) throws {
+        if let helper {
+            guard self.supports(profile) else { throw ClaudeCurrentUsageError.unsupportedProfile }
+            try helper.authorize()
+            self.finishAttempt()
+            return
+        }
         guard self.supports(profile), let native = self.loader as? ClaudeNativeCredentialLoader else {
             throw ClaudeCurrentUsageError.unsupportedProfile
         }
@@ -172,6 +181,10 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
 
     /// Only observations bound to the same current CLI identity are reusable.
     public func cached(profile: ClaudeProfile, auth: ClaudeAuthInfo?, now: Date = Date()) -> ClaudeUsageSnapshot? {
+        if let helper {
+            guard self.supports(profile), let identity = ClaudeUsageReader.accountFingerprint(auth) else { return nil }
+            return helper.cached(identity: identity, now: now)
+        }
         guard self.supports(profile), let identity = ClaudeUsageReader.accountFingerprint(auth),
               let values = try? self.cacheURL(profile).resourceValues(forKeys: [.fileSizeKey]),
               let size = values.fileSize, size <= 1_048_576,
@@ -194,6 +207,22 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
                       authAfter: @Sendable () throws -> ClaudeAuthInfo,
                       now: Date = Date()) async throws -> ClaudeUsageSnapshot {
         guard self.supports(profile) else { throw ClaudeCurrentUsageError.unsupportedProfile }
+        if let helper {
+            guard let identity = ClaudeUsageReader.accountFingerprint(authBefore) else { throw ClaudeCurrentUsageError.accountChanged }
+            try self.beginAttempt(now: now, identity: identity)
+            do {
+                let snapshot = try await Task.detached(priority: .utility) { try helper.read(identity: identity) }.value
+                guard ClaudeUsageReader.accountFingerprint(try authAfter()) == identity else {
+                    throw ClaudeCurrentUsageError.accountChanged
+                }
+                self.finishAttempt()
+                return snapshot
+            } catch {
+                let safe = error as? ClaudeCurrentUsageError ?? .requestFailed
+                self.recordFailure(safe)
+                throw safe
+            }
+        }
         if let cached = self.cached(profile: profile, auth: authBefore, now: now),
            !cached.isStale, now.timeIntervalSince(cached.observedAt) < 60 {
             let after = try authAfter()

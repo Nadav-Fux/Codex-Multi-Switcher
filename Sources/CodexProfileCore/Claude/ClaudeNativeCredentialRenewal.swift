@@ -113,7 +113,9 @@ struct ClaudeNativeCredentialItem {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess else {
             ClaudeNativeKeychainDiagnostics.failure(stage: "data_lookup", status: status)
-            if status == errSecInteractionNotAllowed { throw ClaudeCurrentUsageError.credentialInteractionRequired }
+            if status == errSecInteractionNotAllowed || status == errSecAuthFailed || status == errSecUserCanceled {
+                throw ClaudeCurrentUsageError.credentialInteractionRequired
+            }
             throw ClaudeCurrentUsageError.credentialUnavailable
         }
         guard let data = result as? Data, data.count <= 1_048_576 else {
@@ -190,6 +192,13 @@ private enum ClaudeNativeKeychainInteraction {
 /// to the exact Keychain item for every silent read; a build hash is not an ACL.
 enum ClaudeNativeCredentialAuthorization {
     private static let preferenceKey = "claudeNativeCredentialAuthorizedExecutableSHA256"
+    // CLI helpers need an explicit persistent domain shared by separate invocations.
+    private static var preferences: UserDefaults {
+        if Bundle.main.executableURL?.lastPathComponent == "claude-usage-helper" {
+            return UserDefaults(suiteName: "com.codexmultiswitcher.claude-usage-helper") ?? .standard
+        }
+        return .standard
+    }
     private static let executableDigest: String? = {
         guard let executable = Bundle.main.executableURL,
               let values = try? executable.resourceValues(forKeys: [.fileSizeKey]),
@@ -199,7 +208,7 @@ enum ClaudeNativeCredentialAuthorization {
     }()
 
     static func requireBackgroundAccess() throws {
-        guard UserDefaults.standard.string(forKey: self.preferenceKey)?.isEmpty == false else {
+        guard self.preferences.string(forKey: self.preferenceKey)?.isEmpty == false else {
             throw ClaudeCurrentUsageError.credentialInteractionRequired
         }
     }
@@ -209,7 +218,9 @@ enum ClaudeNativeCredentialAuthorization {
         // Read only the existing native Claude item. macOS controls any grant;
         // no ACL, access group, item, or sign-in is created or altered here.
         _ = try ClaudeNativeCredentialItem.read(allowInteraction: true)
-        UserDefaults.standard.set(digest, forKey: self.preferenceKey)
+        _ = try ClaudeNativeCredentialItem.read(allowInteraction: false)
+        self.preferences.set(digest, forKey: self.preferenceKey)
+        self.preferences.synchronize()
     }
 }
 
