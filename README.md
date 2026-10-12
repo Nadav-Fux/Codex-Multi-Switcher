@@ -1,6 +1,8 @@
 # Codex Multi Switcher
 
-A macOS menu bar app and CLI for managing multiple Codex profiles. Switching profiles saves the outgoing auth state, activates the selected profile, and relaunches Codex Desktop.
+A macOS menu bar app and CLI for people who work across several AI coding harnesses. It switches between Codex and Claude Code accounts, and shows live usage and quota for Codex, Claude Code, Antigravity and GLM / Z.ai in one menu bar item.
+
+Switching a Codex profile saves the outgoing auth state, activates the selected profile, and relaunches Codex Desktop.
 
 ## Compatibility fix
 
@@ -186,4 +188,4 @@ Unsigned development builds use the file-backed vault. A signed release needs yo
 
 ## License
 
-MIT. The upstream copyright notice remains in [LICENSE](LICENSE), as required by the license. Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

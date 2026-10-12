@@ -23,7 +23,7 @@ Use `CODEX_PROFILE_HOME` or `CODEX_PROFILE_TEST_HOME` for isolated runs. Tests m
 - Resolve Codex Desktop's CLI from `Contents/Resources/codex-cli/codex-package.json`; keep the legacy `Contents/Resources/codex` fallback.
 - Do not modify files inside `ChatGPT.app` or `Codex.app`.
 - Keep the app bundle identifier `com.codexmultiswitcher.app` and the Keychain access-group suffix `com.codexmultiswitcher.app.auth-v2` in sync with the packaging scripts.
-- Keep upstream MIT and third-party notices intact.
+- Keep the MIT license and third-party notices intact.
 - Never commit credentials, auth files, logs, provisioning profiles, or signing keys.
 
 ## Versioning
