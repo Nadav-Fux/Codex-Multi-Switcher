@@ -94,6 +94,9 @@ enum ProviderQuotaPresentation {
         case .available:
             if !snapshot.accountVerified { return "Account could not be verified; quota is unavailable." }
             if !snapshot.isCurrent() { return "Observation is out of date. Refresh to read current quota." }
+            if provider == .antigravity && !snapshot.buckets.contains(where: { $0.group == .gemini }) {
+                return "Gemini quota is not reported by this source. Open Antigravity IDE to read both model groups. Other-model quota does not measure Gemini usage."
+            }
             return snapshot.buckets.isEmpty ? "The service did not report quota windows." : ""
         case .signedOut: return "Sign in to \(provider == .glm ? "ZCode / Z.ai" : "Antigravity") to read your subscription quota."
         case .unavailable: return provider == .glm

@@ -12,6 +12,32 @@ struct AppFeatureSmoke {
     @MainActor
     static func main() async throws {
         _ = NSApplication.shared
+        let ideAccount = Data(#"{"userStatus":{"email":"fixture@example.test"}}"#.utf8)
+        let changedIDEAccount = Data(#"{"userStatus":{"email":"other@example.test"}}"#.utf8)
+        let ideQuota = Data(#"{"response":{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.9226,"resetTime":"2027-01-02T12:00:00Z"},{"bucketId":"gemini-5h","remainingFraction":0.9904,"resetTime":"2027-01-01T12:00:00Z"},{"bucketId":"3p-weekly","remainingFraction":1,"resetTime":"2027-01-02T12:00:00Z"},{"bucketId":"3p-5h","remainingFraction":0,"resetTime":"2027-01-01T12:00:00Z"}]}]}}"#.utf8)
+        let ideSnapshot = try AntigravityIDEQuotaReader.snapshot(quota: ideQuota, before: ideAccount, after: ideAccount)
+        try Self.require(ideSnapshot.accountVerified && ideSnapshot.buckets.count == 4
+            && ideSnapshot.buckets.filter { $0.group == .gemini }.count == 2,
+            "The IDE source retains Gemini and partner-model quotas independently")
+        try Self.require(ideSnapshot.buckets.first { $0.id == "gemini-weekly" }?.remainingFraction == 0.9226
+            && ideSnapshot.buckets.first { $0.id == "3p-5h" }?.remainingFraction == 0,
+            "Preserve exact fractions and genuine zero remaining quota")
+        do {
+            _ = try AntigravityIDEQuotaReader.snapshot(quota: ideQuota, before: ideAccount, after: changedIDEAccount)
+            throw Failure(message: "IDE account changes must discard quota")
+        } catch AntigravityUsageError.accountChanged {}
+        for malformed in ["true", "1.1", "-0.1"] {
+            let invalid = Data(String(decoding: ideQuota, as: UTF8.self).replacingOccurrences(of: "0.9226", with: malformed).utf8)
+            do {
+                _ = try AntigravityIDEQuotaReader.snapshot(quota: invalid, before: ideAccount, after: ideAccount)
+                throw Failure(message: "Malformed IDE fractions must fail closed")
+            } catch AntigravityUsageError.invalidResponse {}
+        }
+        let partnerOnly = ProviderUsageSnapshot(provider: .antigravity,
+            buckets: ideSnapshot.buckets.filter { $0.group == .other }, observedAt: Date(),
+            source: "fixture", accountVerified: true)
+        try Self.require(ProviderQuotaPresentation.message(partnerOnly, provider: .antigravity).contains("Gemini quota is not reported"),
+            "An incomplete fallback cannot imply Gemini has 100 percent remaining")
         try Self.require(IconRenderer.render(primaryRemainingPercent: 74, secondaryRemainingPercent: 4).size.height == 23,
             "Menu bar digits enlarged without unbounded height")
         let mixed = IconRenderer.render(primaryRemainingPercent: 74, secondaryRemainingPercent: 4,
@@ -192,6 +218,35 @@ struct AppFeatureSmoke {
             throw Failure(message: "Corrupt schedule storage overwritten")
         } catch BankedResetScheduler.ResetError.storageUnreadable {}
         try Self.require(try Data(contentsOf: scheduleURL) == corrupt, "Preserve unreadable journal")
+        let removalEnvironment = ["CODEX_PROFILE_HOME": root.appendingPathComponent("profile-removal").path]
+        let removalPaths = AppPaths(environment: removalEnvironment)
+        let removalVault = FileAuthVault(root: removalPaths.devAuthStoreURL, authLockURL: removalPaths.authLockURL)
+        let removalStore = ProfileStore(authVault: removalVault, environment: removalEnvironment)
+        try removalVault.saveAuthBlob(auth, profileID: "1")
+        let oldProfile = removalStore.addProfile()
+        try removalVault.saveAuthBlob(auth, profileID: oldProfile.id)
+        try FileManager.default.createDirectory(at: removalPaths.liveCodexHome, withIntermediateDirectories: true)
+        try auth.write(to: removalPaths.liveAuthURL)
+        removalStore.setLiveProfileId(oldProfile.id)
+        for protectedID in ["1", oldProfile.id] {
+            do {
+                try removalStore.removeProfile(protectedID)
+                throw Failure(message: "Configured and live profiles must remain protected")
+            } catch ProfileMutationError.cannotRemoveActiveProfile {}
+        }
+        removalStore.setLiveProfileId("1")
+        try removalStore.removeProfile(oldProfile.id)
+        let reopened = ProfileStore(authVault: removalVault, environment: removalEnvironment)
+        try Self.require(!reopened.config.profiles.contains(where: { $0.id == oldProfile.id })
+            && !(try removalVault.loadAuthBlob(profileID: oldProfile.id) != nil),
+            "Removing an inactive profile persists and removes only its saved sign-in")
+        try Self.require(try removalVault.loadAuthBlob(profileID: "1") == auth
+            && Data(contentsOf: removalPaths.liveAuthURL) == auth,
+            "Removing an inactive profile preserves the current account and live sign-in")
+        let unconfigured = reopened.addProfile()
+        try reopened.removeProfile(unconfigured.id)
+        try Self.require(!reopened.config.profiles.contains(where: { $0.id == unconfigured.id }),
+            "An old Not set up profile can be removed without a saved credential")
         print("PASS: app display modes, login-item validation, durable reset retry, manual no-op, expiry/account guards, duplicate prevention, and corrupt-storage preservation")
     }
 
