@@ -78,7 +78,7 @@ struct AppFeatureSmoke {
         let staleClaude = ClaudeUsageSnapshot(fiveHour: claudeUsage.fiveHour, sevenDay: nil,
             observedAt: Date().addingTimeInterval(-1000), source: .nativeBridge, isStale: true, accountVerified: true)
         try Self.require(ClaudeIconRenderer.render(snapshot: staleClaude, primaryShowsUsed: false, secondaryShowsUsed: false)
-            .accessibilityDescription?.contains("5 hours unavailable") == true, "Stale Claude badge never implies current quota")
+            .accessibilityDescription?.contains("cached quota") == true, "Historical Claude quota is explicitly labelled as cached")
         let expiredClaude = ClaudeUsageSnapshot(fiveHour: ClaudeUsageWindow(usedPercentage: 25, resetsAt: Date().addingTimeInterval(-1)),
             sevenDay: ClaudeUsageWindow(usedPercentage: 30, resetsAt: Date().addingTimeInterval(3600)),
             observedAt: Date(), source: .nativeBridge, isStale: false, accountVerified: true)

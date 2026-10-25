@@ -189,3 +189,9 @@ MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 ### Removing an old Codex profile
 
 In Settings → Codex, select an inactive profile and choose **Remove Profile…** beside its label, **Remove** below the profile list, or the profile's context-menu action. The confirmation names the selected profile and removes only its local saved sign-in. It does not cancel a subscription, delete the OpenAI account, or sign out the current desktop session. Switch away from an active profile first.
+
+### Claude quota polling and rate limits
+
+A fresh, account-matched native Claude Code bridge observation takes priority and avoids a quota API request. Otherwise the menu app polls at most every five minutes. A provider `429` starts a ten-minute wait; repeated failures increase it to 20, 40, then 60 minutes. The wait is saved with an account digest and survives Refresh clicks and app restarts. No credentials are stored in this polling state. The currently observed provider response has `Retry-After: 0`, which does not trigger an immediate retry.
+
+Settings show the next automatic attempt. Historical, account-matched quota can remain visible with its observation time; a grey `~` in the menu bar marks cached values. Expired windows and observations older than a day are unavailable rather than reset or presented as fresh. The existing helper executable and its macOS authorization are preserved by this app-only change.

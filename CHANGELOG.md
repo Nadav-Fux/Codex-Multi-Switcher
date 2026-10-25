@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Prefer fresh Claude Code bridge observations, persist account-bound polling waits across relaunches, and back off repeated quota API rate limits. Clearly mark historical menu-bar values with `~` and show the next refresh time.
 - Read Antigravity's full Gemini and partner-model quota groups from the running IDE's local quota service; label missing Gemini data in the CLI-helper fallback.
 - Add visible Remove Profile actions to Codex settings and preserve the selected profile through confirmation dismissal. Active profiles remain protected.
 - Keep the native Claude credential read-only. Delegate expired sign-in renewal to Claude Code so the usage helper cannot replace its Keychain partition list and cause recurring password prompts.

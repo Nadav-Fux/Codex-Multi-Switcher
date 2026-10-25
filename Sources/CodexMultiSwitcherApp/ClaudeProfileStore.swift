@@ -12,6 +12,7 @@ final class ClaudeProfileStore: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isAuthorizingCredential = false
+    @Published private(set) var nextUsageRefresh: [String: Date] = [:]
     var onChange: (() -> Void)?
 
     private let registry: ClaudeProfileRegistry
@@ -19,18 +20,24 @@ final class ClaudeProfileStore: ObservableObject {
     private let installer: ClaudeBridgeInstaller
     private let scriptsRoot: URL
     private let currentUsage: ClaudeCurrentUsageService
+    private let quotaRefreshPolicy: ClaudeQuotaRefreshPolicy
+    private let priorQuotaURL: URL
     private var refreshTask: Task<Void, Never>?
     private var pendingBridgeOperations: Set<String> = []
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          bridgeURL: URL? = Bundle.main.url(forResource: "ClaudeStatuslineBridge", withExtension: "py"),
-         currentUsageService: ClaudeCurrentUsageService? = nil) {
+         currentUsageService: ClaudeCurrentUsageService? = nil,
+         quotaRefreshPolicy: ClaudeQuotaRefreshPolicy? = nil) {
         let paths = AppPaths(environment: environment)
         self.registry = ClaudeProfileRegistry(paths: paths)
         self.cli = ClaudeCLIService(environment: environment, userHome: self.registry.defaultDirectory.deletingLastPathComponent())
         self.installer = ClaudeBridgeInstaller(root: self.registry.root, bridgeURL: bridgeURL)
         self.scriptsRoot = self.registry.root.appendingPathComponent("launchers", isDirectory: true)
         self.currentUsage = currentUsageService ?? ClaudeCurrentUsageService(root: self.registry.root, helper: ClaudeUsageHelperClient.bundled())
+        self.quotaRefreshPolicy = quotaRefreshPolicy ?? ClaudeQuotaRefreshPolicy(root: self.registry.root)
+        self.priorQuotaURL = self.registry.defaultDirectory.deletingLastPathComponent()
+            .appendingPathComponent("Library/Application Support/Codex Multi Switcher/Claude Usage Helper/usage-observations/claude-default.json")
         do { self.apply(try self.registry.load()) }
         catch {
             self.profiles = [self.registry.defaultProfile]
@@ -53,13 +60,16 @@ final class ClaudeProfileStore: ObservableObject {
         }
         let cli = self.cli
         let currentUsage = self.currentUsage
+        let quotaRefreshPolicy = self.quotaRefreshPolicy
+        let priorQuotaURL = self.priorQuotaURL
         self.refreshTask = Task { [weak self] in
             // Bound concurrent metadata and usage reads for large profile registries.
-            await withTaskGroup(of: (String, ClaudeProfileStatus).self) { group in
+            await withTaskGroup(of: (String, ClaudeProfileStatus, Date?).self) { group in
                 var pending = profiles.makeIterator()
                 func enqueue(_ profile: ClaudeProfile) {
                     group.addTask {
                         var status = ClaudeProfileStatus()
+                        var nextRefresh: Date?
                         do { status.auth = try cli.identityMetadata(profile: profile) }
                         catch {
                             status.error = error.localizedDescription
@@ -68,14 +78,29 @@ final class ClaudeProfileStore: ObservableObject {
                         let usage = ClaudeUsageReader.read(profile: profile, auth: status.auth)
                         status.usage = usage.snapshot
                         if let warning = usage.warning { status.error = warning }
-                        // The native account refreshes directly even when no Claude session
-                        // is running. Bridge observations remain a fallback for managed accounts.
+                        // Prefer recent native session observations. Only poll the API
+                        // when the account-matched bridge cannot supply current usage.
+                        let freshBridge = status.usage.map {
+                            $0.source == .nativeBridge && $0.accountMatched && !$0.isStale
+                        } ?? false
                         if currentUsage.supports(profile), let auth = status.auth,
-                           ClaudeUsageReader.accountFingerprint(auth) != nil {
+                           let identity = ClaudeUsageReader.accountFingerprint(auth), !freshBridge {
                             do {
-                                status.usage = try await currentUsage.fetch(profile: profile, authBefore: auth,
-                                    authAfter: { try cli.identityMetadata(profile: profile) })
-                                status.error = nil
+                                let seed = currentUsage.cached(profile: profile, auth: auth)
+                                    ?? ClaudeQuotaRefreshPolicy.priorObservation(at: priorQuotaURL, profile: profile, identity: identity)
+                                let observation = await quotaRefreshPolicy.read(identity: identity, seed: seed) {
+                                    try await currentUsage.fetch(profile: profile, authBefore: auth,
+                                        authAfter: { try cli.identityMetadata(profile: profile) })
+                                }
+                                guard ClaudeUsageReader.accountFingerprint(try cli.identityMetadata(profile: profile)) == identity else {
+                                    throw ClaudeCurrentUsageError.accountChanged
+                                }
+                                nextRefresh = observation.nextRefreshAt
+                                let observations = [status.usage, observation.snapshot].compactMap { $0 }
+                                let matched = observations.filter(\.accountMatched)
+                                status.usage = (matched.isEmpty ? observations : matched).max { $0.observedAt < $1.observedAt }
+                                if observation.failure == .accountChanged { status.usage = nil }
+                                status.error = observation.failure?.localizedDescription
                             } catch {
                                 let category = (error as? ClaudeCurrentUsageError).map { String(describing: $0) } ?? "request_failed"
                                 CoreLogger.warning("Claude quota unavailable", metadata: ["category": category])
@@ -99,15 +124,16 @@ final class ClaudeProfileStore: ObservableObject {
                                 status.error = error.localizedDescription
                             }
                         }
-                        return (profile.id, status)
+                        return (profile.id, status, nextRefresh)
                     }
                 }
                 for _ in 0..<3 { if let profile = pending.next() { enqueue(profile) } }
-                for await (id, var status) in group {
+                for await (id, var status, nextRefresh) in group {
                     guard let self else { group.cancelAll(); return }
                     if let profile = self.profiles.first(where: { $0.id == id }) {
                         status.bridgeInstalled = self.installer.isInstalled(profile: profile)
                         self.statuses[id] = status
+                        self.nextUsageRefresh[id] = nextRefresh
                         self.onChange?()
                     }
                     if let profile = pending.next() { enqueue(profile) }

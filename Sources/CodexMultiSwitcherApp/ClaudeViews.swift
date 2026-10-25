@@ -208,6 +208,10 @@ struct ClaudeProfilesTab: View {
                 }
                 ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil)
                 ClaudeUsageDetail(snapshot: status?.usage)
+                if let next = store.nextUsageRefresh[profile.id], next > Date() {
+                    Text("Next automatic refresh at \(next.formatted(date: .omitted, time: .shortened)). Refresh also respects this wait.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
                 if let error = status?.error {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .font(.system(size: 11)).foregroundStyle(Palette.warning).textSelection(.enabled)
