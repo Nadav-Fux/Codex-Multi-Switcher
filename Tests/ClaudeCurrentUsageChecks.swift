@@ -55,6 +55,16 @@ enum ClaudeCurrentUsageChecks {
         let profile = ClaudeProfile(id: ClaudeProfileRegistry.defaultID, label: "Fixture",
                                     configDirectory: home.appendingPathComponent(".claude").path, isDefault: true)
         let auth = ClaudeAuthInfo(loggedIn: true, email: "fixture@example.test", organizationID: "org-fixture")
+        // A rejected token must never send the native loader down an OAuth,
+        // Keychain, or CLI lock path. Only the official Claude client renews it.
+        // This entry point rejects before touching any real credential store.
+        do {
+            _ = try await ClaudeNativeCredentialLoader().renewAccessToken(
+                rejectedToken: "fake-rejected-token", auth: auth, authAfter: {
+                    throw Failure(message: "Native renewal must not inspect or mutate sign-in")
+                })
+            throw Failure(message: "Native Claude credential must remain read-only")
+        } catch ClaudeCurrentUsageError.credentialRenewalUnavailable {}
         let fixed = Date()
         func service(_ suffix: String, _ loader: FakeLoader = FakeLoader(), _ transport: FakeTransport = FakeTransport()) -> ClaudeCurrentUsageService {
             ClaudeCurrentUsageService(root: root.appendingPathComponent(suffix), nativeHome: home,
