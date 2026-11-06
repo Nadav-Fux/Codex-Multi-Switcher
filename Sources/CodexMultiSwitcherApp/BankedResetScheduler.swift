@@ -211,11 +211,37 @@ final class BankedResetScheduler: ObservableObject {
             }).value else { throw AuthError.notFound }
             capturedAuth = auth
             guard record.matchesAccount(authData: auth) else { throw ResetError.accountChanged }
+            // Before any reset action: if this profile's own access token has
+            // expired, adopt a newer copy of the same login (usually the one
+            // Codex refreshed in ~/.codex/auth.json) instead of failing with 401.
+            if StaleAuthHealer.accessTokenNeedsHealing(auth),
+               let healed = await self.healAuth(record: record, captured: auth, source: source) {
+                auth = healed
+                capturedAuth = auth
+            }
+            var healedAfterFailure = false
             if record.lastAttemptAt == nil {
                 self.trace("preflight_started", record: record)
-                let preflight = try await CLIUsageFetcher.fetchResult(profileId: record.profileID,
-                    authData: auth, codexConfigURL: self.store.codexConfigURL(),
-                    environment: source.paths.environment, clientVersion: AppInfo.version)
+                let preflight: CLIUsageResult
+                do {
+                    preflight = try await CLIUsageFetcher.fetchResult(profileId: record.profileID,
+                        authData: auth, codexConfigURL: self.store.codexConfigURL(),
+                        environment: source.paths.environment, clientVersion: AppInfo.version)
+                } catch where StaleAuthHealer.isStaleAuthError(error) {
+                    if let operationError = error as? CLIUsageOperationError {
+                        _ = try? await Self.persistAuth(original: auth, updated: operationError.updatedAuthData,
+                                                        record: record, source: source)
+                    }
+                    guard let healed = await self.healAuth(record: record, captured: auth, source: source) else {
+                        throw error
+                    }
+                    auth = healed
+                    capturedAuth = auth
+                    healedAfterFailure = true
+                    preflight = try await CLIUsageFetcher.fetchResult(profileId: record.profileID,
+                        authData: auth, codexConfigURL: self.store.codexConfigURL(),
+                        environment: source.paths.environment, clientVersion: AppInfo.version)
+                }
                 if let updated = preflight.updatedAuthData {
                     if try await Self.persistAuth(original: auth, updated: updated, record: record, source: source) {
                         record.accountFingerprint = AuthBlob.identityFingerprint(from: updated) ?? record.accountFingerprint
@@ -237,10 +263,30 @@ final class BankedResetScheduler: ObservableObject {
             record.lastError = nil
             try self.persist(record)
             self.trace("request_journaled", record: record)
-            let result = try await CLIUsageFetcher.consumeReset(profileId: record.profileID,
-                authData: auth, codexConfigURL: self.store.codexConfigURL(),
-                creditId: record.creditID, idempotencyKey: record.idempotencyKey,
-                environment: source.paths.environment, clientVersion: AppInfo.version)
+            let result: CLIBankedResetResult
+            do {
+                result = try await CLIUsageFetcher.consumeReset(profileId: record.profileID,
+                    authData: auth, codexConfigURL: self.store.codexConfigURL(),
+                    creditId: record.creditID, idempotencyKey: record.idempotencyKey,
+                    environment: source.paths.environment, clientVersion: AppInfo.version)
+            } catch where !healedAfterFailure && StaleAuthHealer.isStaleAuthError(error) {
+                // Retrying with the journaled idempotency key is the documented
+                // safe path after an uncertain failure; at most one retry.
+                if let operationError = error as? CLIUsageOperationError {
+                    _ = try? await Self.persistAuth(original: auth, updated: operationError.updatedAuthData,
+                                                    record: record, source: source)
+                }
+                guard let healed = await self.healAuth(record: record, captured: auth, source: source) else {
+                    throw error
+                }
+                auth = healed
+                capturedAuth = auth
+                self.trace("retry_after_heal", record: record)
+                result = try await CLIUsageFetcher.consumeReset(profileId: record.profileID,
+                    authData: auth, codexConfigURL: self.store.codexConfigURL(),
+                    creditId: record.creditID, idempotencyKey: record.idempotencyKey,
+                    environment: source.paths.environment, clientVersion: AppInfo.version)
+            }
             self.trace("operation_returned", record: record, metadata: ["outcome": result.outcome.rawValue])
             if let updated = result.updatedAuthData {
                 do {
@@ -285,11 +331,12 @@ final class BankedResetScheduler: ObservableObject {
                     record.accountClaimFingerprints = AuthBlob.identityClaimFingerprints(from: operationError.updatedAuthData)
                 }
             }
-            record.lastError = LogRedactor.redact(error.localizedDescription)
+            record.lastError = StaleAuthHealer.isStaleAuthError(error)
+                ? StaleAuthHealer.reloginMessage : LogRedactor.redact(error.localizedDescription)
             record.retryAfter = Date().addingTimeInterval(300)
             if error is ResetError || error is AuthError
                 || (error as? CLIUsageOperationError)?.isAuthRequired == true
-                || (error as? CodexRPCError)?.isAuthRequired == true {
+                || StaleAuthHealer.isStaleAuthError(error) {
                 record.enabled = false
                 record.retryAfter = nil
             }
@@ -333,10 +380,22 @@ final class BankedResetScheduler: ObservableObject {
         record: BankedResetSchedule, source: ProfileStore.UsageAuthSource) async throws -> Bool {
         try await Task.detached {
             let outcome = try AuthCredentialUpdate.persistIfUnchanged(originalData: original,
-                updatedData: updated, profileIDs: Array(Set([record.profileID] + (try source.vault.listProfileIDs()))), vault: source.vault)
+                updatedData: updated, profileIDs: Array(Set([record.profileID] + (try source.vault.listProfileIDs()))), vault: source.vault,
+                liveAuthURL: source.liveAuthURL, backupDirectory: UsageProvider.backupDirectory(source))
             if outcome.savedProfileIDs.contains(record.profileID) { return true }
             return try source.vault.loadAuthBlob(profileID: record.profileID) == updated
         }.value
+    }
+
+    /// Adopts a newer valid copy of the same login into this profile. Returns
+    /// the healed blob only if it still matches the scheduled account.
+    private func healAuth(record: BankedResetSchedule, captured: Data,
+                          source: ProfileStore.UsageAuthSource) async -> Data? {
+        guard let outcome = await UsageProvider.healStaleAuth(
+            profileIDs: [record.profileID], captured: captured, source: source),
+              record.matchesAccount(authData: outcome.healedData) else { return nil }
+        self.trace("auth_healed", record: record, metadata: ["source": outcome.source.diagnosticName])
+        return outcome.healedData
     }
 
     private func persist(_ record: BankedResetSchedule) throws {

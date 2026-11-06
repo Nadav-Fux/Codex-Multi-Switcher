@@ -377,13 +377,44 @@ final class UsageProvider {
         // `CancellationError` early return, and falling off the end of the
         // `do`/`catch` below.
 
+        // The credential the vault holds for this group. A stale-auth heal
+        // replaces it, and every later conditional save must compare against
+        // the healed blob rather than the one that failed.
+        var effectiveAuth = authData
+        var healedFrom: StaleAuthHealer.Source?
         do {
-            let result = try await CLIUsageFetcher.fetchResult(
-                profileId: fetchGroup.contexts[0].id, authData: fetchGroup.queryAuthData ?? authData,
-                codexConfigURL: self.store.codexConfigURL(),
-                environment: source.paths.environment,
-                clientVersion: AppInfo.version)
-            await self.persistRotatedAuth(result.updatedAuthData, original: authData, group: fetchGroup, source: source)
+            let result: CLIUsageResult
+            do {
+                result = try await CLIUsageFetcher.fetchResult(
+                    profileId: fetchGroup.contexts[0].id, authData: fetchGroup.queryAuthData ?? authData,
+                    codexConfigURL: self.store.codexConfigURL(),
+                    environment: source.paths.environment,
+                    clientVersion: AppInfo.version)
+            } catch where Self.canHeal(error, group: fetchGroup) {
+                // Codex (or another profile copy) may have refreshed this login
+                // and rotated the refresh token. Adopt that newer copy and try once more.
+                if let operationError = error as? CLIUsageOperationError {
+                    await self.persistRotatedAuth(
+                        operationError.updatedAuthData, original: authData, group: fetchGroup, source: source)
+                }
+                guard let healed = await Self.healStaleAuth(
+                    profileIDs: fetchGroup.contexts.map(\.id), captured: authData, source: source) else {
+                    throw error
+                }
+                effectiveAuth = healed.healedData
+                healedFrom = healed.source
+                result = try await CLIUsageFetcher.fetchResult(
+                    profileId: fetchGroup.contexts[0].id, authData: healed.healedData,
+                    codexConfigURL: self.store.codexConfigURL(),
+                    environment: source.paths.environment,
+                    clientVersion: AppInfo.version)
+            }
+            await self.persistRotatedAuth(result.updatedAuthData, original: effectiveAuth, group: fetchGroup, source: source)
+            if let healedFrom {
+                AppLogger.info("Usage refresh recovered by adopting a newer sign-in",
+                               metadata: ["profiles": fetchGroup.contexts.map(\.id).joined(separator: ","),
+                                          "source": healedFrom.diagnosticName])
+            }
             for context in fetchGroup.contexts {
                 diagnostics[context.id]?.lastError = nil
                 await finalize(context, .available(result.snapshot), decision: "available")
@@ -393,19 +424,21 @@ final class UsageProvider {
             await self.releaseLease(fetchGroup.contexts.map(\.id), expectedToken: reservation.token)
             return
         } catch let error as CLIUsageOperationError {
-            await self.persistRotatedAuth(error.updatedAuthData, original: authData, group: fetchGroup, source: source)
+            await self.persistRotatedAuth(error.updatedAuthData, original: effectiveAuth, group: fetchGroup, source: source)
+            let needsRelogin = error.isAuthRequired || StaleAuthHealer.isStaleAuthError(error)
             for context in fetchGroup.contexts {
-                diagnostics[context.id]?.lastError = error.localizedDescription
+                diagnostics[context.id]?.lastError = needsRelogin
+                    ? StaleAuthHealer.reloginMessage : LogRedactor.redact(error.localizedDescription)
                 await finalize(
                     context,
-                    error.isAuthRequired ? .reloginNeeded(context.cached) : .stale(context.cached),
-                    decision: error.isAuthRequired ? "relogin-needed" : "stale")
+                    needsRelogin ? .reloginNeeded(context.cached) : .stale(context.cached),
+                    decision: needsRelogin ? "relogin-needed" : "stale")
                 AppLogger.warning("Usage refresh failed",
                                   metadata: ["profile": context.id, "error": error.localizedDescription])
             }
-        } catch let error as CodexRPCError where error.isAuthRequired {
+        } catch let error as CodexRPCError where StaleAuthHealer.isStaleAuthError(error) {
             for context in fetchGroup.contexts {
-                diagnostics[context.id]?.lastError = error.localizedDescription
+                diagnostics[context.id]?.lastError = StaleAuthHealer.reloginMessage
                 await finalize(context, .reloginNeeded(context.cached), decision: "relogin-needed")
                 AppLogger.warning("Usage refresh requires re-login",
                                   metadata: ["profile": context.id, "error": error.localizedDescription])
@@ -580,18 +613,52 @@ final class UsageProvider {
         // cancelled after its network request. The CAS preserves any newer
         // login/deletion while preventing cancellation from discarding rotation.
         let profileIDs = group.contexts.map(\.id)
-        let liveURL = group.contexts.contains(where: \.usesLiveAuth) ? source.liveAuthURL : nil
+        // Always offer the rotation to Codex's own auth.json: Core writes it
+        // only when that file still holds the chain this rotation consumed.
         await Self.persistRotatedAuth(
-            updated, original: original, profileIDs: profileIDs, vault: source.vault, liveAuthURL: liveURL)
+            updated, original: original, profileIDs: profileIDs, vault: source.vault,
+            liveAuthURL: source.liveAuthURL, backupDirectory: Self.backupDirectory(source))
+    }
+
+    nonisolated static func backupDirectory(_ source: ProfileStore.UsageAuthSource) -> URL {
+        source.paths.switcherHome.appendingPathComponent("backups", isDirectory: true)
+    }
+
+    private nonisolated static func canHeal(_ error: Error, group: RefreshGroup) -> Bool {
+        !group.contexts.contains(where: \.usesReadOnlyLiveAuth) && StaleAuthHealer.isStaleAuthError(error)
+    }
+
+    /// Off the main actor: the heal takes the vault lock and reads every profile copy.
+    nonisolated static func healStaleAuth(
+        profileIDs: [String], captured: Data, source: ProfileStore.UsageAuthSource
+    ) async -> StaleAuthHealer.Outcome? {
+        await Task.detached {
+            var outcome: StaleAuthHealer.Outcome?
+            for id in profileIDs {
+                do {
+                    if let healed = try StaleAuthHealer.heal(
+                        profileID: id, captured: captured, vault: source.vault,
+                        liveAuthURL: source.liveAuthURL, backupDirectory: Self.backupDirectory(source)) {
+                        outcome = outcome ?? healed
+                    }
+                } catch {
+                    AppLogger.warning("Could not heal stale profile credential",
+                                      metadata: ["profile": id, "error": LogRedactor.redact(error.localizedDescription)])
+                }
+            }
+            return outcome
+        }.value
     }
 
     private nonisolated static func persistRotatedAuth(
-        _ updated: Data, original: Data, profileIDs: [String], vault: AuthVault, liveAuthURL: URL?
+        _ updated: Data, original: Data, profileIDs: [String], vault: AuthVault, liveAuthURL: URL?,
+        backupDirectory: URL?
     ) async {
         do {
             _ = try AuthCredentialUpdate.persistIfUnchanged(
                 originalData: original, updatedData: updated,
-                profileIDs: profileIDs, vault: vault, liveAuthURL: liveAuthURL)
+                profileIDs: profileIDs, vault: vault, liveAuthURL: liveAuthURL,
+                backupDirectory: backupDirectory)
         } catch {
             AppLogger.warning("Could not save Codex's rotated credential",
                               metadata: ["error": error.localizedDescription])
