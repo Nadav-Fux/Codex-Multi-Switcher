@@ -11,7 +11,13 @@ struct AntigravityIDEQuotaReader: Sendable {
         let csrf: String
     }
 
-    private static let executable = "/Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm"
+    /// Exact installed language-server binaries that serve the Models & Usage
+    /// panel. The standalone Antigravity app (Nov 2026) ships its own server at
+    /// a different path; the older IDE bundle keeps the extension path.
+    static let executables: Set<String> = [
+        "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
+        "/Applications/Antigravity IDE.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+    ]
 
     func read() async throws -> ProviderUsageSnapshot {
         let endpoints = try await Task.detached { try Self.discover() }.value
@@ -94,7 +100,7 @@ struct AntigravityIDEQuotaReader: Sendable {
         var endpoints: [Endpoint] = []
         for row in rows.split(separator: "\n") {
             let fields = row.trimmingCharacters(in: .whitespaces).split(maxSplits: 2, whereSeparator: \.isWhitespace)
-            guard fields.count == 3, fields[1] == String(getuid()), fields[2] == self.executable,
+            guard fields.count == 3, fields[1] == String(getuid()), self.executables.contains(String(fields[2])),
                   let pid = Int32(fields[0]), let token = try? self.csrf(pid: pid) else { continue }
             let listeners = try command("/usr/sbin/lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"])
             for line in listeners.split(separator: "\n") {
@@ -104,7 +110,7 @@ struct AntigravityIDEQuotaReader: Sendable {
                       let suffix = line.split(separator: ":").last,
                       let port = Int(suffix), (1...65535).contains(port) else { continue }
                 endpoints.append(Endpoint(pid: pid, port: port, csrf: token))
-                if endpoints.count == 8 { return endpoints }
+                if endpoints.count == 16 { return endpoints }
             }
         }
         return endpoints
@@ -113,7 +119,7 @@ struct AntigravityIDEQuotaReader: Sendable {
     private static func csrf(pid: Int32) throws -> String {
         let comm = try command("/bin/ps", ["-p", String(pid), "-o", "uid=,comm="])
         let owner = comm.trimmingCharacters(in: .whitespacesAndNewlines).split(maxSplits: 1, whereSeparator: \.isWhitespace)
-        guard owner.count == 2, owner[0] == String(getuid()), owner[1] == self.executable else {
+        guard owner.count == 2, owner[0] == String(getuid()), self.executables.contains(String(owner[1])) else {
             throw AntigravityUsageError.accountChanged
         }
         let args = try command("/bin/ps", ["-p", String(pid), "-o", "args="])
