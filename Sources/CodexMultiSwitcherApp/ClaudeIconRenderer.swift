@@ -5,7 +5,8 @@ import CodexProfileCore
 enum ClaudeIconRenderer {
     static func render(snapshot: ClaudeUsageSnapshot?, primaryShowsUsed: Bool,
                        secondaryShowsUsed: Bool) -> NSImage {
-        let usable = snapshot.map { !$0.isStale && $0.accountVerified } ?? false
+        let usable = snapshot.map { $0.accountVerified && Date().timeIntervalSince($0.observedAt) <= 86400 } ?? false
+        let cached = snapshot?.isStale == true
         let now = Date()
         let windows = [usable ? snapshot?.fiveHour : nil, usable ? snapshot?.sevenDay : nil].map { window -> ClaudeUsageWindow? in
             guard let window, window.usedPercentage.isFinite,
@@ -16,8 +17,9 @@ enum ClaudeIconRenderer {
         let modes = [primaryShowsUsed, secondaryShowsUsed]
         let rows = windows.enumerated().map { index, window -> NSAttributedString in
             let value = window.map { modes[index] ? $0.usedPercentage : $0.remainingPercentage }
-            let display = value.map { String(format: "%02d%%", Int(min(100, max(0, $0)).rounded())) } ?? "—"
-            let color = window.map { IconRenderer.color(for: Int($0.remainingPercentage.rounded())) } ?? IconRenderer.cachedQuotaColor
+            let display = value.map { (cached ? "~" : "") + String(format: "%02d%%", Int(min(100, max(0, $0)).rounded())) } ?? "—"
+            let color = cached ? IconRenderer.cachedQuotaColor
+                : window.map { IconRenderer.color(for: Int($0.remainingPercentage.rounded())) } ?? IconRenderer.cachedQuotaColor
             return NSAttributedString(string: display, attributes: IconRenderer.quotaTextAttributes(
                 font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .bold), color: color))
         }
@@ -39,7 +41,7 @@ enum ClaudeIconRenderer {
             return true
         }
         image.isTemplate = false
-        image.accessibilityDescription = "Claude Code quota: " + windows.enumerated().map { index, window in
+        image.accessibilityDescription = (cached ? "Claude Code cached quota: " : "Claude Code quota: ") + windows.enumerated().map { index, window in
             let period = index == 0 ? "5 hours" : "week"
             guard let window else { return "\(period) unavailable" }
             let amount = modes[index] ? window.usedPercentage : window.remainingPercentage

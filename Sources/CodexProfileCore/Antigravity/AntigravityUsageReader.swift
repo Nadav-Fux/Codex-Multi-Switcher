@@ -200,11 +200,13 @@ public struct AntigravityUsageReader: Sendable {
               posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
             throw AntigravityUsageError.commandFailed
         }
-        let argv = [node.path, script.path, "accounts", "refresh", email].map { strdup($0) }
+        // Explicit element type: older Swift (CI, Xcode 16) cannot infer `strdup` in `map`.
+        let arguments: [String] = [node.path, script.path, "accounts", "refresh", email]
+        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { (value: String) -> UnsafeMutablePointer<CChar>? in strdup(value) }
         // Keep the real home for file-backed helper storage; exclude shell/config injection.
         let env = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CI": "true",
                    "NO_COLOR": "1", "BROWSER": "/usr/bin/false"]
-        let envp = env.map { strdup("\($0.key)=\($0.value)") }
+        let envp: [UnsafeMutablePointer<CChar>?] = env.map { (key: String, value: String) -> UnsafeMutablePointer<CChar>? in strdup("\(key)=\(value)") }
         defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
         var pid: pid_t = 0
         let result = (argv + [nil]).withUnsafeBufferPointer { arguments in

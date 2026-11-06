@@ -3,6 +3,10 @@ import Foundation
 
 enum ClaudeCurrentUsageChecks {
     struct Failure: Error { let message: String }
+    actor PollCalls {
+        var count = 0
+        func record() { self.count += 1 }
+    }
     static func check(_ value: Bool, _ message: String) throws {
         if !value { throw Failure(message: message) }
     }
@@ -55,7 +59,87 @@ enum ClaudeCurrentUsageChecks {
         let profile = ClaudeProfile(id: ClaudeProfileRegistry.defaultID, label: "Fixture",
                                     configDirectory: home.appendingPathComponent(".claude").path, isDefault: true)
         let auth = ClaudeAuthInfo(loggedIn: true, email: "fixture@example.test", organizationID: "org-fixture")
+        // A rejected token must never send the native loader down an OAuth,
+        // Keychain, or CLI lock path. Only the official Claude client renews it.
+        // This entry point rejects before touching any real credential store.
+        do {
+            _ = try await ClaudeNativeCredentialLoader().renewAccessToken(
+                rejectedToken: "fake-rejected-token", auth: auth, authAfter: {
+                    throw Failure(message: "Native renewal must not inspect or mutate sign-in")
+                })
+            throw Failure(message: "Native Claude credential must remain read-only")
+        } catch ClaudeCurrentUsageError.credentialRenewalUnavailable {}
         let fixed = Date()
+        let policyRoot = root.appendingPathComponent("persistent-polling")
+        let rateCalls = PollCalls()
+        let lastKnown = ClaudeUsageSnapshot(fiveHour: ClaudeUsageWindow(usedPercentage: 22),
+            sevenDay: ClaudeUsageWindow(usedPercentage: 32), observedAt: fixed,
+            source: .oauthUsage, isStale: false, accountVerified: true)
+        let ratePolicy = ClaudeQuotaRefreshPolicy(root: policyRoot)
+        let first429 = await ratePolicy.read(identity: "account-a", seed: lastKnown, now: fixed) {
+            await rateCalls.record(); throw ClaudeCurrentUsageError.rateLimited
+        }
+        try check(first429.failure == .rateLimited && first429.snapshot?.isStale == true
+            && first429.nextRefreshAt.timeIntervalSince(fixed) == 600,
+            "429 keeps historical quota and starts a ten-minute wait")
+        let restartedPolicy = ClaudeQuotaRefreshPolicy(root: policyRoot)
+        let beforeRetry = await restartedPolicy.read(identity: "account-a", now: fixed.addingTimeInterval(60)) {
+            await rateCalls.record(); return lastKnown
+        }
+        try check(await rateCalls.count == 1 && beforeRetry.failure == .rateLimited,
+            "Restarting or clicking Refresh cannot bypass a persisted rate-limit wait")
+        let second429 = await restartedPolicy.read(identity: "account-a", now: fixed.addingTimeInterval(601)) {
+            await rateCalls.record(); throw ClaudeCurrentUsageError.rateLimited
+        }
+        try check(await rateCalls.count == 2 && second429.nextRefreshAt.timeIntervalSince(fixed) == 1801,
+            "A repeated 429 doubles the next wait")
+        let anotherAccount = await restartedPolicy.read(identity: "account-b", now: fixed.addingTimeInterval(602)) {
+            throw ClaudeCurrentUsageError.credentialRejected
+        }
+        try check(anotherAccount.snapshot == nil, "Historical quota cannot leak to another account")
+        let normalRoot = root.appendingPathComponent("normal-polling")
+        let normalCalls = PollCalls()
+        let normalPolicy = ClaudeQuotaRefreshPolicy(root: normalRoot)
+        _ = await normalPolicy.read(identity: "account-a", now: fixed) {
+            await normalCalls.record(); return lastKnown
+        }
+        let normalRestarted = ClaudeQuotaRefreshPolicy(root: normalRoot)
+        _ = await normalRestarted.read(identity: "account-a", now: fixed.addingTimeInterval(240)) {
+            await normalCalls.record(); return lastKnown
+        }
+        try check(await normalCalls.count == 1, "Normal API polling is at most once in five minutes across relaunches")
+        let sharedRoot = root.appendingPathComponent("shared-polling")
+        let sharedA = ClaudeQuotaRefreshPolicy(root: sharedRoot), sharedB = ClaudeQuotaRefreshPolicy(root: sharedRoot)
+        let sharedCalls = PollCalls()
+        async let firstShared = sharedA.read(identity: "account-a", now: fixed) {
+            await sharedCalls.record(); try await Task.sleep(nanoseconds: 50_000_000); return lastKnown
+        }
+        async let secondShared = sharedB.read(identity: "account-a", now: fixed) {
+            await sharedCalls.record(); try await Task.sleep(nanoseconds: 50_000_000); return lastKnown
+        }
+        _ = await (firstShared, secondShared)
+        try check(await sharedCalls.count == 1, "Two app instances share one persisted request reservation")
+        let historicalURL = root.appendingPathComponent("historical-helper-observation.json")
+        let historical: [String: Any] = ["schemaVersion": 1, "profileID": profile.id,
+            "configDirectory": profile.configDirectory, "authIdentityDigest": "account-a",
+            "fetchedAt": fixed.timeIntervalSince1970, "usage": ["seven_day": ["utilization": 32]]]
+        try AtomicFileWriter.write(JSONSerialization.data(withJSONObject: historical), to: historicalURL)
+        let imported = ClaudeQuotaRefreshPolicy.priorObservation(at: historicalURL, profile: profile, identity: "account-a", now: fixed)
+        try check(imported?.isStale == true && imported?.sevenDay?.usedPercentage == 32,
+            "Private prior observations survive app restarts only as explicitly historical quota")
+        try check(ClaudeQuotaRefreshPolicy.priorObservation(at: historicalURL, profile: profile, identity: "account-b", now: fixed) == nil,
+            "A prior observation cannot be imported for another account")
+        let corruptRoot = root.appendingPathComponent("corrupt-polling")
+        let corruptURL = corruptRoot.appendingPathComponent("quota-refresh-state.json")
+        let corruptBytes = Data("not-json".utf8)
+        try AtomicFileWriter.write(corruptBytes, to: corruptURL)
+        let corruptPolicy = ClaudeQuotaRefreshPolicy(root: corruptRoot)
+        let corruptCalls = PollCalls()
+        _ = await corruptPolicy.read(identity: "account-a", now: fixed) {
+            await corruptCalls.record(); return lastKnown
+        }
+        try check(await corruptCalls.count == 0 && Data(contentsOf: corruptURL) == corruptBytes,
+            "Unreadable cooldown state must not trigger a blind network request or overwrite the file")
         func service(_ suffix: String, _ loader: FakeLoader = FakeLoader(), _ transport: FakeTransport = FakeTransport()) -> ClaudeCurrentUsageService {
             ClaudeCurrentUsageService(root: root.appendingPathComponent(suffix), nativeHome: home,
                                       credentialLoader: loader, transport: transport)
@@ -140,13 +224,15 @@ enum ClaudeCurrentUsageChecks {
             else { try? FileManager.default.removeItem(at: nativeURL) }
         }
         try? FileManager.default.removeItem(at: nativeURL)
-        let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge, currentUsageService: integrated)
+        let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge, currentUsageService: integrated,
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-store-api")))
         store.refresh()
         let deadline = Date().addingTimeInterval(10)
         while store.isRefreshing && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
         try check(store.statuses[profile.id]?.usage?.source == .oauthUsage, "Store publishes current account usage automatically")
         let mismatchedStore = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
-            currentUsageService: service("store-mismatch", FakeLoader(), FakeTransport(mismatch: true)))
+            currentUsageService: service("store-mismatch", FakeLoader(), FakeTransport(mismatch: true)),
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-store-mismatch")))
         mismatchedStore.refresh()
         let mismatchDeadline = Date().addingTimeInterval(10)
         while mismatchedStore.isRefreshing && Date() < mismatchDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
@@ -159,19 +245,38 @@ enum ClaudeCurrentUsageChecks {
         try AtomicFileWriter.write(JSONSerialization.data(withJSONObject: native), to: nativeURL)
         let untouchedLoader = FakeLoader(), untouchedTransport = FakeTransport()
         let nativeFirst = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
-            currentUsageService: service("store-native-priority", untouchedLoader, untouchedTransport))
+            currentUsageService: service("store-native-priority", untouchedLoader, untouchedTransport),
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-store-native")))
         nativeFirst.refresh()
         let nativeDeadline = Date().addingTimeInterval(10)
         while nativeFirst.isRefreshing && Date() < nativeDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
-        try check(nativeFirst.statuses[profile.id]?.usage?.source == .oauthUsage && untouchedTransport.calls == 2,
-                  "Current authenticated API observation updates even with a prior native bridge observation")
+        try check(nativeFirst.statuses[profile.id]?.usage?.source == .nativeBridge && untouchedTransport.calls == 0,
+                  "A fresh account-matched native bridge avoids quota API calls")
+        var oldNative = native
+        oldNative["fetchedAt"] = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-600))
+        try AtomicFileWriter.write(JSONSerialization.data(withJSONObject: oldNative), to: nativeURL)
         let fallback = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
-            currentUsageService: service("store-bridge-fallback", FakeLoader(), FakeTransport(fail: true)))
+            currentUsageService: service("store-bridge-fallback", FakeLoader(), FakeTransport(fail: true)),
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-store-fallback")))
         fallback.refresh()
         let fallbackDeadline = Date().addingTimeInterval(10)
         while fallback.isRefreshing && Date() < fallbackDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
         try check(fallback.statuses[profile.id]?.usage?.source == .nativeBridge && fallback.statuses[profile.id]?.error != nil,
                   "A failed live read preserves a matching bridge observation as fallback")
+        let olderAPI = ClaudeUsageSnapshot(fiveHour: ClaudeUsageWindow(usedPercentage: 50), sevenDay: nil,
+            observedAt: Date().addingTimeInterval(-1200), source: .oauthUsage, isStale: true, accountVerified: true)
+        let oldPolicy = ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-old-api"))
+        _ = await oldPolicy.read(identity: ClaudeUsageReader.accountFingerprint(auth)!, seed: olderAPI) {
+            throw ClaudeCurrentUsageError.rateLimited
+        }
+        let cooledTransport = FakeTransport()
+        let cooledStore = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
+            currentUsageService: service("cooled-store", FakeLoader(), cooledTransport), quotaRefreshPolicy: oldPolicy)
+        cooledStore.refresh()
+        let cooledDeadline = Date().addingTimeInterval(10)
+        while cooledStore.isRefreshing && Date() < cooledDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        try check(cooledStore.statuses[profile.id]?.usage?.source == .nativeBridge && cooledTransport.calls == 0,
+            "A more recent bridge observation wins over older API history during a persisted cooldown")
         print("Claude current usage checks passed (fake credentials/HTTPS, identity races, private cache, backoff, isolation, store priority).")
     }
 }

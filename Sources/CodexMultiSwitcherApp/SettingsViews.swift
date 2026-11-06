@@ -207,7 +207,7 @@ struct ProfilesTab: View {
     @State private var selectedId: String?
     @State private var labelDraft = ProfileLabelDraft()
     @State private var profiles: [ProfileConfig] = []
-    @State private var pendingDeleteId: String?
+    @State private var pendingDeleteProfile: ProfileConfig?
     @State private var pendingClearAuthId: String?
     @State private var actionInFlight: Set<String> = []
     @State private var refreshTick = 0
@@ -225,24 +225,21 @@ struct ProfilesTab: View {
             self.syncEditingLabel()
         }
         .onDisappear { self.commitLabel() }
-        .alert("Delete Profile", isPresented: Binding(
-            get: { self.pendingDeleteId != nil },
-            set: { if !$0 { self.pendingDeleteId = nil } }
-        )) {
-            Button("Cancel", role: .cancel) { self.pendingDeleteId = nil }
-            Button("Delete", role: .destructive) {
-                if let id = self.pendingDeleteId {
-                    let label = self.profileLabel(id)
-                    if self.removeProfile(id) {
-                        self.toast.show("Deleted \(label)", style: .info)
-                    }
+        .alert("Remove Codex Profile?", isPresented: Binding(
+            get: { self.pendingDeleteProfile != nil },
+            set: { if !$0 { self.pendingDeleteProfile = nil } }
+        ), presenting: self.pendingDeleteProfile) { profile in
+            Button("Cancel", role: .cancel) { self.pendingDeleteProfile = nil }
+            Button("Remove Profile", role: .destructive) {
+                // Capture the presented value: SwiftUI can clear presentation state
+                // before invoking this action when the alert is dismissed.
+                if self.removeProfile(profile.id) {
+                    self.toast.show("Removed \(profile.label)", style: .info)
                 }
-                self.pendingDeleteId = nil
+                self.pendingDeleteProfile = nil
             }
-        } message: {
-            if let id = self.pendingDeleteId {
-                Text("Are you sure you want to delete \"\(self.profileLabel(id))\"? This cannot be undone.")
-            }
+        } message: { profile in
+            Text("Remove \"\(profile.label)\" and its saved sign-in from this Mac? This does not cancel your subscription or delete your OpenAI account. Your current Codex session stays signed in.")
         }
         .confirmationDialog("Clear Saved Auth", isPresented: Binding(
             get: { self.pendingClearAuthId != nil },
@@ -267,6 +264,12 @@ struct ProfilesTab: View {
                     ForEach(self.profiles) { profile in
                         self.sidebarRow(profile)
                             .tag(profile.id)
+                            .contextMenu {
+                                Button("Remove Profile…", role: .destructive) {
+                                    self.requestProfileRemoval(profile.id)
+                                }
+                                .disabled(!self.canRemoveProfile(profile.id))
+                            }
                     }
                 }
             }
@@ -290,16 +293,16 @@ struct ProfilesTab: View {
                 Divider().frame(height: 14)
 
                 Button {
-                    if let id = self.selectedId { self.pendingDeleteId = id }
+                    if let id = self.selectedId { self.requestProfileRemoval(id) }
                 } label: {
-                    Image(systemName: "minus")
-                        .frame(width: 24, height: 20)
+                    Label("Remove", systemImage: "trash")
+                        .frame(height: 20)
                 }
                 .buttonStyle(.borderless)
-                .disabled(
-                    self.selectedId == nil
-                        || self.selectedId == self.store.liveProfileId
-                        || self.selectedId == self.store.config.activeProfile)
+                .help("Remove the selected saved profile. Switch away from an active profile first.")
+                .accessibilityLabel("Remove selected Codex profile")
+                .accessibilityIdentifier("codex-remove-selected-profile")
+                .disabled(self.selectedId.map { !self.canRemoveProfile($0) } ?? true)
 
                 Spacer()
             }
@@ -387,6 +390,19 @@ struct ProfilesTab: View {
                             if !focused { self.commitLabel() }
                         }
                         .disabled(inFlight)
+
+                    Button("Remove Profile…", role: .destructive) {
+                        self.requestProfileRemoval(profile.id)
+                    }
+                    .disabled(!self.canRemoveProfile(profile.id))
+                    .help("Remove this saved profile from the Switcher without cancelling your subscription")
+                    .accessibilityIdentifier("codex-remove-profile-details")
+                }
+
+                if profile.id == self.store.liveProfileId || profile.id == self.store.config.activeProfile {
+                    Text("This profile is active. Switch to another profile before removing it.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
 
                 if hasSavedAuth {
@@ -492,6 +508,20 @@ struct ProfilesTab: View {
     }
 
     // MARK: - Actions
+
+    private func canRemoveProfile(_ id: String) -> Bool {
+        self.profiles.contains(where: { $0.id == id })
+            && id != self.store.liveProfileId
+            && id != self.store.config.activeProfile
+            && !self.actionInFlight.contains(id)
+            && !CodexBridge.isLoginRunning(profileId: id)
+    }
+
+    private func requestProfileRemoval(_ id: String) {
+        guard self.canRemoveProfile(id) else { return }
+        self.commitLabel()
+        self.pendingDeleteProfile = self.profiles.first(where: { $0.id == id })
+    }
 
     private func syncEditingLabel() {
         self.labelDraft.sync(selectedId: self.selectedId, profiles: self.profiles)

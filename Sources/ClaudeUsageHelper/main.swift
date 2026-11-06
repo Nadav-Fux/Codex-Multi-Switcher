@@ -51,7 +51,8 @@ enum ClaudeUsageHelperMain {
 
     private static func emit(_ response: ClaudeUsageHelperResponse) {
         guard let data = try? JSONEncoder().encode(response) else { exit(1) }
-        FileHandle.standardOutput.write(data)
-        FileHandle.standardOutput.write(Data([0x0a]))
+        // Throwing overload: the Data-only write(_:) raises an uncatchable
+        // exception if the app closed the pipe.
+        do { try FileHandle.standardOutput.write(contentsOf: data + Data([0x0a])) } catch { exit(1) }
     }
 }

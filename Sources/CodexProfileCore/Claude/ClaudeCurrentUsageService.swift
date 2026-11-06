@@ -11,7 +11,7 @@ public enum ClaudeCurrentUsageError: String, Codable, LocalizedError {
         case .credentialInteractionRequired: return "Connect Claude in Settings to authorize its usage helper. Background access is paused until a silent read succeeds."
         case .credentialRejected: return "Current Claude usage is unavailable for this sign-in. Usage can appear when the account becomes available; the statusline bridge is also supported."
         case .accessDenied: return "Claude denied quota access for this sign-in. Check this account in Claude Code."
-        case .credentialRenewalUnavailable: return "Claude could not renew this sign-in without a Keychain prompt. Open Claude Code to renew it, then refresh."
+        case .credentialRenewalUnavailable: return "Claude sign-in needs renewal. Open Claude Code, then refresh usage."
         case .credentialRenewalFailed: return "Claude sign-in renewal failed. Refresh again in a few minutes; sign in through Claude Code if it continues."
         case .refreshInProgress: return "Another Claude process is updating sign-in. Usage will refresh automatically."
         case .rateLimited: return "Claude temporarily limited quota requests. Usage will refresh automatically."
@@ -35,7 +35,7 @@ public extension ClaudeUsageCredentialLoading {
     }
 }
 
-/// Reads exactly Claude's native item. Renewal updates only that existing item, without prompts.
+/// Reads exactly Claude's native item. Only Claude Code may renew or write that sign-in.
 public struct ClaudeNativeCredentialLoader: ClaudeUsageCredentialLoading {
     public init() {}
     public func accessToken() throws -> String {
@@ -50,7 +50,10 @@ public struct ClaudeNativeCredentialLoader: ClaudeUsageCredentialLoading {
 
     public func renewAccessToken(rejectedToken: String, auth: ClaudeAuthInfo,
                                  authAfter: @Sendable () throws -> ClaudeAuthInfo) async throws -> String {
-        try await ClaudeNativeCredentialRenewal.renew(rejectedToken: rejectedToken, auth: auth, authAfter: authAfter)
+        // Even an in-place legacy Keychain data update can replace its partition
+        // list with this ad-hoc helper's cdhash, blocking Claude's security CLI.
+        // Never consume its rotating refresh token or mutate its credential/ACL.
+        throw ClaudeCurrentUsageError.credentialRenewalUnavailable
     }
 }
 
