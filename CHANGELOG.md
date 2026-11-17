@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Show Claude limit resets (full, weekly, 5-hour and Fable) in Claude settings, read from the same usage block Claude Code's `/limit-reset` uses. Display only: the app never spends a reset.
+- Redesign Claude settings to match the other providers: one status banner (Connected / one-time approval / sign in) with the single action it needs, usage, then new-session controls; directory, reconnect and the statusline recorder move under Advanced. Separate Claude accounts get their usage recorder installed automatically after sign-in unless it was removed on purpose.
+- Note: the stable signature keeps the Claude grant across app rebuilds while the usage helper is unchanged. A change to `CodexProfileCore` or the helper produces a new helper binary, which macOS asks to approve once.
 - Sign the installed Local build with a stable identity (`Codex Multi Switcher Local Signing`, or `APP_IDENTITY`) so Keychain "Always Allow" grants survive rebuilds; packaging fails with setup instructions instead of silently falling back to ad-hoc. `APP_IDENTITY=-` opts into ad-hoc explicitly.
 - Store the Z.ai Coding Plan key in a mode-600 file under the switcher home instead of the Keychain; a key saved by an older build migrates once when its Keychain item is readable. A failing legacy Keychain read is logged once, not every 30 seconds.
 - Notify once when macOS blocks silent Claude usage access instead of leaving the menu bar on "?", and remove block flags left by earlier helper builds.

@@ -146,6 +146,7 @@ final class ClaudeProfileStore: ObservableObject {
             guard let self else { return }
             self.isRefreshing = false
             self.refreshTask = nil
+            self.installMissingRecorders()
             let blockedMessage = ClaudeCurrentUsageError.credentialInteractionRequired.localizedDescription
             ClaudeAccessNotifier.update(blocked: self.statuses.values.contains { $0.error == blockedMessage })
             self.onChange?()
@@ -161,6 +162,30 @@ final class ClaudeProfileStore: ObservableObject {
     func openSession(id: String) { self.launch(id: id, login: false) }
 
     func supportsNativeUsage(_ profile: ClaudeProfile) -> Bool { self.currentUsage.supports(profile) }
+
+    /// One answer for the Settings banner: is usage for this account working,
+    /// and if not, what single step fixes it.
+    func connectionState(_ profile: ClaudeProfile) -> ClaudeConnectionState {
+        let status = self.statuses[profile.id]
+        if self.isAuthorizingCredential, self.currentUsage.supports(profile) { return .needsApproval }
+        if status?.auth?.loggedIn == false { return .needsSignIn }
+        let blocked = [ClaudeCurrentUsageError.credentialInteractionRequired, .credentialUnavailable]
+            .map(\.localizedDescription)
+        if self.currentUsage.supports(profile), let error = status?.error, blocked.contains(error) { return .needsApproval }
+        if status?.busy == true, status?.usage == nil { return .checking }
+        if status == nil { return .checking }
+        if self.currentUsage.supports(profile) {
+            if let error = status?.error, status?.usage == nil { return .problem(error) }
+            return .connected("Usage updates automatically in the background.")
+        }
+        if status?.bridgeInstalled == true {
+            return .connected(status?.usage == nil
+                ? "Usage appears after the first Claude reply in a session opened with this account."
+                : "Usage updates from Claude sessions opened with this account.")
+        }
+        if let error = status?.error { return .problem(error) }
+        return .checking
+    }
 
     /// The click authorizes only an existing native Claude credential read.
     /// Run Security off the main actor so the macOS consent dialog stays usable.
@@ -194,7 +219,23 @@ final class ClaudeProfileStore: ObservableObject {
         self.onChange?()
     }
 
+    private static func recorderOptOutKey(_ id: String) -> String { "claudeBridgeOptOut.\(id)" }
+
+    /// Separate accounts can only report usage through their statusline
+    /// recorder, so install it once the account is signed in — unless the
+    /// user removed it on purpose.
+    private func installMissingRecorders() {
+        for profile in self.profiles where !self.currentUsage.supports(profile) {
+            guard let status = self.statuses[profile.id], !status.bridgeInstalled, !status.busy,
+                  status.auth?.email != nil || status.auth?.accountID != nil,
+                  !UserDefaults.standard.bool(forKey: Self.recorderOptOutKey(profile.id)) else { continue }
+            CoreLogger.info("Installing Claude usage recorder for a separate account")
+            self.installBridge(id: profile.id)
+        }
+    }
+
     func installBridge(id: String) {
+        UserDefaults.standard.removeObject(forKey: Self.recorderOptOutKey(id))
         self.error = nil
         guard let profile = self.profile(id) else { return }
         var status = self.statuses[id] ?? ClaudeProfileStatus()
@@ -247,6 +288,7 @@ final class ClaudeProfileStore: ObservableObject {
         do {
             try self.installer.restore(profile: profile)
             self.statuses[id]?.bridgeInstalled = false
+            UserDefaults.standard.set(true, forKey: Self.recorderOptOutKey(id))
         } catch { self.error = error.localizedDescription }
         self.onChange?()
     }
@@ -292,4 +334,15 @@ final class ClaudeProfileStore: ObservableObject {
         let ids = Set(state.profiles.map(\.id))
         self.statuses = self.statuses.filter { ids.contains($0.key) }
     }
+}
+
+/// One plain answer to "is Claude working?", shown at the top of Settings.
+enum ClaudeConnectionState: Equatable {
+    case checking
+    case connected(String)
+    case needsSignIn
+    case needsApproval
+    case problem(String)
+
+    var isHealthy: Bool { if case .connected = self { return true } else { return false } }
 }

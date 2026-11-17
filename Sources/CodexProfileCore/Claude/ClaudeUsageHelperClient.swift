@@ -76,7 +76,7 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
         return ClaudeUsageSnapshot(fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
             modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
             isStale: true,
-            accountVerified: snapshot.accountVerified)
+            accountVerified: snapshot.accountVerified, resets: snapshot.resets)
     }
 
     private static let blockKeyPrefix = "claudeUsageHelperAccessBlocked."

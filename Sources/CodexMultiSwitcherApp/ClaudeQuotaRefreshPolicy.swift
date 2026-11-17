@@ -102,7 +102,7 @@ actor ClaudeQuotaRefreshPolicy {
                 modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
                 isStale: record.failure != nil || snapshot.isStale
                     || now.timeIntervalSince(snapshot.observedAt) > ClaudeCurrentUsageService.cacheFreshness,
-                accountVerified: snapshot.accountVerified)
+                accountVerified: snapshot.accountVerified, resets: snapshot.resets)
         }
         return Observation(snapshot: snapshot, failure: record.failure, nextRefreshAt: record.nextRefreshAt)
     }
@@ -148,7 +148,7 @@ actor ClaudeQuotaRefreshPolicy {
         guard let snapshot, Self.valid(snapshot, now: now) else { return nil }
         return ClaudeUsageSnapshot(fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
             modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
-            isStale: true, accountVerified: true)
+            isStale: true, accountVerified: true, resets: snapshot.resets)
     }
 
     /// Imports only an already verified numeric observation for this exact

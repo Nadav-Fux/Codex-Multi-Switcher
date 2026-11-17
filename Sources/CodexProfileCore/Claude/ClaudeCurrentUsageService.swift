@@ -63,8 +63,10 @@ public protocol ClaudeUsageTransport: Sendable {
 
 public struct ClaudeHTTPSUsageTransport: ClaudeUsageTransport {
     public init() {}
+    /// The same read Claude Code's `/limit-reset` uses to list available resets.
+    public static let usageWithResetsPath = "usage?cedar_ember=1&skip_spend=1"
     public func get(path: String, accessToken: String) async throws -> Data {
-        guard ["usage", "profile"].contains(path),
+        guard ["usage", "profile", Self.usageWithResetsPath].contains(path),
               let url = URL(string: "https://api.anthropic.com/api/oauth/" + path) else {
             throw ClaudeCurrentUsageError.requestFailed
         }
@@ -293,7 +295,7 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         let profileData = try await self.transport.get(path: "profile", accessToken: token)
         guard let linked = try? JSONSerialization.jsonObject(with: profileData) as? [String: Any],
               Self.matches(linked, auth: authBefore) else { throw ClaudeCurrentUsageError.accountChanged }
-        let usageData = try await self.transport.get(path: "usage", accessToken: token)
+        let usageData = try await self.transport.get(path: ClaudeHTTPSUsageTransport.usageWithResetsPath, accessToken: token)
         guard usageData.count <= 1_048_576,
               let usage = try? JSONSerialization.jsonObject(with: usageData) as? [String: Any] else {
             throw ClaudeCurrentUsageError.invalidResponse
@@ -314,6 +316,9 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
                 if let reset = window.resetsAt { value["resets_at"] = ISO8601DateFormatter().string(from: reset) }
                 normalized[key] = value
             }
+        }
+        if let resets = snapshot.resets {
+            normalized["cedar_ember"] = ["eligible": true, "grants": resets.map(\.normalized)]
         }
         let payload: [String: Any] = ["schemaVersion": 1, "profileID": profile.id,
                                      "configDirectory": profile.configDirectory,
@@ -366,6 +371,7 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         guard five != nil || seven != nil else { throw ClaudeCurrentUsageError.invalidResponse }
         return ClaudeUsageSnapshot(fiveHour: five, sevenDay: seven, modelWeekly: window("seven_day_sonnet"),
                                    observedAt: observedAt, source: .oauthUsage,
-                                   isStale: now.timeIntervalSince(observedAt) > Self.cacheFreshness, accountVerified: true)
+                                   isStale: now.timeIntervalSince(observedAt) > Self.cacheFreshness, accountVerified: true,
+                                   resets: ClaudeLimitReset.parse(usage["cedar_ember"]))
     }
 }

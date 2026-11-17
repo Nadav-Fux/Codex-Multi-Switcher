@@ -53,6 +53,80 @@ public enum ClaudeUsageSource: String, Codable, Equatable, Sendable {
     case oauthUsage
 }
 
+/// A limit reset Claude grants the account (Claude Code's `/limit-reset`).
+/// Read-only here: the app shows what is available and never spends one.
+public struct ClaudeLimitReset: Codable, Equatable, Sendable, Identifiable {
+    public enum Kind: String, Codable, Sendable {
+        case session, weekly, fable, full
+    }
+    public let id: String
+    public let label: String
+    public let kind: Kind
+    public let left: Int
+    public let total: Int
+    public let endsAt: Date?
+    public let usableNow: Bool
+    public let paused: Bool
+
+    public init(id: String, label: String, kind: Kind, left: Int, total: Int,
+                endsAt: Date?, usableNow: Bool, paused: Bool) {
+        self.id = id; self.label = label; self.kind = kind; self.left = left
+        self.total = total; self.endsAt = endsAt; self.usableNow = usableNow; self.paused = paused
+    }
+
+    /// Mirrors Claude Code: a grant that gives back weekly usage is the Fable
+    /// reset; otherwise the server type, else what the grant clears.
+    public static func kind(type: String?, clears: [String], givesBackWeekly: Bool) -> Kind {
+        if givesBackWeekly { return .fable }
+        if let type, let kind = Kind(rawValue: type) { return kind }
+        let session = clears.contains("five_hour")
+        let other = clears.contains { $0 != "five_hour" }
+        return session && !other ? .session : other && !session ? .weekly : .full
+    }
+
+    /// Parses the `cedar_ember` block of the usage response. Malformed grants are skipped.
+    public static func parse(_ block: Any?) -> [ClaudeLimitReset]? {
+        guard let block = block as? [String: Any] else { return nil }
+        guard block["eligible"] as? Bool == true else { return [] }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        func date(_ value: Any?) -> Date? {
+            guard let text = value as? String else { return nil }
+            return fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        }
+        func int(_ value: Any?) -> Int? {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue >= 0, number.doubleValue < 10_000 else { return nil }
+            return number.intValue
+        }
+        return (block["grants"] as? [[String: Any]] ?? []).compactMap { grant in
+            guard let id = grant["id"] as? String, !id.isEmpty, id.count <= 64,
+                  let left = int(grant["resets_left"]) else { return nil }
+            let clears = grant["clears"] as? [String] ?? []
+            return ClaudeLimitReset(
+                id: id, label: (grant["label"] as? String).map { String($0.prefix(80)) } ?? "",
+                kind: kind(type: grant["type"] as? String, clears: clears,
+                           givesBackWeekly: grant["gives_back_weekly"] as? Bool ?? false),
+                left: left, total: int(grant["resets_total"]) ?? left,
+                endsAt: date(grant["ends_at"]),
+                usableNow: grant["usable_now"] as? Bool ?? false,
+                paused: grant["paused"] as? Bool ?? false)
+        }
+    }
+
+    /// Back to the response shape, for the normalized local cache.
+    public var normalized: [String: Any] {
+        var value: [String: Any] = ["id": id, "label": label, "resets_left": left, "resets_total": total,
+                                    "usable_now": usableNow, "paused": paused]
+        switch kind {
+        case .fable: value["gives_back_weekly"] = true
+        default: value["type"] = kind.rawValue
+        }
+        if let endsAt { value["ends_at"] = ISO8601DateFormatter().string(from: endsAt) }
+        return value
+    }
+}
+
 public struct ClaudeUsageSnapshot: Codable, Equatable, Sendable {
     public let fiveHour: ClaudeUsageWindow?
     public let sevenDay: ClaudeUsageWindow?
@@ -63,11 +137,15 @@ public struct ClaudeUsageSnapshot: Codable, Equatable, Sendable {
     /// OAuth observations match a token-linked profile and CLI identity before/after the request.
     /// Bridge observations match installation identity; older sessions cannot attest credentials.
     public let accountVerified: Bool
+    /// Limit resets available to the account; nil when the source cannot tell.
+    public let resets: [ClaudeLimitReset]?
     public var accountMatched: Bool { self.accountVerified }
 
     public init(fiveHour: ClaudeUsageWindow?, sevenDay: ClaudeUsageWindow?,
                 modelWeekly: ClaudeUsageWindow? = nil, observedAt: Date,
-                source: ClaudeUsageSource, isStale: Bool, accountVerified: Bool = false) {
+                source: ClaudeUsageSource, isStale: Bool, accountVerified: Bool = false,
+                resets: [ClaudeLimitReset]? = nil) {
+        self.resets = resets
         self.fiveHour = fiveHour
         self.sevenDay = sevenDay
         self.modelWeekly = modelWeekly
