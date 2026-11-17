@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Sign the installed Local build with a stable identity (`Codex Multi Switcher Local Signing`, or `APP_IDENTITY`) so Keychain "Always Allow" grants survive rebuilds; packaging fails with setup instructions instead of silently falling back to ad-hoc. `APP_IDENTITY=-` opts into ad-hoc explicitly.
+- Store the Z.ai Coding Plan key in a mode-600 file under the switcher home instead of the Keychain; a key saved by an older build migrates once when its Keychain item is readable. A failing legacy Keychain read is logged once, not every 30 seconds.
+- Notify once when macOS blocks silent Claude usage access instead of leaving the menu bar on "?", and remove block flags left by earlier helper builds.
 - Read Antigravity quotas from the standalone Antigravity app's language server (`/Applications/Antigravity.app/Contents/Resources/bin/language_server`) as well as the older IDE bundle, so Gemini quota is shown instead of the CLI-helper fallback.
 - Heal Codex profiles whose saved sign-in went stale after Codex refreshed the same login. On a 401 / `token_expired` / `refresh_token_reused` (and before a banked reset when the profile's own token has expired), the app adopts a newer, still-valid copy of the same account from `~/.codex/auth.json` or another profile (same `account_id` and same user), backs up the replaced copy under `backups/auth-heal/`, and retries once. Tokens the switcher rotates are written back to `~/.codex/auth.json` when it still holds the consumed chain. When no valid copy exists, a plain "re-login needed" message replaces the raw backend error.
 - Prefer fresh Claude Code bridge observations, persist account-bound polling waits across relaunches, and back off repeated quota API rate limits. Clearly mark historical menu-bar values with `~` and show the next refresh time.

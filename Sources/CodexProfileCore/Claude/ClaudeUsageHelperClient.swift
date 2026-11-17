@@ -79,7 +79,24 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
             accountVerified: snapshot.accountVerified)
     }
 
-    private func blockKey(_ digest: String) -> String { "claudeUsageHelperAccessBlocked." + digest }
+    private static let blockKeyPrefix = "claudeUsageHelperAccessBlocked."
+    private func blockKey(_ digest: String) -> String { Self.blockKeyPrefix + digest }
+
+    /// Removes block flags left by earlier helper builds. Each flag is keyed by
+    /// the helper digest it latched for, so a flag for any other digest can
+    /// never be cleared by Connect and only clutters the preferences. Returns
+    /// how many were removed. The current helper's own flag is kept.
+    @discardableResult
+    public func clearStaleAccessBlocks() -> Int {
+        let current = (try? self.executableDigest()).map(self.blockKey)
+        var removed = 0
+        for key in self.preferences.dictionaryRepresentation().keys
+            where key.hasPrefix(Self.blockKeyPrefix) && key != current {
+            self.preferences.removeObject(forKey: key)
+            removed += 1
+        }
+        return removed
+    }
 
     private func executableDigest() throws -> String {
         var file = stat()

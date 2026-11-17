@@ -25,6 +25,10 @@ def command_output(*arguments):
     return subprocess.check_output(arguments, stderr=subprocess.STDOUT).decode().strip()
 
 
+def signing_identity():
+    return os.environ.get("CODEX_MULTI_SWITCHER_SIGN_IDENTITY") or "-"
+
+
 def fingerprint(root, build_arguments):
     sdk = os.environ.get("CODEX_PROFILE_SDK") or command_output("xcrun", "--show-sdk-path")
     inputs = {
@@ -35,6 +39,8 @@ def fingerprint(root, build_arguments):
         "sdkSettings": sha256(Path(sdk) / "SDKSettings.json"),
         "developerDirectory": os.environ.get("DEVELOPER_DIR", ""),
         "buildArguments": build_arguments,
+        # A helper signed by another identity is a different Keychain identity.
+        "signingIdentity": signing_identity(),
         "files": {},
     }
     files = list((root / "Sources/CodexProfileCore").rglob("*.swift"))
@@ -105,7 +111,7 @@ def main():
                 binary = staging / BINARY
                 shutil.copyfile(args.built_binary, binary)
                 binary.chmod(0o700)
-                subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", IDENTIFIER,
+                subprocess.run(["codesign", "--force", "--sign", signing_identity(), "--identifier", IDENTIFIER,
                                 str(binary)], check=True)
                 metadata = {"schemaVersion": SCHEMA, "sourceFingerprint": source_fingerprint,
                             "sha256": sha256(binary)}

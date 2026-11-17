@@ -38,6 +38,10 @@ final class ClaudeProfileStore: ObservableObject {
         self.quotaRefreshPolicy = quotaRefreshPolicy ?? ClaudeQuotaRefreshPolicy(root: self.registry.root)
         self.priorQuotaURL = self.registry.defaultDirectory.deletingLastPathComponent()
             .appendingPathComponent("Library/Application Support/Codex Multi Switcher/Claude Usage Helper/usage-observations/claude-default.json")
+        if currentUsageService == nil {
+            let removed = ClaudeUsageHelperClient.bundled().clearStaleAccessBlocks()
+            if removed > 0 { AppLogger.info("Removed stale Claude helper access flags", metadata: ["count": String(removed)]) }
+        }
         do { self.apply(try self.registry.load()) }
         catch {
             self.profiles = [self.registry.defaultProfile]
@@ -142,6 +146,8 @@ final class ClaudeProfileStore: ObservableObject {
             guard let self else { return }
             self.isRefreshing = false
             self.refreshTask = nil
+            let blockedMessage = ClaudeCurrentUsageError.credentialInteractionRequired.localizedDescription
+            ClaudeAccessNotifier.update(blocked: self.statuses.values.contains { $0.error == blockedMessage })
             self.onChange?()
         }
         self.onChange?()

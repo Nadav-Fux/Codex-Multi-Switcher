@@ -27,6 +27,28 @@ if [[ -e "$APP_BUNDLE" ]]; then
   echo "Output already exists; choose a new output path: $APP_BUNDLE" >&2
   exit 1
 fi
+# A stable signing identity keeps Keychain "Always Allow" grants valid across
+# rebuilds; an ad-hoc signature changes on every build and silently voids them.
+# The installed Local build therefore requires the named identity unless the
+# caller opts out explicitly with APP_IDENTITY=- .
+LOCAL_SIGNING_IDENTITY="Codex Multi Switcher Local Signing"
+if [[ "$BUILD_MODE" == local ]]; then
+  SIGN_IDENTITY="${APP_IDENTITY:-$LOCAL_SIGNING_IDENTITY}"
+else
+  SIGN_IDENTITY="${APP_IDENTITY:--}"
+fi
+if [[ "$SIGN_IDENTITY" != "-" ]] \
+    && ! security find-identity -p codesigning | grep -Fq "\"$SIGN_IDENTITY\""; then
+  cat >&2 <<MSG
+ERROR: code-signing identity "$SIGN_IDENTITY" was not found in your keychain.
+Create it once in Keychain Access > Certificate Assistant > Create a Certificate:
+  Name: $SIGN_IDENTITY   Identity Type: Self Signed Root   Certificate Type: Code Signing
+To build with an ad-hoc signature anyway (Keychain grants will not survive), run
+with APP_IDENTITY=- .
+MSG
+  exit 1
+fi
+export CODEX_MULTI_SWITCHER_SIGN_IDENTITY="$SIGN_IDENTITY"
 if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app ]]; then
   export DEVELOPER_DIR=/Applications/Xcode.app
 fi
@@ -88,10 +110,10 @@ cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$STAGED_APP/Contents/Info.plist"
-codesign --force --sign - "$STAGED_APP/Contents/Helpers/codex-profile"
+codesign --force --sign "$SIGN_IDENTITY" "$STAGED_APP/Contents/Helpers/codex-profile"
 # Deliberately omit --deep: the usage helper's signed bytes preserve its grant.
-codesign --force --sign - "$STAGED_APP"
+codesign --force --sign "$SIGN_IDENTITY" "$STAGED_APP"
 codesign --verify --deep --strict "$STAGED_APP"
 mv "$STAGED_APP" "$APP_BUNDLE"
-printf 'Built %s: %s\n' "$BUILD_MODE" "$APP_BUNDLE"
+printf 'Built %s: %s (signed: %s)\n' "$BUILD_MODE" "$APP_BUNDLE" "$SIGN_IDENTITY"
 printf 'Open with: open "%s"\n' "$APP_BUNDLE"
