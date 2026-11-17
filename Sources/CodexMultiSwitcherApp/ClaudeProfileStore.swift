@@ -40,7 +40,7 @@ final class ClaudeProfileStore: ObservableObject {
             .appendingPathComponent("Library/Application Support/Codex Multi Switcher/Claude Usage Helper/usage-observations/claude-default.json")
         if currentUsageService == nil {
             let removed = ClaudeUsageHelperClient.bundled().clearStaleAccessBlocks()
-            if removed > 0 { AppLogger.info("Removed stale Claude helper access flags", metadata: ["count": String(removed)]) }
+            if removed > 0 { CoreLogger.info("Removed stale Claude helper access flags", metadata: ["count": String(removed)]) }
         }
         do { self.apply(try self.registry.load()) }
         catch {

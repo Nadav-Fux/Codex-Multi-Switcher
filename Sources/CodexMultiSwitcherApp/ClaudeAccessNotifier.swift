@@ -1,7 +1,6 @@
-import AppKit
+@preconcurrency import UserNotifications
 import CodexProfileCore
 import Foundation
-import UserNotifications
 
 /// Background Claude refreshes never open a Keychain dialog, so when silent
 /// access is blocked the usage simply stops updating. This raises one clear
@@ -21,7 +20,7 @@ enum ClaudeAccessNotifier {
         guard self.shouldNotify(defaults: defaults, now: now) else { return }
         self.notifiedThisSpell = true
         defaults.set(now, forKey: self.lastNotifiedKey)
-        AppLogger.warning("Claude usage paused: background access needs Connect in Settings")
+        CoreLogger.warning("Claude usage paused: background access needs Connect in Settings")
         // UNUserNotificationCenter traps outside an app bundle (tests, CLI smoke).
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         let center = UNUserNotificationCenter.current()
