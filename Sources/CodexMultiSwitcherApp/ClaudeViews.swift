@@ -302,8 +302,9 @@ private struct ClaudeLimitResetsView: View {
             Text("LIMIT RESETS").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
             let shown = resets.filter { $0.left > 0 || $0.usableNow }
             if shown.isEmpty {
-                Text("No limit resets available right now.")
+                Text("Claude does not report limit resets to Claude Code for this account yet. The Claude app may still list them under Settings › Usage, where they can be used.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(shown) { reset in
                     HStack(spacing: 8) {
