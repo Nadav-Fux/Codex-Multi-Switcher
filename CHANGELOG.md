@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed the menu bar icon freezing on old values while Settings showed current ones: the icon is now redrawn on every change and re-pushed at least every 5 minutes, and each change is logged.
 - Show Claude limit resets (full, weekly, 5-hour and Fable) in Claude settings, read from the same usage block Claude Code's `/limit-reset` uses. Display only: the app never spends a reset.
 - Redesign Claude settings to match the other providers: one status banner (Connected / one-time approval / sign in) with the single action it needs, usage, then new-session controls; directory, reconnect and the statusline recorder move under Advanced. Separate Claude accounts get their usage recorder installed automatically after sign-in unless it was removed on purpose.
 - Note: the stable signature keeps the Claude grant across app rebuilds while the usage helper is unchanged. A change to `CodexProfileCore` or the helper produces a new helper binary, which macOS asks to approve once.
