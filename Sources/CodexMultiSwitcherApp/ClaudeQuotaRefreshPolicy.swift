@@ -31,13 +31,16 @@ actor ClaudeQuotaRefreshPolicy {
         self.lockURL = root.appendingPathComponent("quota-refresh-state.lock")
     }
 
-    func read(identity: String, seed: ClaudeUsageSnapshot? = nil, now: Date = Date(),
+    /// `force` (an explicit Refresh or a just-finished Connect) skips the normal 5-minute
+    /// wait, but never a rate-limit delay the server asked for.
+    func read(identity: String, seed: ClaudeUsageSnapshot? = nil, now: Date = Date(), force: Bool = false,
               fetch: @Sendable () async throws -> ClaudeUsageSnapshot) async -> Observation {
         let reservation: Record
         do {
             let prepared = try CacheLock.withLock(at: self.lockURL) { () -> (Record, Bool) in
                 let existing = try self.load()
-                if let existing, existing.identity == identity, existing.nextRefreshAt > now {
+                if let existing, existing.identity == identity, existing.nextRefreshAt > now,
+                   !force || existing.failure == .rateLimited {
                     return (existing, false)
                 }
                 let sameAccount = existing?.identity == identity

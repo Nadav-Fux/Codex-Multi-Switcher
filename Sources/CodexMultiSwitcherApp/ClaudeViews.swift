@@ -140,7 +140,7 @@ struct ClaudeProfilesTab: View {
                 HStack {
                     Text("Claude Code").font(.system(size: 18, weight: .semibold))
                     Spacer()
-                    Button("Refresh") { store.refresh() }
+                    Button("Refresh") { store.refresh(force: true) }
                         .disabled(store.isRefreshing || store.isAuthorizingCredential)
                 }
                 Toggle("Show in menu bar", isOn: Binding(
@@ -555,7 +555,7 @@ struct ClaudeMenuSectionView: View {
             HStack(spacing: 0) {
                 ProviderSectionHeaderView(title: "Claude Code", isCollapsed: self.isCollapsed, onToggle: self.onToggle)
                 if !self.isCollapsed {
-                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    Button { store.refresh(force: true) } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
                         .frame(width: 32, height: Self.headerHeight)
                         .contentShape(Rectangle())

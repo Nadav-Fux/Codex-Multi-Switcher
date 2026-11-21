@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep Claude usage current without Keychain access: every few minutes the app runs `claude -p /usage` (no model call, 0 tokens; it switches itself off for good if a run ever reports tokens or cost), which makes Claude Code refresh its own usage cache.
+- Connect and Refresh in Claude settings now take effect at once: they skip the 5-minute wait that kept showing the old "needs approval" result (a server rate-limit wait is still honoured), and a Connect clicked during a background refresh runs right after it instead of being dropped. Connect attempts are logged.
 - Read Claude usage from Claude Code's own cache in its config file (`cachedUsageUtilization`, matched to the signed-in account) before asking the Keychain helper. Claude Code rewrites its Keychain login when it renews it, which dropped the helper's access several times a day; while Claude Code is in use the app no longer needs that access.
 - Fixed the menu bar icon freezing on old values while Settings showed current ones: the icon is now redrawn on every change and re-pushed at least every 5 minutes, and each change is logged.
 - Show Claude limit resets (full, weekly, 5-hour and Fable) in Claude settings, read from the same usage block Claude Code's `/limit-reset` uses. Display only: the app never spends a reset.

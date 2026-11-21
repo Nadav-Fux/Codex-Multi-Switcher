@@ -25,6 +25,8 @@ final class ClaudeProfileStore: ObservableObject {
     private let claudeUserHome: URL
     private var refreshTask: Task<Void, Never>?
     private var pendingBridgeOperations: Set<String> = []
+    private var pendingConnectID: String?
+    private var lastCodeUsageRefresh: [String: Date] = [:]
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          bridgeURL: URL? = Bundle.main.url(forResource: "ClaudeStatuslineBridge", withExtension: "py"),
@@ -51,7 +53,9 @@ final class ClaudeProfileStore: ObservableObject {
         }
     }
 
-    func refresh() {
+    /// `force` is for an explicit Refresh click or a finished Connect: it asks Claude Code and
+    /// the helper again right away instead of reusing a recent (possibly failed) observation.
+    func refresh(force: Bool = false) {
         guard !self.isRefreshing, !self.isAuthorizingCredential else { return }
         self.error = nil
         do { self.apply(try self.registry.load()) }
@@ -69,6 +73,18 @@ final class ClaudeProfileStore: ObservableObject {
         let quotaRefreshPolicy = self.quotaRefreshPolicy
         let priorQuotaURL = self.priorQuotaURL
         let userHome = self.claudeUserHome
+        // Ask Claude Code itself to refresh its usage cache (`claude -p /usage`, no model call) at
+        // most every 4 minutes per profile, or 30 seconds apart when the user asked for it.
+        let now = Date()
+        let refreshExecutable = ClaudeCodeUsageRefresher.isEnabled ? cli.discoverExecutable() : nil
+        var codeRefreshDue: Set<String> = []
+        for profile in profiles {
+            let last = self.lastCodeUsageRefresh[profile.id] ?? .distantPast
+            if refreshExecutable != nil, now.timeIntervalSince(last) >= (force ? 30 : 240) {
+                codeRefreshDue.insert(profile.id)
+                self.lastCodeUsageRefresh[profile.id] = now
+            }
+        }
         self.refreshTask = Task { [weak self] in
             // Bound concurrent metadata and usage reads for large profile registries.
             await withTaskGroup(of: (String, ClaudeProfileStatus, Date?).self) { group in
@@ -86,7 +102,14 @@ final class ClaudeProfileStore: ObservableObject {
                         if let warning = usage.warning { status.error = warning }
                         // Claude Code caches its own usage reads in its config file. That needs no
                         // Keychain access, so it keeps working after Claude Code rewrites its login.
-                        let codeCache = ClaudeCodeUsageCache.read(profile: profile, auth: status.auth, userHome: userHome)
+                        var codeCache = ClaudeCodeUsageCache.read(profile: profile, auth: status.auth, userHome: userHome)
+                        let codeCacheIsRecent = codeCache.map { Date().timeIntervalSince($0.observedAt) < 180 } ?? false
+                        if codeRefreshDue.contains(profile.id), !codeCacheIsRecent || force,
+                           let executable = refreshExecutable, status.auth?.accountID != nil,
+                           ClaudeCodeUsageRefresher.run(executable: executable,
+                                                        environment: cli.sanitizedEnvironment(profile: profile)) {
+                            codeCache = ClaudeCodeUsageCache.read(profile: profile, auth: status.auth, userHome: userHome)
+                        }
                         let local = [usage.snapshot, codeCache].compactMap { $0 }
                         let localMatched = local.filter(\.accountMatched)
                         status.usage = (localMatched.isEmpty ? local : localMatched).max { $0.observedAt < $1.observedAt }
@@ -98,7 +121,7 @@ final class ClaudeProfileStore: ObservableObject {
                             do {
                                 let seed = currentUsage.cached(profile: profile, auth: auth)
                                     ?? ClaudeQuotaRefreshPolicy.priorObservation(at: priorQuotaURL, profile: profile, identity: identity)
-                                let observation = await quotaRefreshPolicy.read(identity: identity, seed: seed) {
+                                let observation = await quotaRefreshPolicy.read(identity: identity, seed: seed, force: force) {
                                     try await currentUsage.fetch(profile: profile, authBefore: auth,
                                         authAfter: { try cli.identityMetadata(profile: profile) })
                                 }
@@ -157,6 +180,10 @@ final class ClaudeProfileStore: ObservableObject {
             let blockedMessage = ClaudeCurrentUsageError.credentialInteractionRequired.localizedDescription
             ClaudeAccessNotifier.update(blocked: self.statuses.values.contains { $0.error == blockedMessage })
             self.onChange?()
+            if let id = self.pendingConnectID {
+                self.pendingConnectID = nil
+                self.connectNativeAccount(id: id)
+            }
         }
         self.onChange?()
     }
@@ -197,8 +224,17 @@ final class ClaudeProfileStore: ObservableObject {
     /// The click authorizes only an existing native Claude credential read.
     /// Run Security off the main actor so the macOS consent dialog stays usable.
     func connectNativeAccount(id: String) {
-        guard !self.isRefreshing, !self.isAuthorizingCredential,
+        guard !self.isAuthorizingCredential,
               let profile = self.profile(id), self.currentUsage.supports(profile) else { return }
+        // A click during a background refresh used to be dropped silently. Run it right after.
+        if self.isRefreshing {
+            self.pendingConnectID = id
+            self.statuses[id]?.busy = true
+            self.onChange?()
+            CoreLogger.info("Claude Connect queued until the current refresh ends", metadata: [:])
+            return
+        }
+        CoreLogger.info("Claude Connect started", metadata: [:])
         self.error = nil
         self.isAuthorizingCredential = true
         self.statuses[id]?.busy = true
@@ -210,12 +246,15 @@ final class ClaudeProfileStore: ObservableObject {
                     try currentUsage.authorizeNativeCredentialAccess(profile: profile)
                 }.value
                 guard let self else { return }
+                CoreLogger.info("Claude Connect succeeded", metadata: [:])
                 self.isAuthorizingCredential = false
                 self.statuses[id]?.busy = false
                 self.statuses[id]?.error = nil
-                self.refresh()
+                self.refresh(force: true)
             } catch {
                 guard let self else { return }
+                let category = (error as? ClaudeCurrentUsageError).map { String(describing: $0) } ?? "other"
+                CoreLogger.warning("Claude Connect failed", metadata: ["category": category])
                 self.isAuthorizingCredential = false
                 self.statuses[id]?.busy = false
                 self.statuses[id]?.error = error.localizedDescription
@@ -415,5 +454,62 @@ enum ClaudeCodeUsageCache {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+    }
+}
+
+/// Runs `claude -p /usage`: Claude Code reads its own login, asks the server for usage and
+/// rewrites `cachedUsageUtilization`. It makes no model call. If a run ever reports turns,
+/// tokens or cost, the refresher turns itself off for good and logs why.
+enum ClaudeCodeUsageRefresher {
+    private static let disabledKey = "claudeCodeUsageRefreshDisabled"
+    static var isEnabled: Bool { !UserDefaults.standard.bool(forKey: Self.disabledKey) }
+
+    static func run(executable: URL, environment: [String: String], timeout: TimeInterval = 45) -> Bool {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory.appendingPathComponent("claude-usage-refresh-" + UUID().uuidString)
+        guard (try? fileManager.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])) != nil else { return false }
+        defer { try? fileManager.removeItem(at: directory) }
+        let output = directory.appendingPathComponent("out.json")
+        guard fileManager.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]),
+              let handle = try? FileHandle(forWritingTo: output) else { return false }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["-p", "/usage", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config", "--setting-sources", "project"]
+        process.currentDirectoryURL = directory
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = handle
+        process.standardError = FileHandle.nullDevice
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        do { try process.run() } catch {
+            try? handle.close()
+            CoreLogger.warning("Claude usage refresh could not start", metadata: [:])
+            return false
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = done.wait(timeout: .now() + 5)
+            try? handle.close()
+            CoreLogger.warning("Claude usage refresh timed out", metadata: [:])
+            return false
+        }
+        try? handle.close()
+        guard process.terminationStatus == 0,
+              let data = try? Data(contentsOf: output), data.count <= 262_144,
+              let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            CoreLogger.warning("Claude usage refresh failed", metadata: ["status": String(process.terminationStatus)])
+            return false
+        }
+        let usage = result["usage"] as? [String: Any] ?? [:]
+        let spent = [result["num_turns"], result["total_cost_usd"], usage["input_tokens"], usage["output_tokens"]]
+            .map { ($0 as? NSNumber)?.doubleValue ?? 0 }
+        guard spent.allSatisfy({ $0 == 0 }) else {
+            UserDefaults.standard.set(true, forKey: Self.disabledKey)
+            CoreLogger.warning("Claude usage refresh used model tokens and is now off", metadata: [:])
+            return false
+        }
+        return result["is_error"] as? Bool != true
     }
 }

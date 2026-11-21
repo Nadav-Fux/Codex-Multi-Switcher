@@ -93,10 +93,30 @@ enum ClaudeCurrentUsageChecks {
         }
         try check(await rateCalls.count == 2 && second429.nextRefreshAt.timeIntervalSince(fixed) == 1801,
             "A repeated 429 doubles the next wait")
+        let forcedRateLimit = await restartedPolicy.read(identity: "account-a", now: fixed.addingTimeInterval(700), force: true) {
+            await rateCalls.record(); return lastKnown
+        }
+        try check(await rateCalls.count == 2 && forcedRateLimit.failure == .rateLimited, "A forced refresh still honours a rate-limit wait")
         let anotherAccount = await restartedPolicy.read(identity: "account-b", now: fixed.addingTimeInterval(602)) {
             throw ClaudeCurrentUsageError.credentialRejected
         }
         try check(anotherAccount.snapshot == nil, "Historical quota cannot leak to another account")
+        let connectRoot = root.appendingPathComponent("connect-polling")
+        let connectCalls = PollCalls()
+        let connectPolicy = ClaudeQuotaRefreshPolicy(root: connectRoot)
+        _ = await connectPolicy.read(identity: "account-a", now: fixed) {
+            await connectCalls.record(); throw ClaudeCurrentUsageError.credentialInteractionRequired
+        }
+        let unforced = await connectPolicy.read(identity: "account-a", now: fixed.addingTimeInterval(30)) {
+            await connectCalls.record(); return lastKnown
+        }
+        try check(await connectCalls.count == 1 && unforced.failure == .credentialInteractionRequired,
+            "A background refresh reuses the recent blocked result")
+        let forced = await connectPolicy.read(identity: "account-a", now: fixed.addingTimeInterval(31), force: true) {
+            await connectCalls.record(); return lastKnown
+        }
+        try check(await connectCalls.count == 2 && forced.failure == nil && forced.snapshot != nil,
+            "After Connect a forced refresh asks again instead of showing the old block")
         let normalRoot = root.appendingPathComponent("normal-polling")
         let normalCalls = PollCalls()
         let normalPolicy = ClaudeQuotaRefreshPolicy(root: normalRoot)
