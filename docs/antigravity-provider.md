@@ -1,6 +1,16 @@
 # Antigravity quota provider
 
-The provider calls Google's read-only quota-summary API through the user's existing `antigravity-usage` statusline helper connection. It does not launch `agy`, read or write Keychain items, open a browser, or execute statusline hooks. The earlier temporary-HOME CLI reader was removed: an expired CLI token could make its credential-store subprocess look for a nonexistent default Keychain.
+## IDE source
+
+While Antigravity IDE is running, the app reads its local language-server quota service, the same source used by Models & Usage. It discovers only the exact installed IDE server executable and its own loopback listening ports. The per-process CSRF value stays in memory and is sent only to that loopback server. No browser, Keychain call, agent turn, model request, or OAuth refresh is performed.
+
+`GetUserStatus` is checked before and after `RetrieveUserQuotaSummary`. A changed account, changed server connection, malformed percentages, duplicate windows, or unsupported reset date discards that result. The local transport refuses redirects and bounds process waits, network timeouts, and accepted response sizes. Quota percentages and reset times are retained exactly as returned.
+
+The direct Google quota-summary endpoint can return only the `3p` partner-model groups even for an account whose IDE reports Gemini usage. The local IDE service supplies both groups. If the IDE is closed, the previous helper-backed reader remains available and the UI explicitly labels missing Gemini data. A partner-model reading of 100 percent must never imply unused Gemini quota.
+
+## CLI helper fallback
+
+The fallback provider calls Google's read-only quota-summary API through the user's existing `antigravity-usage` statusline helper connection. It does not launch `agy`, read or write Keychain items, open a browser, or execute statusline hooks. The earlier temporary-HOME CLI reader was removed: an expired CLI token could make its credential-store subprocess look for a nonexistent default Keychain.
 
 The reader requires the helper's active account to match the email in Antigravity's locally cached CLI ID token. It reads only the matching helper account's owner-owned, regular, private (`0600`) token file. Google userinfo must independently verify that the bearer belongs to the same subject and verified email. The active account, local CLI identity, and credential fingerprint are checked again before publishing any quota. Token contents and emails are not returned or logged.
 

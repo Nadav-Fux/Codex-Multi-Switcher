@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var claudeMenuImage: NSImage?
     private var codexMenuTooltip = "Codex — usage unavailable"
     private var claudeMenuTooltip = "Claude Code — usage unavailable"
+    private var lastMenuBarSignature: String?
+    private var lastMenuBarImageSetAt: Date?
+    private var lastLoggedMenuBarSummary: String?
+    private var didLogMissingMenuBarButton = false
     private var claudeStore: ClaudeProfileStore!
     private var claudeRefreshTimer: Timer?
     private var externalStore: ExternalProviderStore!
@@ -543,6 +547,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateCombinedIcon() {
         guard self.statusItem != nil else { return }
+        guard let button = self.statusItem.button else {
+            if !self.didLogMissingMenuBarButton {
+                self.didLogMissingMenuBarButton = true
+                AppLogger.error("Menu bar button unavailable", metadata: [:])
+            }
+            return
+        }
         let providers = ProviderVisibility.selection()
         let selected = providers.map { provider -> (NSImage, String) in
             switch provider {
@@ -554,8 +565,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     snapshot: self.externalStore?.snapshots[provider]), provider.displayName)
             }
         }
-        self.statusItem.button?.image = MenuBarCompositeRenderer.render(selected: selected)
-        self.statusItem.button?.toolTip = providers.map { provider in
+        let image = MenuBarCompositeRenderer.render(selected: selected)
+        let tooltip = providers.map { provider in
             switch provider {
             case .codex: return self.codexMenuTooltip
             case .claude: return self.claudeMenuTooltip
@@ -566,6 +577,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     + (snapshot?.account?.displayName.map { " · " + $0 } ?? "")
             }
         }.joined(separator: "\n")
+        let summary = image.accessibilityDescription ?? ""
+        let signature = "\(summary)|\(image.size.width)x\(image.size.height)|\(tooltip)"
+        let now = Date()
+        if signature == self.lastMenuBarSignature,
+            let lastSetAt = self.lastMenuBarImageSetAt,
+            now.timeIntervalSince(lastSetAt) < 300 {
+            return
+        }
+        button.image = image
+        button.toolTip = tooltip
+        button.needsDisplay = true
+        button.invalidateIntrinsicContentSize()
+        if summary != self.lastLoggedMenuBarSummary {
+            self.lastLoggedMenuBarSummary = summary
+            AppLogger.info("Menu bar icon updated", metadata: ["summary": String(summary.prefix(200))])
+        }
+        self.lastMenuBarSignature = signature
+        self.lastMenuBarImageSetAt = now
     }
 
     // MARK: - Menu Construction
