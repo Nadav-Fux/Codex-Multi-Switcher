@@ -25,6 +25,39 @@ struct ClaudeIntegrationSmoke {
         let root = fm.temporaryDirectory.appendingPathComponent("claude-integration-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: root) }
         try AtomicFileWriter.ensurePrivateDirectory(root)
+        do {
+            // Claude Code's own usage cache: read without Keychain, only for the matching account.
+            let cacheHome = root.appendingPathComponent("code-cache-home", isDirectory: true)
+            try AtomicFileWriter.ensurePrivateDirectory(cacheHome)
+            let profile = ClaudeProfile(id: "default", label: "Existing Claude",
+                                        configDirectory: cacheHome.appendingPathComponent(".claude").path, isDefault: true)
+            let owner = ClaudeAuthInfo(loggedIn: nil, email: "owner@example.test", accountID: "acct-owner")
+            func writeCache(fetchedAt: Date) throws {
+                try writeJSON(["oauthAccount": ["accountUuid": "acct-owner"],
+                               "cachedUsageUtilization": [
+                                   "fetchedAtMs": fetchedAt.timeIntervalSince1970 * 1000, "accountUuid": "acct-owner",
+                                   "utilization": [
+                                       "five_hour": ["utilization": 28, "resets_at": "2026-11-21T20:29:59.505352+00:00"],
+                                       "seven_day": ["utilization": 23, "resets_at": "2026-11-26T15:59:59.505372+00:00"],
+                                       "seven_day_opus": NSNull(), "cedar_ember": NSNull()]]],
+                              cacheHome.appendingPathComponent(".claude.json"))
+            }
+            let now = Date()
+            try writeCache(fetchedAt: now)
+            let fresh = ClaudeCodeUsageCache.read(profile: profile, auth: owner, userHome: cacheHome, now: now)
+            try require(fresh?.fiveHour?.usedPercentage == 28 && fresh?.sevenDay?.usedPercentage == 23,
+                        "Claude Code cache should supply both windows")
+            try require(fresh?.fiveHour?.resetsAt != nil && fresh?.sevenDay?.resetsAt != nil,
+                        "Claude Code cache reset times should parse")
+            try require(fresh?.source == .oauthUsage && fresh?.isStale == false && fresh?.accountMatched == true,
+                        "A fresh Claude Code cache should be current, matched usage")
+            let stranger = ClaudeAuthInfo(loggedIn: nil, email: "other@example.test", accountID: "acct-other")
+            try require(ClaudeCodeUsageCache.read(profile: profile, auth: stranger, userHome: cacheHome, now: now) == nil,
+                        "Claude Code cache must not be shown for another account")
+            try writeCache(fetchedAt: now.addingTimeInterval(-1_200))
+            try require(ClaudeCodeUsageCache.read(profile: profile, auth: owner, userHome: cacheHome, now: now)?.isStale == true,
+                        "A 20-minute-old Claude Code cache should be stale")
+        }
         let dedicatedHome = root.appendingPathComponent("claude-user", isDirectory: true)
         try AtomicFileWriter.ensurePrivateDirectory(dedicatedHome)
         let bin = root.appendingPathComponent("bin", isDirectory: true)

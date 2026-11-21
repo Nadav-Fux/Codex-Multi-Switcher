@@ -22,6 +22,7 @@ final class ClaudeProfileStore: ObservableObject {
     private let currentUsage: ClaudeCurrentUsageService
     private let quotaRefreshPolicy: ClaudeQuotaRefreshPolicy
     private let priorQuotaURL: URL
+    private let claudeUserHome: URL
     private var refreshTask: Task<Void, Never>?
     private var pendingBridgeOperations: Set<String> = []
 
@@ -31,7 +32,8 @@ final class ClaudeProfileStore: ObservableObject {
          quotaRefreshPolicy: ClaudeQuotaRefreshPolicy? = nil) {
         let paths = AppPaths(environment: environment)
         self.registry = ClaudeProfileRegistry(paths: paths)
-        self.cli = ClaudeCLIService(environment: environment, userHome: self.registry.defaultDirectory.deletingLastPathComponent())
+        self.claudeUserHome = self.registry.defaultDirectory.deletingLastPathComponent()
+        self.cli = ClaudeCLIService(environment: environment, userHome: self.claudeUserHome)
         self.installer = ClaudeBridgeInstaller(root: self.registry.root, bridgeURL: bridgeURL)
         self.scriptsRoot = self.registry.root.appendingPathComponent("launchers", isDirectory: true)
         self.currentUsage = currentUsageService ?? ClaudeCurrentUsageService(root: self.registry.root, helper: ClaudeUsageHelperClient.bundled())
@@ -66,6 +68,7 @@ final class ClaudeProfileStore: ObservableObject {
         let currentUsage = self.currentUsage
         let quotaRefreshPolicy = self.quotaRefreshPolicy
         let priorQuotaURL = self.priorQuotaURL
+        let userHome = self.claudeUserHome
         self.refreshTask = Task { [weak self] in
             // Bound concurrent metadata and usage reads for large profile registries.
             await withTaskGroup(of: (String, ClaudeProfileStatus, Date?).self) { group in
@@ -80,15 +83,18 @@ final class ClaudeProfileStore: ObservableObject {
                             CoreLogger.warning("Claude quota unavailable", metadata: ["category": "auth_status_unavailable"])
                         }
                         let usage = ClaudeUsageReader.read(profile: profile, auth: status.auth)
-                        status.usage = usage.snapshot
                         if let warning = usage.warning { status.error = warning }
-                        // Prefer recent native session observations. Only poll the API
-                        // when the account-matched bridge cannot supply current usage.
-                        let freshBridge = status.usage.map {
-                            $0.source == .nativeBridge && $0.accountMatched && !$0.isStale
-                        } ?? false
+                        // Claude Code caches its own usage reads in its config file. That needs no
+                        // Keychain access, so it keeps working after Claude Code rewrites its login.
+                        let codeCache = ClaudeCodeUsageCache.read(profile: profile, auth: status.auth, userHome: userHome)
+                        let local = [usage.snapshot, codeCache].compactMap { $0 }
+                        let localMatched = local.filter(\.accountMatched)
+                        status.usage = (localMatched.isEmpty ? local : localMatched).max { $0.observedAt < $1.observedAt }
+                        // Prefer recent local observations. Only poll the API when neither the
+                        // account-matched bridge nor Claude Code's cache supplies current usage.
+                        let freshLocal = status.usage.map { $0.accountMatched && !$0.isStale } ?? false
                         if currentUsage.supports(profile), let auth = status.auth,
-                           let identity = ClaudeUsageReader.accountFingerprint(auth), !freshBridge {
+                           let identity = ClaudeUsageReader.accountFingerprint(auth), !freshLocal {
                             do {
                                 let seed = currentUsage.cached(profile: profile, auth: auth)
                                     ?? ClaudeQuotaRefreshPolicy.priorObservation(at: priorQuotaURL, profile: profile, identity: identity)
@@ -118,7 +124,8 @@ final class ClaudeProfileStore: ObservableObject {
                                         status.auth = after
                                         let bridge = ClaudeUsageReader.read(profile: profile, auth: after).snapshot
                                         let cached = currentUsage.cached(profile: profile, auth: after)
-                                        let observations = [cached, bridge].compactMap { $0 }
+                                        let codeCache = ClaudeCodeUsageCache.read(profile: profile, auth: after, userHome: userHome)
+                                        let observations = [cached, bridge, codeCache].compactMap { $0 }
                                         let matched = observations.filter(\.accountMatched)
                                         status.usage = (matched.isEmpty ? observations : matched).max { $0.observedAt < $1.observedAt }
                                     } else {
@@ -345,4 +352,68 @@ enum ClaudeConnectionState: Equatable {
     case problem(String)
 
     var isHealthy: Bool { if case .connected = self { return true } else { return false } }
+}
+
+/// Reads the usage Claude Code itself caches in its config file (`cachedUsageUtilization`).
+/// Only that block and its account id are used; nothing else in the file is read or logged.
+enum ClaudeCodeUsageCache {
+    /// Claude Code rewrites this cache every few minutes while it is in use, not on a fixed
+    /// timer, so allow longer than the helper's 5 minutes before treating it as old.
+    static let staleAfter: TimeInterval = 900
+
+    static func read(profile: ClaudeProfile, auth: ClaudeAuthInfo?, userHome: URL,
+                     now: Date = Date(), fileManager: FileManager = .default) -> ClaudeUsageSnapshot? {
+        guard let accountID = auth?.accountID, !accountID.isEmpty else { return nil }
+        let url: URL
+        if profile.isDefault {
+            url = userHome.appendingPathComponent(".claude.json")
+        } else {
+            let directory = URL(fileURLWithPath: profile.configDirectory, isDirectory: true)
+            let legacy = directory.appendingPathComponent(".config.json")
+            url = fileManager.fileExists(atPath: legacy.path) ? legacy : directory.appendingPathComponent(".claude.json")
+        }
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 16_777_216,
+              let data = try? Data(contentsOf: url),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cache = document["cachedUsageUtilization"] as? [String: Any],
+              cache["accountUuid"] as? String == accountID,
+              let fetchedMs = Self.number(cache["fetchedAtMs"]),
+              let utilization = cache["utilization"] as? [String: Any] else { return nil }
+        let observedAt = Date(timeIntervalSince1970: fetchedMs / 1000)
+        let age = now.timeIntervalSince(observedAt)
+        guard age >= -60, age <= 86_400 else { return nil }
+        let five = Self.window(utilization["five_hour"])
+        let seven = Self.window(utilization["seven_day"])
+        guard five != nil || seven != nil else { return nil }
+        return ClaudeUsageSnapshot(
+            fiveHour: five, sevenDay: seven, modelWeekly: Self.window(utilization["seven_day_opus"]),
+            observedAt: observedAt, source: .oauthUsage,
+            isStale: age > Self.staleAfter, accountVerified: true,
+            resets: ClaudeLimitReset.parse(utilization["cedar_ember"]))
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite else { return nil }
+        return number.doubleValue
+    }
+
+    private static func window(_ value: Any?) -> ClaudeUsageWindow? {
+        guard let window = value as? [String: Any], let used = Self.number(window["utilization"]),
+              (0...100).contains(used) else { return nil }
+        return ClaudeUsageWindow(usedPercentage: used, resetsAt: Self.date(window["resets_at"]))
+    }
+
+    static func date(_ value: Any?) -> Date? {
+        guard var text = value as? String else { return nil }
+        // Claude Code writes microseconds; ISO8601DateFormatter accepts at most milliseconds.
+        if let dot = text.firstIndex(of: "."),
+           let end = text[dot...].firstIndex(where: { !$0.isNumber && $0 != "." }) {
+            let digits = text[text.index(after: dot)..<end]
+            if digits.count > 3 { text.replaceSubrange(text.index(dot, offsetBy: 4)..<end, with: "") }
+        }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+    }
 }
