@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Antigravity quota works again with the standalone Antigravity app: its local server no longer exposes a connection token, and the CLI ID-token file is gone, so the account is matched by the signed-in email in the app's storage and confirmed with Google. Quota is read from the same endpoint Antigravity uses (`daily-cloudcode-pa`), which reports the real weekly Claude/GPT usage.
 - Keep Claude usage current without Keychain access: every few minutes the app runs `claude -p /usage` (no model call, 0 tokens; it switches itself off for good if a run ever reports tokens or cost), which makes Claude Code refresh its own usage cache.
 - Connect and Refresh in Claude settings now take effect at once: they skip the 5-minute wait that kept showing the old "needs approval" result (a server rate-limit wait is still honoured), and a Connect clicked during a background refresh runs right after it instead of being dropped. Connect attempts are logged.
 - Read Claude usage from Claude Code's own cache in its config file (`cachedUsageUtilization`, matched to the signed-in account) before asking the Keychain helper. Claude Code rewrites its Keychain login when it renews it, which dropped the helper's access several times a day; while Claude Code is in use the app no longer needs that access.
