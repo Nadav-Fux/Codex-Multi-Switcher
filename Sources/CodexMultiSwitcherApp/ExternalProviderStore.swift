@@ -79,6 +79,14 @@ enum ProviderQuotaPresentation {
     static func selectedBuckets(_ snapshot: ProviderUsageSnapshot?) -> [ProviderUsageBucket] {
         guard let snapshot else { return [] }
         if snapshot.provider == .antigravity {
+            // Default: every window, ordered Gemini weekly/5h then other weekly/5h, drawn as
+            // two columns. Turning it off keeps the older one-window-per-group display.
+            if UserDefaults.standard.object(forKey: "antigravityMenuShowsAll") as? Bool ?? true {
+                func order(_ bucket: ProviderUsageBucket) -> Int {
+                    (bucket.group == .gemini ? 0 : 2) + (bucket.title.lowercased().contains("week") ? 0 : 1)
+                }
+                return snapshot.buckets.sorted { order($0) < order($1) }
+            }
             return [ProviderUsageBucketGroup.gemini, .other].compactMap { group in
                 let candidates = snapshot.buckets.filter { $0.group == group }
                 let selectedID = UserDefaults.standard.string(forKey: "antigravityMenuBucket.\(group.rawValue)")

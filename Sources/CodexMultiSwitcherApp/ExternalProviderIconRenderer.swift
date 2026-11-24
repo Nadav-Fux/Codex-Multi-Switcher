@@ -32,7 +32,12 @@ enum ExternalProviderIconRenderer {
         let labelWidth = rows.map { $0.1.size().width }.max() ?? 0
         let logo = provider == .antigravity ? antigravityLogo : nil
         let prefixWidth = logo != nil ? CGFloat(26) : identifier.size().width + 5
-        let size = NSSize(width: ceil(prefixWidth + numberWidth + labelWidth + 5), height: 23)
+        // Two rows per column; three or four windows spill into a second column.
+        let columnWidth = numberWidth + 3 + labelWidth
+        let columnGap: CGFloat = 6
+        let columns = max(1, (rows.count + 1) / 2)
+        let size = NSSize(width: ceil(prefixWidth + CGFloat(columns) * columnWidth
+                                      + CGFloat(columns - 1) * columnGap + 2), height: 23)
         let image = NSImage(size: size, flipped: true) { _ in
             if let logo {
                 logo.draw(in: NSRect(x: 0, y: 0, width: 23, height: 23), from: .zero,
@@ -48,9 +53,10 @@ enum ExternalProviderIconRenderer {
             }
             for (index, row) in rows.enumerated() {
                 let rowHeight: CGFloat = rows.count == 1 ? 23 : 11.5
-                let y = CGFloat(index) * rowHeight
-                row.0.draw(at: NSPoint(x: prefixWidth + numberWidth - row.0.size().width, y: y + (rowHeight - row.0.size().height) / 2))
-                row.1.draw(at: NSPoint(x: prefixWidth + numberWidth + 3, y: y + (rowHeight - row.1.size().height) / 2))
+                let y = CGFloat(index % 2) * rowHeight
+                let x = prefixWidth + CGFloat(index / 2) * (columnWidth + columnGap)
+                row.0.draw(at: NSPoint(x: x + numberWidth - row.0.size().width, y: y + (rowHeight - row.0.size().height) / 2))
+                row.1.draw(at: NSPoint(x: x + numberWidth + 3, y: y + (rowHeight - row.1.size().height) / 2))
             }
             return true
         }

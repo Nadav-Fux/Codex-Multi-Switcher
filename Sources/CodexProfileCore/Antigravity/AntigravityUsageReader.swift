@@ -150,13 +150,21 @@ public struct AntigravityUsageReader: Sendable {
                           expiresAt: Date(timeIntervalSince1970: expiry.doubleValue / 1000), digest: digest(data))
     }
 
+    private static let userAgent: String = {
+        let info = Bundle(url: URL(fileURLWithPath: "/Applications/Antigravity.app"))?.infoDictionary
+        let raw = info?["CFBundleShortVersionString"] as? String ?? ""
+        let version = raw.range(of: #"^[0-9]+(\.[0-9]+){1,3}$"#, options: .regularExpression) != nil ? raw : "2.34.0"
+        return "antigravity/\(version) darwin/arm64"
+    }()
+
     private static func request(url: String, accessToken: String, session: URLSession,
                                 post: Bool = false) async throws -> Data {
         var request = URLRequest(url: URL(string: url)!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
         request.httpMethod = post ? "POST" : "GET"
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+        // Google returns the Gemini group only to a versioned Antigravity client.
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         if post {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = Data("{}".utf8)
