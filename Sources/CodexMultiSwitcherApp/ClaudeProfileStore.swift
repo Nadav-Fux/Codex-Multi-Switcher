@@ -123,7 +123,7 @@ final class ClaudeProfileStore: ObservableObject {
                                     ?? ClaudeQuotaRefreshPolicy.priorObservation(at: priorQuotaURL, profile: profile, identity: identity)
                                 let observation = await quotaRefreshPolicy.read(identity: identity, seed: seed, force: force) {
                                     try await currentUsage.fetch(profile: profile, authBefore: auth,
-                                        authAfter: { try cli.identityMetadata(profile: profile) })
+                                        authAfter: { try cli.identityMetadata(profile: profile) }, force: force)
                                 }
                                 guard ClaudeUsageReader.accountFingerprint(try cli.identityMetadata(profile: profile)) == identity else {
                                     throw ClaudeCurrentUsageError.accountChanged
@@ -209,6 +209,11 @@ final class ClaudeProfileStore: ObservableObject {
         if status?.busy == true, status?.usage == nil { return .checking }
         if status == nil { return .checking }
         if self.currentUsage.supports(profile) {
+            // `loggedIn` is nil (unknown), not false, when no account metadata
+            // exists — a never-signed-in default profile must still offer the
+            // Sign In action instead of reporting Connected.
+            let hasAccountMetadata = status?.auth?.email != nil || status?.auth?.accountID != nil
+            if !hasAccountMetadata, status?.usage == nil { return .needsSignIn }
             if let error = status?.error, status?.usage == nil { return .problem(error) }
             return .connected("Usage updates automatically in the background.")
         }

@@ -26,6 +26,44 @@ public enum AtomicFileWriter {
         }
     }
 
+    /// Same write as `write`, but committed only when the destination still
+    /// holds `expected`. The temp file is created and fsynced FIRST, then the
+    /// destination is re-read and compared, then the rename happens
+    /// immediately — nothing else runs between the compare and the rename, so
+    /// a concurrent external write is caught everywhere except the rename
+    /// itself. Returns false (and deletes the temp file) when the destination
+    /// changed. `beforeCommit` is a test seam that runs after the temp file is
+    /// prepared and before the final compare.
+    @discardableResult
+    public static func writeIfUnchanged(
+        _ data: Data,
+        to destination: URL,
+        expected: Data,
+        beforeCommit: (() -> Void)? = nil,
+        fileManager: FileManager = .default
+    ) throws -> Bool {
+        try self.ensurePrivateDirectory(destination.deletingLastPathComponent(), fileManager: fileManager)
+        let temp = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).tmp-\(UUID().uuidString)")
+        try self.createFilePrivately(at: temp, contents: data)
+        beforeCommit?()
+        guard (try? Data(contentsOf: destination)) == expected else {
+            try? fileManager.removeItem(at: temp)
+            return false
+        }
+        do {
+            if fileManager.fileExists(atPath: destination.path) {
+                _ = try fileManager.replaceItemAt(destination, withItemAt: temp)
+            } else {
+                try fileManager.moveItem(at: temp, to: destination)
+            }
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            throw error
+        }
+        return true
+    }
+
     /// Creates `url` at mode 0600 from the moment it exists, instead of writing
     /// with the process's default permissions (0644 under a typical umask) and
     /// narrowing afterward. A crash between those two steps would otherwise

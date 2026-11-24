@@ -34,21 +34,30 @@ struct StaleAuthHealerTests {
     }
 
     /// `expiresIn` is relative to `now`; `refreshedAgo` sets `last_refresh`.
+    /// `user: nil` writes a workspace-only blob without an `id_token`;
+    /// `idTokenClaims` overrides the id_token payload entirely (e.g. an
+    /// email-only token).
     private func auth(
         account: String = "account-a",
-        user: String = "user-1",
+        user: String? = "user-1",
+        idTokenClaims: [String: Any]? = nil,
         chain: String,
         expiresIn: TimeInterval,
         refreshedAgo: TimeInterval?
     ) -> Data {
+        var tokens: [String: Any] = [
+            "access_token": self.jwt(["exp": self.now.addingTimeInterval(expiresIn).timeIntervalSince1970]),
+            "refresh_token": "refresh-\(chain)",
+            "account_id": account,
+        ]
+        if let idTokenClaims {
+            tokens["id_token"] = self.jwt(idTokenClaims)
+        } else if let user {
+            tokens["id_token"] = self.jwt(["sub": user])
+        }
         var json: [String: Any] = [
             "auth_mode": "chatgpt",
-            "tokens": [
-                "access_token": self.jwt(["exp": self.now.addingTimeInterval(expiresIn).timeIntervalSince1970]),
-                "refresh_token": "refresh-\(chain)",
-                "id_token": self.jwt(["sub": user]),
-                "account_id": account,
-            ],
+            "tokens": tokens,
         ]
         if let refreshedAgo {
             let formatter = ISO8601DateFormatter()
@@ -138,6 +147,57 @@ struct StaleAuthHealerTests {
         let teammate = self.auth(user: "user-2", chain: "new", expiresIn: self.day, refreshedAgo: self.day)
         #expect(StaleAuthHealer.bestReplacement(
             for: stale, candidates: [.init(source: .liveAuth, data: teammate)], now: self.now) == nil)
+    }
+
+    @Test
+    func workspaceOnlyProfileNeverAdoptsAnotherMembersLogin() {
+        // A blob saved without an id_token carries only the shared workspace
+        // account_id: it can never prove a candidate belongs to the same
+        // member, so it adopts nothing — not even a userless copy.
+        let stale = self.auth(user: nil, chain: "old", expiresIn: -self.day, refreshedAgo: 11 * self.day)
+        let teammate = self.auth(user: "user-2", chain: "new", expiresIn: self.day, refreshedAgo: self.day)
+        let userlessCopy = self.auth(user: nil, chain: "newest", expiresIn: self.day, refreshedAgo: self.day)
+        #expect(StaleAuthHealer.bestReplacement(for: stale, candidates: [
+            .init(source: .liveAuth, data: teammate),
+            .init(source: .profile("2"), data: userlessCopy),
+        ], now: self.now) == nil)
+    }
+
+    @Test
+    func emailOnlyProfileAdoptsSameEmailLoginThatGainedASub() {
+        // An id_token saved before `sub` existed carries only `email`; a newer
+        // login with the same email plus `sub` is still the same member.
+        let stale = self.auth(idTokenClaims: ["email": "alice@example.test"],
+                              chain: "old", expiresIn: -self.day, refreshedAgo: 11 * self.day)
+        let sameUser = self.auth(idTokenClaims: ["email": "alice@example.test", "sub": "user-1"],
+                                 chain: "new", expiresIn: self.day, refreshedAgo: self.day)
+        let picked = StaleAuthHealer.bestReplacement(
+            for: stale, candidates: [.init(source: .liveAuth, data: sameUser)], now: self.now)
+        #expect(picked?.source == .liveAuth)
+        #expect(picked?.data == sameUser)
+    }
+
+    @Test
+    func emailOnlyProfileNeverAdoptsADifferentEmailLogin() {
+        let stale = self.auth(idTokenClaims: ["email": "alice@example.test"],
+                              chain: "old", expiresIn: -self.day, refreshedAgo: 11 * self.day)
+        let otherUser = self.auth(idTokenClaims: ["email": "bob@example.test", "sub": "user-2"],
+                                  chain: "new", expiresIn: self.day, refreshedAgo: self.day)
+        #expect(StaleAuthHealer.bestReplacement(
+            for: stale, candidates: [.init(source: .liveAuth, data: otherUser)], now: self.now) == nil)
+    }
+
+    @Test
+    func sameUserCandidateInSharedWorkspaceStillHeals() {
+        let stale = self.auth(user: "user-1", chain: "old", expiresIn: -self.day, refreshedAgo: 11 * self.day)
+        let teammate = self.auth(user: "user-2", chain: "newest", expiresIn: self.day, refreshedAgo: self.day)
+        let sameUser = self.auth(user: "user-1", chain: "new", expiresIn: self.day, refreshedAgo: 2 * self.day)
+        let picked = StaleAuthHealer.bestReplacement(for: stale, candidates: [
+            .init(source: .liveAuth, data: teammate),
+            .init(source: .profile("2"), data: sameUser),
+        ], now: self.now)
+        #expect(picked?.source == .profile("2"))
+        #expect(picked?.data == sameUser)
     }
 
     @Test

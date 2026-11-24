@@ -30,15 +30,18 @@ enum ClaudeCurrentUsageChecks {
         let fail: Bool
         let invalid: Bool
         let rejected: Bool
-        init(mismatch: Bool = false, fail: Bool = false, invalid: Bool = false, rejected: Bool = false) {
+        let rateLimited: Bool
+        init(mismatch: Bool = false, fail: Bool = false, invalid: Bool = false, rejected: Bool = false,
+             rateLimited: Bool = false) {
             self.mismatch = mismatch; self.fail = fail; self.invalid = invalid
-            self.rejected = rejected
+            self.rejected = rejected; self.rateLimited = rateLimited
         }
         func get(path: String, accessToken: String) async throws -> Data {
             self.record()
             try check(accessToken.hasPrefix("fake-"), "Only fake credentials reach fake transport")
             if self.fail { throw ClaudeCurrentUsageError.requestFailed }
             if self.rejected { throw ClaudeCurrentUsageError.credentialRejected }
+            if self.rateLimited { throw ClaudeCurrentUsageError.rateLimited }
             if path == "profile" {
                 return try JSONSerialization.data(withJSONObject: [
                     "account": ["uuid": "acct-fixture", "email": self.mismatch ? "other@example.test" : "fixture@example.test"],
@@ -234,6 +237,29 @@ enum ClaudeCurrentUsageChecks {
             } catch ClaudeCurrentUsageError.credentialRejected {}
         }
         try check(rejectedTransport.calls == 1, "Backoff preserves actionable rejected-token error without another request")
+        let forcedFailTransport = FakeTransport(fail: true)
+        let forcedFail = service("forced-retry", FakeLoader(), forcedFailTransport)
+        for delta in [0.0, 30.0] {
+            do { _ = try await forcedFail.fetch(profile: profile, authBefore: auth, authAfter: { auth }, now: fixed.addingTimeInterval(delta))
+                throw Failure(message: "Fake failure must fail")
+            } catch is ClaudeCurrentUsageError {}
+        }
+        try check(forcedFailTransport.calls == 1, "An unforced retry inside backoff rethrows the cached failure")
+        do { _ = try await forcedFail.fetch(profile: profile, authBefore: auth, authAfter: { auth },
+                                            now: fixed.addingTimeInterval(31), force: true)
+            throw Failure(message: "Fake failure must fail")
+        } catch is ClaudeCurrentUsageError {}
+        try check(forcedFailTransport.calls == 2, "A forced refresh retries instead of rethrowing the cached failure")
+        let limitedTransport = FakeTransport(rateLimited: true)
+        let limited = service("forced-rate-limit", FakeLoader(), limitedTransport)
+        do { _ = try await limited.fetch(profile: profile, authBefore: auth, authAfter: { auth }, now: fixed)
+            throw Failure(message: "Fake rate limit must fail")
+        } catch ClaudeCurrentUsageError.rateLimited {}
+        do { _ = try await limited.fetch(profile: profile, authBefore: auth, authAfter: { auth },
+                                         now: fixed.addingTimeInterval(30), force: true)
+            throw Failure(message: "Fake rate limit must fail")
+        } catch ClaudeCurrentUsageError.rateLimited {}
+        try check(limitedTransport.calls == 1, "A forced refresh still honours a rate-limit wait")
 
         // Store integration uses fake CLI+Keychain+HTTPS dependencies only.
         let integrated = service("store-api")
@@ -297,6 +323,37 @@ enum ClaudeCurrentUsageChecks {
         while cooledStore.isRefreshing && Date() < cooledDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
         try check(cooledStore.statuses[profile.id]?.usage?.source == .nativeBridge && cooledTransport.calls == 0,
             "A more recent bridge observation wins over older API history during a persisted cooldown")
+
+        // A default profile with no account metadata and no usage is a sign-in
+        // candidate, not Connected: `loggedIn` nil is unknown, not logged in.
+        // It needs its own switcher home too: the shared registry's default
+        // profile points at another Claude home and would fail validation
+        // before refresh ever publishes a status.
+        let unsignedHome = root.appendingPathComponent("unsigned-claude-home")
+        try FileManager.default.createDirectory(at: unsignedHome, withIntermediateDirectories: true)
+        let unsignedSwitcherHome = root.appendingPathComponent("unsigned-switcher-home")
+        var unsignedEnv = environment
+        unsignedEnv["CLAUDE_PROFILE_USER_HOME"] = unsignedHome.path
+        unsignedEnv["HOME"] = unsignedHome.path
+        unsignedEnv["CODEX_PROFILE_HOME"] = unsignedSwitcherHome.path
+        unsignedEnv["CODEX_PROFILE_TEST_HOME"] = unsignedSwitcherHome.path
+        let unsignedStore = ClaudeProfileStore(environment: unsignedEnv, bridgeURL: bridge,
+            currentUsageService: ClaudeCurrentUsageService(root: root.appendingPathComponent("unsigned-store"),
+                nativeHome: unsignedHome, credentialLoader: FakeLoader(), transport: FakeTransport()),
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("policy-unsigned")))
+        guard let unsignedProfile = unsignedStore.profiles.first(where: { $0.isDefault }) else {
+            throw Failure(message: "Default profile missing")
+        }
+        unsignedStore.refresh()
+        // Wait for the refresh to publish a completed status: `isRefreshing`
+        // can still be false right after refresh() is called, and the eager
+        // busy placeholder alone would still report `.checking`.
+        let unsignedDeadline = Date().addingTimeInterval(10)
+        while unsignedStore.statuses[unsignedProfile.id]?.busy != false, Date() < unsignedDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try check(unsignedStore.connectionState(unsignedProfile) == .needsSignIn,
+            "A default profile without account metadata offers Sign In, not Connected")
         print("Claude current usage checks passed (fake credentials/HTTPS, identity races, private cache, backoff, isolation, store priority).")
     }
 }

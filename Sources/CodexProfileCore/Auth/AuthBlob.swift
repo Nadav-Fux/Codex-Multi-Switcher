@@ -154,6 +154,38 @@ public enum AuthBlob {
         return matchedNonKindClaims > 0
     }
 
+    /// Stricter than `identityMatches` for adopting a DIFFERENT credential
+    /// chain: at least one shared USER-level claim — anything other than
+    /// `kind` and `accountId` — must match on both sides. `accountId` is the
+    /// shared workspace id on ChatGPT Team plans, so a saved blob without an
+    /// `id_token` (identity `{kind: "oauth", accountId: X}`) cannot prove that
+    /// another member's newer login is the same person; such a blob matches
+    /// nothing here. A differing value on any claim present on both sides is
+    /// still a mismatch (`accountId` included).
+    ///
+    /// Unlike `identityMatches`, this does NOT reuse `authIdentity`: that
+    /// extractor keeps only `userId` once `sub` exists and drops `email`, so a
+    /// saved token carrying only `email` would share no claim with the same
+    /// user's newer `email`+`sub` token. The strict path collects EVERY
+    /// user-level claim an id_token carries.
+    public static func identityMatchesUser(_ current: Data, _ replacement: Data) -> Bool {
+        guard let currentJSON = try? parseTopLevelObject(from: current),
+              let replacementJSON = try? parseTopLevelObject(from: replacement),
+              let currentIdentity = strictIdentityClaims(from: currentJSON),
+              let replacementIdentity = strictIdentityClaims(from: replacementJSON) else {
+            return false
+        }
+        var matchedUserClaims = 0
+        for (key, value) in currentIdentity {
+            guard let replacementValue = replacementIdentity[key] else { continue }
+            guard "\(value)" == "\(replacementValue)" else { return false }
+            if key != "kind" && key != "accountId" {
+                matchedUserClaims += 1
+            }
+        }
+        return matchedUserClaims > 0
+    }
+
     private static func parseTopLevelObject(from data: Data) throws -> [String: Any] {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw AuthError.decodeFailed
@@ -264,6 +296,55 @@ public enum AuthBlob {
         }
 
         return nil
+    }
+
+    /// Identity extraction for `identityMatchesUser` only. Same shape as
+    /// `authIdentity`, except an id_token contributes EVERY user-level claim
+    /// it carries — `userId` AND `email` — instead of only the first match.
+    private static func strictIdentityClaims(from json: [String: Any]) -> [String: Any]? {
+        if let apiKey = nonEmptyString(json["OPENAI_API_KEY"]) {
+            let digest = SHA256.hash(data: Data(apiKey.utf8))
+            return [
+                "kind": "api-key",
+                "keyHash": digest.map { String(format: "%02x", $0) }.joined(),
+            ]
+        }
+
+        guard let tokens = json["tokens"] as? [String: Any] else { return nil }
+        var claims: [String: Any] = ["kind": "oauth"]
+        if let accountId = self.tokenString(tokens, snakeCase: "account_id", camelCase: "accountId") {
+            claims["accountId"] = accountId
+        }
+        if let idToken = self.tokenString(tokens, snakeCase: "id_token", camelCase: "idToken"),
+           let userClaims = self.userClaims(fromIDToken: idToken) {
+            claims.merge(userClaims) { _, new in new }
+        }
+        return claims.count > 1 ? claims : nil
+    }
+
+    /// Every user-level claim an id_token carries: `userId` from `sub` or the
+    /// OpenAI namespaced user id, plus `email` (lowercased). Used only by the
+    /// strict match; `userIdentity(fromIDToken:)` below keeps its one-claim
+    /// shape for `identityFingerprint` and `identityMatches`.
+    private static func userClaims(fromIDToken idToken: String) -> [String: Any]? {
+        let parts = idToken.split(separator: ".")
+        guard parts.count >= 2,
+              let payloadData = base64URLDecode(String(parts[1])),
+              let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+            return nil
+        }
+
+        var claims: [String: Any] = [:]
+        for key in ["sub", "https://api.openai.com/user_id"] {
+            if let value = payload[key] as? String, !value.isEmpty {
+                claims["userId"] = value
+                break
+            }
+        }
+        if let email = payload["email"] as? String, !email.isEmpty {
+            claims["email"] = email.lowercased()
+        }
+        return claims.isEmpty ? nil : claims
     }
 
     private static func userIdentity(fromIDToken idToken: String) -> [String: Any]? {

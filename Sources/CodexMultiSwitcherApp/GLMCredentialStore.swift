@@ -9,7 +9,22 @@ import CodexProfileCore
 /// there once, the first time that item is readable. ZCode's encrypted
 /// credentials are never copied or decrypted. The key is never logged.
 enum GLMCredentialStore {
-    private static var file: GLMKeyFileStore { GLMKeyFileStore() }
+    private static var file: GLMKeyFileStore { self.fileStoreProvider() }
+    /// Test seams; production uses the switcher-home file and the real Keychain.
+    nonisolated(unsafe) static var fileStoreProvider: () -> GLMKeyFileStore = { GLMKeyFileStore() }
+    // The interaction policy lives inside the default seam so an injected
+    // reader never reaches a Security.framework call.
+    nonisolated(unsafe) static var legacyItemReader: (Bool) throws -> String? = { allowed in
+        try KeychainInteractionPolicy.withInteraction(allowed: allowed) {
+            try GLMCredentialStore.read(allowInteraction: allowed)
+        }
+    }
+    nonisolated(unsafe) static var legacyItemDeleter: () -> OSStatus = {
+        SecItemDelete(GLMCredentialStore.silentQuery() as CFDictionary)
+    }
+    /// Serializes load-migration, save and remove: a `remove` landing while a
+    /// `load` still holds a legacy item must never let that item be saved back.
+    private static let migrationLock = NSLock()
     /// Logs a failing silent Keychain read once per process, not every poll.
     private static let warnedLock = NSLock()
     nonisolated(unsafe) private static var warnedKeychain = false
@@ -25,19 +40,38 @@ enum GLMCredentialStore {
     }
 
     static func load(allowInteraction: Bool = false) throws -> String? {
+        let file = self.file
+        self.migrationLock.lock()
+        let stored: String?
         do {
-            if let stored = try self.file.load() { return stored }
-        } catch { throw Failure.unavailable }
-        // One-time migration from the legacy Keychain item.
+            stored = try file.load()
+        } catch {
+            self.migrationLock.unlock()
+            throw Failure.unavailable
+        }
+        // An earlier save/remove already decided the key's state: a leftover
+        // legacy Keychain item must never be migrated back.
+        let decided = file.hasNoLegacyMigrationMarker
+        self.migrationLock.unlock()
+        if let stored { return stored }
+        guard !decided else { return nil }
+        // The legacy Keychain read can wait on a user prompt, so it runs
+        // outside the lock: a main-thread save/remove must never block on it.
         let legacy: String?
         do {
-            legacy = try KeychainInteractionPolicy.withInteraction(allowed: allowInteraction) {
-                try self.read(allowInteraction: allowInteraction)
-            }
+            legacy = try self.legacyItemReader(allowInteraction)
         } catch { throw Failure.unavailable }
         guard let legacy else { return nil }
+        self.migrationLock.lock()
+        defer { self.migrationLock.unlock() }
+        // Re-check under the lock: a save/remove that landed while the legacy
+        // read ran already decided the key's state and wins over the item.
         do {
-            try self.file.save(legacy)
+            if let stored = try file.load() { return stored }
+        } catch { throw Failure.unavailable }
+        guard !file.hasNoLegacyMigrationMarker else { return nil }
+        do {
+            try file.save(legacy)
             AppLogger.info("Moved the GLM key from the Keychain to the app's private key file")
         } catch {
             AppLogger.warning("Could not write the GLM key file", metadata: ["error": String(describing: type(of: error))])
@@ -71,17 +105,32 @@ enum GLMCredentialStore {
     }
 
     static func save(_ input: String) throws {
-        do { try self.file.save(input) }
+        self.migrationLock.lock()
+        defer { self.migrationLock.unlock() }
+        let file = self.file
+        do {
+            try file.save(input)
+            // Record the decision so a leftover legacy item cannot return.
+            try? file.markNoLegacyMigration()
+        }
         catch GLMKeyFileStore.Failure.invalidKey { throw Failure.invalidKey }
         catch { throw Failure.unavailable }
         // The file is now authoritative; a leftover legacy item is harmless and
         // is removed without prompting when this build is allowed to.
-        _ = SecItemDelete(self.silentQuery() as CFDictionary)
+        _ = self.legacyItemDeleter()
     }
 
     static func remove() throws {
-        do { try self.file.remove() } catch { throw Failure.unavailable }
-        let status = SecItemDelete(self.silentQuery() as CFDictionary)
+        self.migrationLock.lock()
+        defer { self.migrationLock.unlock() }
+        let file = self.file
+        // Record the decision first: even when the legacy Keychain delete fails
+        // or is deferred, the marker keeps `load` from resurrecting that item.
+        do {
+            try file.markNoLegacyMigration()
+            try file.remove()
+        } catch { throw Failure.unavailable }
+        let status = self.legacyItemDeleter()
         guard status == errSecSuccess || status == errSecItemNotFound
             || status == errSecInteractionNotAllowed || status == errSecAuthFailed else { throw Failure.unavailable }
     }

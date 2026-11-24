@@ -60,6 +60,7 @@ struct ExternalProviderSettings: View {
     @State private var connectingKey = false
     @AppStorage("antigravityMenuBucket.gemini") private var geminiBucket = ""
     @AppStorage("antigravityMenuBucket.other") private var otherBucket = ""
+    @AppStorage("antigravityMenuShowsAll") private var antigravityMenuShowsAll = true
 
     var body: some View {
         ScrollView {
@@ -87,8 +88,11 @@ struct ExternalProviderSettings: View {
                      : "Reads your Z.ai GLM Coding Plan subscription quota. Local token counts and pay-as-you-go API balance are separate from subscription limits.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .antigravity {
-                    bucketPicker("Gemini in menu bar", group: .gemini, selection: $geminiBucket)
-                    bucketPicker("Other models in menu bar", group: .other, selection: $otherBucket)
+                    Toggle("Show all four windows in the menu bar", isOn: $antigravityMenuShowsAll)
+                    if !antigravityMenuShowsAll {
+                        bucketPicker("Gemini in menu bar", group: .gemini, selection: $geminiBucket)
+                        bucketPicker("Other models in menu bar", group: .other, selection: $otherBucket)
+                    }
                 }
                 Divider()
                 TimelineView(.periodic(from: .now, by: 1)) { context in

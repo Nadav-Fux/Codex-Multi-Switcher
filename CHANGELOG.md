@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Stale sign-in healing now requires a shared user-level identity claim, not only `account_id` — on ChatGPT Team workspaces `account_id` is shared by every member, so a saved profile without an `id_token` can no longer adopt a teammate's newer login. The same check guards writing rotated credentials back to `~/.codex/auth.json`.
+- The `~/.codex/auth.json` write-back prepares its temp file first, then re-reads the destination immediately before the rename and commits only when it is unchanged — narrowing the window where a login Codex Desktop saves concurrently could be overwritten to the final compare-and-rename.
+- The GLM key stdin import in Local and Preview builds now writes to the same profile home the GUI reads it from.
+- Saving or removing the GLM key writes a "no legacy migration" marker next to the key file, so a leftover Keychain item can never bring a removed key back — even when the legacy Keychain delete fails. The one-time legacy read also runs outside the store's lock, so a Keychain prompt can no longer freeze Save/Remove in Settings while it waits.
+- A Claude helper reply that only needs a sign-in renewal no longer latches the permission block; polling retries after the sign-in is renewed in Claude Code.
+- Claude's Refresh button now retries inside the in-memory failure backoff instead of rethrowing the last failure for five minutes; a server rate-limit wait is still honoured.
+- A default Claude profile with no account metadata and no usage now shows Sign In instead of Connected.
+- Antigravity settings gain a "Show all four windows in the menu bar" toggle (on by default); the per-group menu window pickers only appear when it is off.
 - Antigravity shows all four quota windows (Gemini and Claude/GPT, weekly and 5-hour) in the menu bar as two columns. Google returns the Gemini group only to a versioned Antigravity client, so the request now sends Antigravity's own version. Set `antigravityMenuShowsAll` to false to go back to one window per group.
 - Antigravity quota works again with the standalone Antigravity app: its local server no longer exposes a connection token, and the CLI ID-token file is gone, so the account is matched by the signed-in email in the app's storage and confirmed with Google. Quota is read from the same endpoint Antigravity uses (`daily-cloudcode-pa`), which reports the real weekly Claude/GPT usage.
 - Keep Claude usage current without Keychain access: every few minutes the app runs `claude -p /usage` (no model call, 0 tokens; it switches itself off for good if a run ever reports tokens or cost), which makes Claude Code refresh its own usage cache.

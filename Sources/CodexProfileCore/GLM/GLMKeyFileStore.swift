@@ -58,4 +58,19 @@ public struct GLMKeyFileStore: Sendable {
             try FileManager.default.removeItem(at: self.url)
         }
     }
+
+    /// Next to the key file: records that the app already decided this key's
+    /// state (saved or removed), so a leftover legacy Keychain item must never
+    /// be migrated back in.
+    public var noLegacyMigrationMarkerURL: URL {
+        self.url.appendingPathExtension("no-legacy-migration")
+    }
+
+    public var hasNoLegacyMigrationMarker: Bool {
+        FileManager.default.fileExists(atPath: self.noLegacyMigrationMarkerURL.path)
+    }
+
+    public func markNoLegacyMigration() throws {
+        try AtomicFileWriter.write(Data("no-legacy-migration\n".utf8), to: self.noLegacyMigrationMarkerURL)
+    }
 }

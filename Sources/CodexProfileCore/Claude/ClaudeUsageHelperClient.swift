@@ -63,7 +63,10 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
             return snapshot
         } catch {
             let safe = error as? ClaudeCurrentUsageError ?? .requestFailed
-            if [.credentialInteractionRequired, .credentialUnavailable, .credentialRenewalUnavailable].contains(safe) {
+            // Renewal-unavailable is transient: the user can renew the sign-in
+            // in Claude Code at any time, so the next poll must retry rather
+            // than stay latched behind an explicit Connect.
+            if [.credentialInteractionRequired, .credentialUnavailable].contains(safe) {
                 self.preferences.set(true, forKey: self.blockKey(digest))
             }
             throw safe
