@@ -7,6 +7,7 @@ struct AntigravityProviderAdapter: UsageProviderAdapter {
     private let reader = AntigravityUsageReader()
 
     func readUsageSnapshot() async -> ProviderUsageSnapshot {
+        if let native = try? await AntigravityIDEQuotaReader().read() { return native }
         do {
             let usage = try await reader.read()
             let buckets = usage.buckets.map { bucket in

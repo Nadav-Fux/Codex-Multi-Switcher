@@ -83,7 +83,7 @@ struct ExternalProviderSettings: View {
                     set: { ProviderVisibility.set(provider, visible: $0) }))
                     .disabled(ProviderVisibility.selection().count == 1 && ProviderVisibility.selection().contains(provider))
                 Text(provider == .antigravity
-                     ? "Reads quota through your existing statusline helper connection, after verifying its account matches Antigravity. Gemini and other model quotas remain separate."
+                     ? "Reads the same quota summary as the running Antigravity IDE. If the IDE is closed, the matching CLI helper is used; that source may omit Gemini quota. Gemini and other model quotas remain separate."
                      : "Reads your Z.ai GLM Coding Plan subscription quota. Local token counts and pay-as-you-go API balance are separate from subscription limits.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .antigravity {
@@ -97,8 +97,8 @@ struct ExternalProviderSettings: View {
                 Divider()
                 Text("CONNECTION").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
                 Text(provider == .antigravity
-                    ? "Use the same account in Antigravity and the antigravity-usage statusline helper. This section observes quota; account switching remains managed by Antigravity. Quotas may be shared by several models; shared pools are shown once when the service identifies them."
-                    : "Connect your Personal Z.ai Coding Plan key for quota and usage. Its key stays in this app’s Keychain. Reset cards and Flash grants are read separately from your existing local ZCode sign-in; credentials are decoded only in memory using ZCode’s published format. Redeem cards in ZCode.")
+                    ? "The active IDE account is checked before and after each local quota read. When the IDE is closed, the fallback helper must match the CLI account. This section only observes quota; it does not run an agent or consume model allowance. Claude/GPT percentages do not indicate Gemini consumption."
+                    : "Connect your Personal Z.ai Coding Plan key for quota and usage. Its key is stored in a private file only your user account can read. Reset cards and Flash grants are read separately from your existing local ZCode sign-in; credentials are decoded only in memory using ZCode’s published format. Redeem cards in ZCode.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                 if provider == .glm {
                     Button(connectingKey ? "Waiting for macOS permission…" : "Connect Saved Z.ai Key…") {
@@ -117,7 +117,7 @@ struct ExternalProviderSettings: View {
                             } catch { credentialError = error.localizedDescription }
                         }
                     }.disabled(connectingKey)
-                    Text("Reconnect the existing saved key after an app update if macOS requests Keychain permission. This does not replace the key.")
+                    Text("Moves a key saved by an older version out of the Keychain. Needed once; it does not replace the key.")
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                     Toggle("Read reset cards and Start Plan / Flash balances from local ZCode sign-in", isOn: $readsZCodeBenefits)
                         .onChange(of: readsZCodeBenefits) { _, _ in store.credentialsDidChange(.glm) }

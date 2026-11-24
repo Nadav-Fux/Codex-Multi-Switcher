@@ -134,10 +134,16 @@ struct ClaudeProfilesTab: View {
 
     private func detail(_ profile: ClaudeProfile) -> some View {
         let status = store.statuses[profile.id]
+        let state = store.connectionState(profile)
         return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Claude Code").font(.system(size: 17, weight: .semibold))
-                Toggle("Show Claude in menu bar", isOn: Binding(
+                HStack {
+                    Text("Claude Code").font(.system(size: 18, weight: .semibold))
+                    Spacer()
+                    Button("Refresh") { store.refresh(force: true) }
+                        .disabled(store.isRefreshing || store.isAuthorizingCredential)
+                }
+                Toggle("Show in menu bar", isOn: Binding(
                     get: {
                         _ = self.menuBarProviders
                         _ = self.legacyShowClaude
@@ -146,9 +152,44 @@ struct ClaudeProfilesTab: View {
                     set: { show in
                         ProviderVisibility.set(.claude, visible: show)
                     }))
-                    .font(.system(size: 12))
-                Text("Choose an account for new Claude terminal sessions. Existing sessions keep their current account.")
+                ClaudeConnectionBanner(state: state, authorizing: store.isAuthorizingCredential,
+                                       onConnect: { store.connectNativeAccount(id: profile.id) },
+                                       onSignIn: {
+                                           beginAction("Opening Claude sign-in in a new terminal…") { store.signIn(id: profile.id) }
+                                       })
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(claudeAccountLabel(status)).font(.system(size: 13, weight: .medium))
+                    if let subscription = status?.auth?.subscription, !subscription.isEmpty {
+                        Text(subscription.capitalized).font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
+                    if let organization = status?.auth?.organization, !organization.isEmpty {
+                        Text(organization).font(.system(size: 12)).foregroundStyle(.secondary)
+                    }
+                }
+                Divider()
+                ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil)
+                ClaudeUsageDetail(snapshot: status?.usage)
+                if let resets = status?.usage?.resets {
+                    ClaudeLimitResetsView(resets: resets)
+                }
+                if let error = store.error, error != status?.error, state.isHealthy {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 11)).foregroundStyle(Palette.warning).textSelection(.enabled)
+                }
+                Divider()
+                Text("NEW SESSIONS").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                Text("The selected account is used by new Claude terminal sessions. Running sessions keep their account.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button(profile.id == store.selectedID ? "Selected for new sessions" : "Use for New Sessions") {
+                        perform("Claude account selected for new sessions") { store.select(id: profile.id) }
+                    }
+                    .disabled(profile.id == store.selectedID)
+                    Button("Open New Session") {
+                        beginAction("Opening a new Claude terminal session…") { store.openSession(id: profile.id) }
+                    }
+                }
+                .disabled(status?.busy == true)
                 HStack {
                     Text("Label:").foregroundStyle(.secondary)
                     TextField("Account label", text: $label)
@@ -158,90 +199,61 @@ struct ClaudeProfilesTab: View {
                         .onChange(of: labelFocused) { _, focused in if !focused { commitLabel() } }
                 }
                 .font(.system(size: 13))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(claudeAccountLabel(status)).font(.system(size: 13, weight: .medium))
-                    if let auth = status?.auth {
-                        if let organization = auth.organization, !organization.isEmpty {
-                            Text(organization).font(.system(size: 12)).foregroundStyle(.secondary)
-                        }
-                        if let subscription = auth.subscription, !subscription.isEmpty {
-                            Text(subscription.capitalized).font(.system(size: 12)).foregroundStyle(.secondary)
-                        }
-                    }
-                    Text(profile.isDefault ? "Default Claude directory" : "Separate Claude directory")
-                        .font(.system(size: 11)).foregroundStyle(.tertiary)
-                    Text(profile.configDirectory).font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary).textSelection(.enabled)
+                DisclosureGroup("Advanced") {
+                    advanced(profile, status: status)
+                        .padding(.top, 8)
                 }
-                HStack(spacing: 8) {
-                    Button(profile.id == store.selectedID ? "Selected for new sessions" : "Choose Account") {
-                        perform("Claude account selected for new sessions") { store.select(id: profile.id) }
-                    }
-                    .disabled(profile.id == store.selectedID)
-                    Button("Open New Session") {
-                        beginAction("Opening a new Claude terminal session…") { store.openSession(id: profile.id) }
-                    }
-                    Button("Sign In…") {
-                        beginAction("Opening Claude sign-in in a new terminal…") { store.signIn(id: profile.id) }
-                    }
-                }
-                .disabled(status?.busy == true)
-                Divider()
-                HStack {
-                    Text("Claude usage").font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Button("Refresh") { store.refresh() }
-                        .disabled(store.isRefreshing || store.isAuthorizingCredential)
-                        .controlSize(.small)
+                .font(.system(size: 12))
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func advanced(_ profile: ClaudeProfile, status: ClaudeProfileStatus?) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(profile.isDefault ? "Default Claude directory" : "Separate Claude directory")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            Text(profile.configDirectory).font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary).textSelection(.enabled)
+            HStack(spacing: 8) {
+                Button("Sign In Again…") {
+                    beginAction("Opening Claude sign-in in a new terminal…") { store.signIn(id: profile.id) }
                 }
                 if store.supportsNativeUsage(profile) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Button(store.isAuthorizingCredential ? "Waiting for macOS permission…" : "Connect Claude Account…") {
-                            store.connectNativeAccount(id: profile.id)
-                        }
-                        .disabled(store.isRefreshing || store.isAuthorizingCredential)
-                        Text("Connect authorizes the Claude usage helper. Choose Always Allow if macOS asks. We verify access in a separate silent process before confirming the connection. Background refresh never opens permission dialogs.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                        Text("The helper keeps its identity across interface updates. A helper update or a replaced Claude sign-in may require reconnecting once.")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    Button(store.isAuthorizingCredential ? "Waiting for macOS permission…" : "Reconnect Usage Access…") {
+                        store.connectNativeAccount(id: profile.id)
                     }
-                }
-                ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil)
-                ClaudeUsageDetail(snapshot: status?.usage)
-                if let error = status?.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 11)).foregroundStyle(Palette.warning).textSelection(.enabled)
-                }
-                if let error = store.error, error != status?.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.system(size: 11)).foregroundStyle(Palette.warning).textSelection(.enabled)
-                }
-                Divider()
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Optional usage bridge").font(.system(size: 13, weight: .semibold))
-                    Text(profile.isDefault
-                        ? "Current usage can be read automatically for your existing default Claude account. The optional statusline bridge records usage from future sessions as a fallback and preserves your existing statusline output."
-                        : "Separate Claude accounts use the statusline bridge to record usage from future sessions. It preserves the output of your existing statusline command.")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                    HStack {
-                        Button(status?.bridgeInstalled == true ? "Update Usage Bridge" : "Install Bridge for This Account") {
-                            beginAction("Installing Claude usage bridge…") { store.installBridge(id: profile.id) }
-                        }
-                        if status?.bridgeInstalled == true {
-                            Button("Remove Bridge") {
-                                perform("Original Claude statusline restored") { store.restoreBridge(id: profile.id) }
-                            }
-                        }
-                    }
-                    .disabled(status?.busy == true)
-                    Text(profile.isDefault
-                        ? "Refresh checks available account usage without changing your sign-in. Bridge observations update when Claude emits statusline data."
-                        : "Refresh reads the saved bridge observation. Send a new Claude response to update it.")
-                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .disabled(store.isRefreshing || store.isAuthorizingCredential)
                 }
             }
-            .padding(20)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(status?.busy == true)
+            Text(store.supportsNativeUsage(profile)
+                 ? "Usage for this account is read directly from Claude in the background. Reconnect is only needed if macOS stops allowing it."
+                 : "Usage for this account is recorded by Claude sessions opened with it (through its statusline). It is set up automatically after sign-in.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button(status?.bridgeInstalled == true ? "Reinstall Session Recorder" : "Install Session Recorder") {
+                    beginAction("Installing Claude usage recorder…") { store.installBridge(id: profile.id) }
+                }
+                if status?.bridgeInstalled == true {
+                    Button("Remove Session Recorder") {
+                        perform("Original Claude statusline restored") { store.restoreBridge(id: profile.id) }
+                    }
+                }
+            }
+            .disabled(status?.busy == true)
+            Text("The session recorder adds a small step to this account's Claude statusline and keeps your existing statusline output. "
+                 + (store.supportsNativeUsage(profile) ? "It is optional for this account." : "It is required for usage of this account."))
+                .font(.system(size: 11)).foregroundStyle(.tertiary)
+            if let snapshot = status?.usage {
+                Text("\(claudeSourceLabel(snapshot)) · observed \(snapshot.observedAt.formatted(date: .abbreviated, time: .standard))")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            if let next = store.nextUsageRefresh[profile.id], next > Date() {
+                Text("Next automatic check at \(next.formatted(date: .omitted, time: .shortened)).")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
         }
     }
 
@@ -280,6 +292,139 @@ private func claudeAccountLabel(_ status: ClaudeProfileStatus?) -> String {
     }
 }
 
+/// Limit resets Claude granted this account, like Codex's banked resets.
+/// Shown only: spending one stays a deliberate step in Claude Code.
+private struct ClaudeLimitResetsView: View {
+    let resets: [ClaudeLimitReset]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("LIMIT RESETS").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            let shown = resets.filter { $0.left > 0 || $0.usableNow }
+            if shown.isEmpty {
+                Text("Claude does not report limit resets to Claude Code for this account yet. The Claude app may still list them under Settings › Usage, where they can be used.")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(shown) { reset in
+                    HStack(spacing: 8) {
+                        Image(systemName: Self.symbol(reset.kind))
+                            .foregroundStyle(reset.paused ? Color.secondary : Palette.success)
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(Self.title(reset)).font(.system(size: 12, weight: .medium))
+                            Text(Self.detail(reset)).font(.system(size: 11)).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text("\(reset.left) left").font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    }
+                }
+                Text("Use one in Claude Code with /limit-reset. This app only shows them and never uses one.")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    static func title(_ reset: ClaudeLimitReset) -> String {
+        switch reset.kind {
+        case .full: return "Full reset (5-hour and weekly)"
+        case .weekly: return "Weekly reset"
+        case .session: return "5-hour reset"
+        case .fable: return "Fable reset"
+        }
+    }
+
+    static func detail(_ reset: ClaudeLimitReset) -> String {
+        var parts: [String] = []
+        switch reset.kind {
+        case .fable: parts.append("gives back only what Fable used this week")
+        case .full: parts.append("refills every limit")
+        case .weekly: parts.append("refills the weekly limit")
+        case .session: parts.append("refills the 5-hour limit")
+        }
+        if let endsAt = reset.endsAt { parts.append("use by \(endsAt.formatted(date: .abbreviated, time: .shortened))") }
+        if reset.paused { parts.append("paused") }
+        return parts.joined(separator: " · ")
+    }
+
+    static func symbol(_ kind: ClaudeLimitReset.Kind) -> String {
+        switch kind {
+        case .full: return "arrow.counterclockwise.circle.fill"
+        case .weekly: return "calendar.circle.fill"
+        case .session: return "clock.arrow.circlepath"
+        case .fable: return "sparkles"
+        }
+    }
+}
+
+private struct ClaudeConnectionBanner: View {
+    let state: ClaudeConnectionState
+    let authorizing: Bool
+    let onConnect: () -> Void
+    let onSignIn: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(tint).font(.system(size: 16))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                if let detail { Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                switch state {
+                case .needsApproval:
+                    Button(authorizing ? "Waiting for macOS permission…" : "Connect Claude…", action: onConnect)
+                        .buttonStyle(.borderedProminent).disabled(authorizing).padding(.top, 2)
+                case .needsSignIn:
+                    Button("Sign In…", action: onSignIn).buttonStyle(.borderedProminent).padding(.top, 2)
+                default: EmptyView()
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(tint.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.35)))
+    }
+
+    private var tint: Color {
+        switch state {
+        case .connected: return Palette.success
+        case .checking: return .secondary
+        case .needsSignIn, .needsApproval: return Palette.warning
+        case .problem: return Palette.danger
+        }
+    }
+
+    private var icon: String {
+        switch state {
+        case .connected: return "checkmark.circle.fill"
+        case .checking: return "arrow.triangle.2.circlepath"
+        case .needsSignIn: return "person.crop.circle.badge.exclamationmark"
+        case .needsApproval: return "lock.circle"
+        case .problem: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var title: String {
+        switch state {
+        case .connected: return "Connected"
+        case .checking: return "Checking Claude…"
+        case .needsSignIn: return "Sign in to this Claude account"
+        case .needsApproval: return "One-time approval needed"
+        case .problem: return "Usage could not be read"
+        }
+    }
+
+    private var detail: String? {
+        switch state {
+        case .connected(let how): return how
+        case .checking: return nil
+        case .needsSignIn: return "Opens Claude sign-in in Terminal. Usage starts updating automatically afterwards."
+        case .needsApproval: return "macOS needs your OK once so usage can update in the background. Choose Always Allow when it asks."
+        case .problem(let message): return message
+        }
+    }
+}
+
 private func claudeSourceLabel(_ snapshot: ClaudeUsageSnapshot) -> String {
     switch snapshot.source {
     case .oauthUsage:
@@ -297,8 +442,8 @@ private func claudeUsageIsCached(_ snapshot: ClaudeUsageSnapshot?, window: Claud
 }
 
 private func claudeFreshnessLabel(_ snapshot: ClaudeUsageSnapshot) -> String {
-    let state = snapshot.isStale ? "Stale cache" : (snapshot.accountVerified ? "Fresh" : "Unverified cache")
-    return "\(state) · \(updatedLabel(from: snapshot.observedAt))"
+    if !snapshot.isStale && snapshot.accountVerified { return updatedLabel(from: snapshot.observedAt) }
+    return "Last known values · \(updatedLabel(from: snapshot.observedAt))"
 }
 
 private struct ClaudeUsageDetail: View {
@@ -317,11 +462,9 @@ private struct ClaudeUsageDetail: View {
             if let snapshot {
                 Text(claudeFreshnessLabel(snapshot)).font(.system(size: 11))
                     .foregroundStyle(claudeUsageIsCached(snapshot) ? Palette.warning : Color.secondary)
-                Text(claudeSourceLabel(snapshot)).font(.system(size: 11)).foregroundStyle(.secondary)
-                Text("Observed \(snapshot.observedAt.formatted(date: .abbreviated, time: .standard))")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .help("\(claudeSourceLabel(snapshot)) · observed \(snapshot.observedAt.formatted(date: .complete, time: .standard))")
             } else {
-                Text("Claude usage is not available yet. Refresh can check the existing default account automatically. Separate accounts use the bridge and a new Claude session.")
+                Text("No usage yet. It appears after the first successful check.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
@@ -412,7 +555,7 @@ struct ClaudeMenuSectionView: View {
             HStack(spacing: 0) {
                 ProviderSectionHeaderView(title: "Claude Code", isCollapsed: self.isCollapsed, onToggle: self.onToggle)
                 if !self.isCollapsed {
-                    Button { store.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    Button { store.refresh(force: true) } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
                         .frame(width: 32, height: Self.headerHeight)
                         .contentShape(Rectangle())

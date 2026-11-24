@@ -5,7 +5,10 @@ import Testing
 @Suite("Codex rate-limit snapshots")
 struct CodexRateLimitsTests {
 
-    @Test("captures a weekly primary window when secondary is absent")
+    // Since 674376b ("correct weekly-only Codex quotas") the window duration,
+    // not the RPC field, picks the display slot: a weekly-only plan shows in
+    // the weekly slot and leaves the 5-hour slot empty.
+    @Test("places a weekly-only primary window in the weekly slot")
     func capturesWeeklyPrimaryWindow() throws {
         let json = """
         {
@@ -29,10 +32,10 @@ struct CodexRateLimitsTests {
         let response = try JSONDecoder().decode(RPCRateLimitsResponse.self, from: Data(json.utf8))
         let snapshot = try CLIUsageFetcher.makeSnapshot(from: response.rateLimits)
 
-        #expect(snapshot.primaryUsedPercent == 18)
-        #expect(snapshot.primaryWindowDurationMins == 10_080)
-        #expect(snapshot.secondaryUsedPercent == 0)
-        #expect(snapshot.secondaryWindowDurationMins == nil)
+        #expect(snapshot.primaryUsedPercent == 0)
+        #expect(snapshot.primaryWindowDurationMins == nil)
+        #expect(snapshot.secondaryUsedPercent == 18)
+        #expect(snapshot.secondaryWindowDurationMins == 10_080)
     }
 
     @Test("decodes snapshots cached before window durations were recorded")

@@ -17,10 +17,9 @@ public struct AntigravityUsageReader: Sendable {
 
     public func read() async throws -> AntigravityUsageSnapshot {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let identityURL = home.appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")
         let helperDirectory = home.appendingPathComponent("Library/Application Support/antigravity-usage")
         let configURL = helperDirectory.appendingPathComponent("config.json")
-        guard let identity = Self.identity(at: identityURL),
+        guard let identity = Self.currentIdentity(home: home),
               let active = Self.activeAccount(at: configURL), active.lowercased() == identity.email else {
             throw AntigravityUsageError.accountUnavailable
         }
@@ -39,7 +38,7 @@ public struct AntigravityUsageReader: Sendable {
         }
         guard credential.expiresAt > Date(),
               Self.activeAccount(at: configURL) == active,
-              Self.identity(at: identityURL) == identity else { throw AntigravityUsageError.accountChanged }
+              Self.currentIdentity(home: home) == identity else { throw AntigravityUsageError.accountChanged }
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.urlCache = nil
@@ -52,18 +51,21 @@ public struct AntigravityUsageReader: Sendable {
         let user = try await Self.request(url: "https://www.googleapis.com/oauth2/v2/userinfo",
                                           accessToken: credential.accessToken, session: session)
         guard let userRoot = try? JSONSerialization.jsonObject(with: user) as? [String: Any],
-              userRoot["id"] as? String == identity.subject,
+              let googleID = userRoot["id"] as? String, !googleID.isEmpty,
+              identity.subject.isEmpty || googleID == identity.subject,
               let verified = userRoot["verified_email"] as? Bool, verified,
               let email = userRoot["email"] as? String,
               email.lowercased() == identity.email else { throw AntigravityUsageError.accountChanged }
         let response = try await Self.request(
-            url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            url: "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
             accessToken: credential.accessToken, session: session, post: true)
         guard Self.activeAccount(at: configURL) == active,
-              Self.identity(at: identityURL) == identity,
+              Self.currentIdentity(home: home) == identity,
               let latest = Self.readFile(at: tokenURL, privateFile: true),
               Self.digest(latest) == credential.digest else { throw AntigravityUsageError.accountChanged }
-        return try Self.parse(response, observedAt: Date(), identity: identity.digest)
+        // The app-storage identity has no Google subject; take it from the verified userinfo.
+        let confirmed = Identity(issuer: "https://accounts.google.com", subject: googleID, email: identity.email)
+        return try Self.parse(response, observedAt: Date(), identity: confirmed.digest)
     }
 
     private struct Identity: Equatable {
@@ -101,6 +103,22 @@ public struct AntigravityUsageReader: Sendable {
         return email
     }
 
+    /// The Antigravity CLI kept an ID token with the account's Google subject. The standalone
+    /// Antigravity app (Nov 2026) removed that file and records only the signed-in email in
+    /// its app storage. Then the email must match, and Google's userinfo supplies the subject.
+    private static func currentIdentity(home: URL) -> Identity? {
+        if let identity = self.identity(at: home.appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")) {
+            return identity
+        }
+        let storage = home.appendingPathComponent("Library/Application Support/Antigravity/app_storage.json")
+        guard let data = readFile(at: storage),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let email = root["agy.onboarding.lastLoginUsername"] as? String,
+              email.contains("@"), email.count <= 320,
+              email.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else { return nil }
+        return Identity(issuer: "antigravity-app", subject: "", email: email.lowercased())
+    }
+
     private static func identity(at url: URL) -> Identity? {
         guard let data = readFile(at: url),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -132,13 +150,21 @@ public struct AntigravityUsageReader: Sendable {
                           expiresAt: Date(timeIntervalSince1970: expiry.doubleValue / 1000), digest: digest(data))
     }
 
+    private static let userAgent: String = {
+        let info = Bundle(url: URL(fileURLWithPath: "/Applications/Antigravity.app"))?.infoDictionary
+        let raw = info?["CFBundleShortVersionString"] as? String ?? ""
+        let version = raw.range(of: #"^[0-9]+(\.[0-9]+){1,3}$"#, options: .regularExpression) != nil ? raw : "2.34.0"
+        return "antigravity/\(version) darwin/arm64"
+    }()
+
     private static func request(url: String, accessToken: String, session: URLSession,
                                 post: Bool = false) async throws -> Data {
         var request = URLRequest(url: URL(string: url)!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData)
         request.httpMethod = post ? "POST" : "GET"
         request.setValue("Bearer " + accessToken, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+        // Google returns the Gemini group only to a versioned Antigravity client.
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         if post {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = Data("{}".utf8)
@@ -200,11 +226,13 @@ public struct AntigravityUsageReader: Sendable {
               posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
             throw AntigravityUsageError.commandFailed
         }
-        let argv = [node.path, script.path, "accounts", "refresh", email].map { strdup($0) }
+        // Explicit element type: older Swift (CI, Xcode 16) cannot infer `strdup` in `map`.
+        let arguments: [String] = [node.path, script.path, "accounts", "refresh", email]
+        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { (value: String) -> UnsafeMutablePointer<CChar>? in strdup(value) }
         // Keep the real home for file-backed helper storage; exclude shell/config injection.
         let env = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CI": "true",
                    "NO_COLOR": "1", "BROWSER": "/usr/bin/false"]
-        let envp = env.map { strdup("\($0.key)=\($0.value)") }
+        let envp: [UnsafeMutablePointer<CChar>?] = env.map { (key: String, value: String) -> UnsafeMutablePointer<CChar>? in strdup("\(key)=\(value)") }
         defer { argv.forEach { free($0) }; envp.forEach { free($0) } }
         var pid: pid_t = 0
         let result = (argv + [nil]).withUnsafeBufferPointer { arguments in

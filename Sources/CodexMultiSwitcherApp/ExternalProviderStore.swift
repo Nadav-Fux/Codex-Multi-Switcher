@@ -79,6 +79,14 @@ enum ProviderQuotaPresentation {
     static func selectedBuckets(_ snapshot: ProviderUsageSnapshot?) -> [ProviderUsageBucket] {
         guard let snapshot else { return [] }
         if snapshot.provider == .antigravity {
+            // Default: every window, ordered Gemini weekly/5h then other weekly/5h, drawn as
+            // two columns. Turning it off keeps the older one-window-per-group display.
+            if UserDefaults.standard.object(forKey: "antigravityMenuShowsAll") as? Bool ?? true {
+                func order(_ bucket: ProviderUsageBucket) -> Int {
+                    (bucket.group == .gemini ? 0 : 2) + (bucket.title.lowercased().contains("week") ? 0 : 1)
+                }
+                return snapshot.buckets.sorted { order($0) < order($1) }
+            }
             return [ProviderUsageBucketGroup.gemini, .other].compactMap { group in
                 let candidates = snapshot.buckets.filter { $0.group == group }
                 let selectedID = UserDefaults.standard.string(forKey: "antigravityMenuBucket.\(group.rawValue)")
@@ -94,6 +102,9 @@ enum ProviderQuotaPresentation {
         case .available:
             if !snapshot.accountVerified { return "Account could not be verified; quota is unavailable." }
             if !snapshot.isCurrent() { return "Observation is out of date. Refresh to read current quota." }
+            if provider == .antigravity && !snapshot.buckets.contains(where: { $0.group == .gemini }) {
+                return "Gemini quota is not reported by this source. Open Antigravity IDE to read both model groups. Other-model quota does not measure Gemini usage."
+            }
             return snapshot.buckets.isEmpty ? "The service did not report quota windows." : ""
         case .signedOut: return "Sign in to \(provider == .glm ? "ZCode / Z.ai" : "Antigravity") to read your subscription quota."
         case .unavailable: return provider == .glm
