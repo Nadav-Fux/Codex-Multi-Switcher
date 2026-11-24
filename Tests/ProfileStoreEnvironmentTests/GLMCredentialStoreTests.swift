@@ -102,9 +102,13 @@ struct GLMCredentialStoreTests {
                 return "legacy-key"
             }
 
-            #expect(try GLMCredentialStore.load() == nil)
+            // Evaluate outside #expect: the macro cannot propagate a throw here
+            // (CI: "errors thrown from here are not handled").
+            let loaded = try GLMCredentialStore.load()
+            let stored = try store.load()
+            #expect(loaded == nil)
             #expect(removeRan)
-            #expect(try store.load() == nil)
+            #expect(stored == nil)
             #expect(store.hasNoLegacyMigrationMarker)
         }
     }

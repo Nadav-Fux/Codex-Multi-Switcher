@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Antigravity quota no longer shows `?` when a window is unused: the quota service omits `resetTime` on a full window, and that used to discard the whole response. A partly used window without a reset time still fails closed.
 - Stale sign-in healing now requires a shared user-level identity claim, not only `account_id` — on ChatGPT Team workspaces `account_id` is shared by every member, so a saved profile without an `id_token` can no longer adopt a teammate's newer login. The same check guards writing rotated credentials back to `~/.codex/auth.json`.
 - The `~/.codex/auth.json` write-back prepares its temp file first, then re-reads the destination immediately before the rename and commits only when it is unchanged — narrowing the window where a login Codex Desktop saves concurrently could be overwritten to the final compare-and-rename.
 - The GLM key stdin import in Local and Preview builds now writes to the same profile home the GUI reads it from.

@@ -73,9 +73,16 @@ struct AntigravityIDEQuotaReader: Sendable {
                 guard seen.insert(id).inserted,
                       let fraction = entry["remainingFraction"] as? NSNumber,
                       CFGetTypeID(fraction) != CFBooleanGetTypeID(), fraction.doubleValue.isFinite,
-                      (0...1).contains(fraction.doubleValue),
-                      let reset = entry["resetTime"] as? String,
-                      let date = Self.date(reset) else { throw AntigravityUsageError.invalidResponse }
+                      (0...1).contains(fraction.doubleValue) else { throw AntigravityUsageError.invalidResponse }
+                // An unused (full) window carries no resetTime. Any other window must have one.
+                let date: Date?
+                if let reset = entry["resetTime"] as? String {
+                    guard let parsed = Self.date(reset) else { throw AntigravityUsageError.invalidResponse }
+                    date = parsed
+                } else {
+                    guard fraction.doubleValue == 1 else { throw AntigravityUsageError.invalidResponse }
+                    date = nil
+                }
                 buckets.append(ProviderUsageBucket(id: id, title: title,
                     remainingFraction: fraction.doubleValue, resetAt: date, group: family))
             }
