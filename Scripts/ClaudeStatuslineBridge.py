@@ -69,10 +69,17 @@ def _write_snapshot(snapshot_path, config_dir, profile_id, config_directory, aut
         os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         updates = {}
-        for source_key, output_key in (("five_hour", "fiveHour"), ("seven_day", "sevenDay")):
+        for source_key, output_key in (
+            ("five_hour", "fiveHour"),
+            ("seven_day", "sevenDay"),
+            ("seven_day_overage_included", "fable"),
+        ):
             candidate = _window(rate_limits, source_key)
             if candidate is not None:
                 updates[output_key] = candidate
+        model_weekly = _window(rate_limits, "seven_day_sonnet") or _window(rate_limits, "seven_day_opus")
+        if model_weekly is not None:
+            updates["modelWeekly"] = model_weekly
         # An absent/null/invalid rate_limits object is not a zero-usage sample.
         # Do not refresh metadata or replace a recent good snapshot in that case.
         if not updates:

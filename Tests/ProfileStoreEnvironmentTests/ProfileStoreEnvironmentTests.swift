@@ -574,4 +574,179 @@ final class ProfileStoreEnvironmentTests {
                       "Completed migration retained its pending credential fingerprint")
     }
 
+    // MARK: - Provider visibility gating
+
+    @Test
+    func providerVisibilityDefaultsAndOptOutRules() throws {
+        let suiteName = "provider-visibility-tests-\(UUID().uuidString)"
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+
+        // A fresh install defaults to Codex + Claude and never force-enables GLM/Antigravity.
+        try envExpect(Set(ProviderVisibility.selection(in: suite)) == [.codex, .claude],
+                      "Fresh install did not default to Codex + Claude only")
+        try envExpect(!ProviderVisibility.isVisible(.glm, in: suite)
+                      && !ProviderVisibility.isVisible(.antigravity, in: suite),
+                      "Fresh install force-enabled an unconfigured provider")
+
+        // Every provider can be switched off, and any other combination switched on.
+        ProviderVisibility.set(.codex, visible: false, in: suite)
+        try envExpect(ProviderVisibility.selection(in: suite) == [.claude],
+                      "Codex could not be switched off")
+        ProviderVisibility.set(.glm, visible: true, in: suite)
+        ProviderVisibility.set(.claude, visible: false, in: suite)
+        try envExpect(ProviderVisibility.selection(in: suite) == [.glm],
+                      "A GLM-only selection must be possible")
+
+        // The menu bar needs an icon: the last visible provider cannot be turned off.
+        ProviderVisibility.set(.glm, visible: false, in: suite)
+        try envExpect(ProviderVisibility.selection(in: suite) == [.glm],
+                      "The last visible provider must stay selected")
+    }
+
+    @Test @MainActor
+    func hiddenCodexProviderNeverStartsUsageRefresh() async throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-visibility-codex-tests-\(UUID().uuidString)", isDirectory: true)
+        let home = workDir.appendingPathComponent("home", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+        let environment = ["CODEX_PROFILE_HOME": home.path]
+        let paths = AppPaths(environment: environment)
+        let config = AppConfig(profiles: [ProfileConfig(id: "1", label: "One")], activeProfile: "1")
+        try AtomicFileWriter.write(JSONEncoder().encode(config), to: paths.configURL)
+
+        let store = ProfileStore(authVault: MigrationTestVault(), environment: environment)
+        store.setLiveProfileId("1")
+        let provider = UsageProvider(store: store)
+        provider.isVisible = { false }
+        provider.refreshAll(force: true)
+        provider.refreshActive(force: true)
+        try envExpect(!provider.isRefreshing,
+                      "A hidden Codex provider must not start a usage refresh")
+
+        // Sanity: the identical fixture does start a refresh while visible, proving
+        // the assertions above measure gating rather than an inert fixture.
+        provider.isVisible = { true }
+        provider.refreshAll(force: true)
+        try envExpect(provider.isRefreshing,
+                      "The same refresh must run while the provider is visible")
+        let deadline = Date().addingTimeInterval(10)
+        while provider.isRefreshing && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try envExpect(!provider.isRefreshing, "The sanity refresh did not finish")
+    }
+
+    @Test @MainActor
+    func hiddenExternalProviderIsNotPolledInBackground() async throws {
+        final class Counter: @unchecked Sendable { var count = 0 }
+        struct CountingAdapter: UsageProviderAdapter {
+            let providerID: ProviderID
+            let counter: Counter
+            func readUsageSnapshot() async -> ProviderUsageSnapshot {
+                self.counter.count += 1
+                return ProviderUsageSnapshot(provider: self.providerID, source: "test", state: .unavailable)
+            }
+        }
+
+        let counter = Counter()
+        let store = ExternalProviderStore(adapters: [CountingAdapter(providerID: .glm, counter: counter)])
+        store.isVisible = { _ in false }
+        store.refresh(force: true, respectingVisibility: true)
+        store.refresh(.glm, force: true, respectingVisibility: true)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try envExpect(counter.count == 0,
+                      "A hidden external provider was polled in the background")
+
+        // Explicit per-provider settings actions are user intent, not background polling.
+        store.refresh(.glm, force: true)
+        let deadline = Date().addingTimeInterval(5)
+        while counter.count == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try envExpect(counter.count == 1, "An explicit settings refresh must still run")
+    }
+
+    @Test @MainActor
+    func cancelledExternalTaskCannotClearReplacementTaskBookkeeping() async throws {
+        actor ControlledAdapter: UsageProviderAdapter {
+            nonisolated let providerID: ProviderID = .glm
+            private(set) var startCount = 0
+            private var continuations: [CheckedContinuation<ProviderUsageSnapshot, Never>] = []
+
+            func readUsageSnapshot() async -> ProviderUsageSnapshot {
+                self.startCount += 1
+                return await withCheckedContinuation { continuation in
+                    self.continuations.append(continuation)
+                }
+            }
+
+            @discardableResult
+            func finishNext(source: String) -> Bool {
+                guard !self.continuations.isEmpty else { return false }
+                let continuation = self.continuations.removeFirst()
+                continuation.resume(returning: ProviderUsageSnapshot(
+                    provider: .glm, source: source, state: .unavailable))
+                return true
+            }
+        }
+
+        let adapter = ControlledAdapter()
+        let store = ExternalProviderStore(adapters: [adapter])
+
+        func waitForStarts(_ count: Int) async throws {
+            let deadline = Date().addingTimeInterval(5)
+            while true {
+                let started = await adapter.startCount
+                if started >= count { return }
+                if Date() >= deadline { try envFail("Timed out waiting for \(count) provider reads") }
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+
+        store.refresh(.glm, force: true)
+        try await waitForStarts(1)
+        store.cancel(.glm)
+        store.refresh(.glm, force: true)
+        try await waitForStarts(2)
+
+        // The first read belongs to the cancelled task. Its completion must not
+        // clear the replacement task's refreshing state or task handle.
+        let finishedStale = await adapter.finishNext(source: "stale")
+        try envExpect(finishedStale, "The first controlled read did not finish")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try envExpect(store.refreshing.contains(.glm),
+                      "A stale cancelled task cleared the replacement task's refreshing state")
+        try envExpect(store.snapshots[.glm] == nil,
+                      "A stale cancelled task published its provider snapshot")
+
+        // Because the replacement handle survived, this cancel really reaches the
+        // second read instead of letting it publish after the provider is hidden.
+        store.cancel(.glm)
+        let finishedReplacement = await adapter.finishNext(source: "replacement")
+        try envExpect(finishedReplacement, "The replacement controlled read did not finish")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try envExpect(!store.refreshing.contains(.glm),
+                      "Cancelling the replacement task did not clear its refreshing state")
+        try envExpect(store.snapshots[.glm] == nil,
+                      "The cancelled replacement task published its provider snapshot")
+        let finalStartCount = await adapter.startCount
+        try envExpect(finalStartCount == 2,
+                      "Stale task completion started an unintended parallel provider read")
+    }
+
+    @Test @MainActor
+    func hiddenClaudeProviderDoesNotRefreshInBackground() throws {
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-visibility-claude-tests-\(UUID().uuidString)", isDirectory: true)
+        let home = workDir.appendingPathComponent("home", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+
+        let store = ClaudeProfileStore(environment: ["CODEX_PROFILE_HOME": home.path])
+        store.isVisible = { false }
+        store.refresh(force: true, respectingVisibility: true)
+        try envExpect(!store.isRefreshing && store.statuses.isEmpty,
+                      "A hidden Claude provider must not start helpers, CLIs or network reads")
+    }
+
 }

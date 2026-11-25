@@ -77,6 +77,10 @@ enum ProviderVisibility {
         return [.codex, .claude].filter { $0 == .codex ? old.showsCodex : old.showsClaude }
     }
 
+    static func isVisible(_ provider: ProviderID, in defaults: UserDefaults = .standard) -> Bool {
+        self.selection(in: defaults).contains(provider)
+    }
+
     static func set(_ provider: ProviderID, visible: Bool, in defaults: UserDefaults = .standard) {
         var selected = Set(selection(in: defaults))
         if visible { selected.insert(provider) } else { selected.remove(provider) }

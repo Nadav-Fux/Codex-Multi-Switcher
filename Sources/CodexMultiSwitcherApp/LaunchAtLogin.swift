@@ -2,6 +2,11 @@ import Foundation
 import CodexProfileCore
 import ServiceManagement
 
+extension Notification.Name {
+    static let renewalAgentRegistrationDidChange = Notification.Name(
+        "com.codexmultiswitcher.app.renewalAgentRegistrationDidChange")
+}
+
 enum LaunchAtLogin {
     enum State: Equatable {
         case enabled
@@ -343,6 +348,29 @@ enum RenewalAgent {
             }
         @unknown default:
             throw OperationError.failed("Unexpected renewal LaunchAgent status.")
+        }
+    }
+
+    /// Removes the daily renewal schedule. Called when the user turns the Codex
+    /// provider off: a hidden provider must not launch helper processes at all.
+    /// Returns whether an asynchronous unregistration was started; its completion
+    /// is reported through `completion` with `true` when no error was reported.
+    @discardableResult
+    static func unregister(completion: @escaping (Bool) -> Void) -> Bool {
+        guard Self.isEligible else { return false }
+        let service = SMAppService.agent(plistName: Self.plistName)
+        switch service.status {
+        case .enabled, .requiresApproval:
+            service.unregister { error in
+                if let error {
+                    AppLogger.warning("Failed to unregister renewal agent",
+                                      metadata: ["error": error.localizedDescription])
+                }
+                completion(error == nil)
+            }
+            return true
+        default:
+            return false
         }
     }
 

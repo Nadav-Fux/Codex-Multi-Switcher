@@ -71,19 +71,26 @@ actor ClaudeQuotaRefreshPolicy {
             completed.rateLimitCount = 0
             completed.failure = nil
         } catch {
-            let failure = error as? ClaudeCurrentUsageError ?? .requestFailed
-            completed.failure = failure
-            if failure == .accountChanged { completed.snapshot = nil }
-            if failure == .rateLimited {
-                completed.rateLimitCount = min(4, completed.rateLimitCount + 1)
-                // The observed provider sends Retry-After: 0 for this endpoint.
-                // Never treat that as permission for a tight retry loop.
-                let delay = min(3600.0, 600 * pow(2, Double(completed.rateLimitCount - 1)))
-                completed.nextRefreshAt = now.addingTimeInterval(delay)
-                CoreLogger.warning("Claude quota request delayed", metadata: [
-                    "category": "rateLimited", "retry_at": ISO8601DateFormatter().string(from: completed.nextRefreshAt),
-                    "delay_seconds": String(Int(delay)),
-                ])
+            if error is CancellationError {
+                // Cancellation is user intent, not a service failure. Do not make the
+                // next visible refresh wait behind either failure backoff mechanism.
+                completed.failure = nil
+                completed.nextRefreshAt = .distantPast
+            } else {
+                let failure = error as? ClaudeCurrentUsageError ?? .requestFailed
+                completed.failure = failure
+                if failure == .accountChanged { completed.snapshot = nil }
+                if failure == .rateLimited {
+                    completed.rateLimitCount = min(4, completed.rateLimitCount + 1)
+                    // The observed provider sends Retry-After: 0 for this endpoint.
+                    // Never treat that as permission for a tight retry loop.
+                    let delay = min(3600.0, 600 * pow(2, Double(completed.rateLimitCount - 1)))
+                    completed.nextRefreshAt = now.addingTimeInterval(delay)
+                    CoreLogger.warning("Claude quota request delayed", metadata: [
+                        "category": "rateLimited", "retry_at": ISO8601DateFormatter().string(from: completed.nextRefreshAt),
+                        "delay_seconds": String(Int(delay)),
+                    ])
+                }
             }
         }
         do {
@@ -102,7 +109,8 @@ actor ClaudeQuotaRefreshPolicy {
         let snapshot = record.snapshot.flatMap { snapshot -> ClaudeUsageSnapshot? in
             guard Self.valid(snapshot, now: now) else { return nil }
             return ClaudeUsageSnapshot(fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
-                modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
+                modelWeekly: snapshot.modelWeekly, fable: snapshot.fable,
+                observedAt: snapshot.observedAt, source: snapshot.source,
                 isStale: record.failure != nil || snapshot.isStale
                     || now.timeIntervalSince(snapshot.observedAt) > ClaudeCurrentUsageService.cacheFreshness,
                 accountVerified: snapshot.accountVerified, resets: snapshot.resets)
@@ -141,7 +149,7 @@ actor ClaudeQuotaRefreshPolicy {
         let age = now.timeIntervalSince(snapshot.observedAt)
         return snapshot.accountVerified && age.isFinite && age >= -60 && age <= 86400
             && (snapshot.fiveHour != nil || snapshot.sevenDay != nil)
-            && [snapshot.fiveHour, snapshot.sevenDay, snapshot.modelWeekly].compactMap { $0 }.allSatisfy {
+            && [snapshot.fiveHour, snapshot.sevenDay, snapshot.modelWeekly, snapshot.fable].compactMap { $0 }.allSatisfy {
                 $0.usedPercentage.isFinite && (0...100).contains($0.usedPercentage)
                     && ($0.resetsAt?.timeIntervalSince1970.isFinite ?? true)
             }
@@ -150,7 +158,8 @@ actor ClaudeQuotaRefreshPolicy {
     private static func historical(_ snapshot: ClaudeUsageSnapshot?, now: Date) -> ClaudeUsageSnapshot? {
         guard let snapshot, Self.valid(snapshot, now: now) else { return nil }
         return ClaudeUsageSnapshot(fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
-            modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
+            modelWeekly: snapshot.modelWeekly, fable: snapshot.fable,
+            observedAt: snapshot.observedAt, source: snapshot.source,
             isStale: true, accountVerified: true, resets: snapshot.resets)
     }
 
@@ -174,7 +183,9 @@ actor ClaudeQuotaRefreshPolicy {
             return ClaudeUsageWindow(usedPercentage: number.doubleValue, resetsAt: date)
         }
         let snapshot = ClaudeUsageSnapshot(fiveHour: window("five_hour"), sevenDay: window("seven_day"),
-            modelWeekly: window("seven_day_sonnet"), observedAt: Date(timeIntervalSince1970: fetchedAt),
+            modelWeekly: window("seven_day_sonnet") ?? window("seven_day_opus"),
+            fable: window("seven_day_overage_included"),
+            observedAt: Date(timeIntervalSince1970: fetchedAt),
             source: .oauthUsage, isStale: true, accountVerified: true)
         return Self.valid(snapshot, now: now) ? snapshot : nil
     }

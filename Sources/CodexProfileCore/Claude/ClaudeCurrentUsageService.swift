@@ -219,12 +219,25 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
             guard let identity = ClaudeUsageReader.accountFingerprint(authBefore) else { throw ClaudeCurrentUsageError.accountChanged }
             try self.beginAttempt(now: now, identity: identity, force: force)
             do {
-                let snapshot = try await Task.detached(priority: .utility) { try helper.read(identity: identity) }.value
+                // The helper blocks in a child process, so keep it off the caller.
+                // Detached tasks do not inherit cancellation; forward it explicitly
+                // so the helper's own cancellation polling terminates that process.
+                let readTask = Task.detached(priority: .utility) { try helper.read(identity: identity) }
+                let snapshot = try await withTaskCancellationHandler {
+                    try await readTask.value
+                } onCancel: {
+                    readTask.cancel()
+                }
                 guard ClaudeUsageReader.accountFingerprint(try authAfter()) == identity else {
                     throw ClaudeCurrentUsageError.accountChanged
                 }
                 self.finishAttempt()
                 return snapshot
+            } catch let cancellation as CancellationError {
+                // A user-initiated cancel is not a failed service response and must
+                // not keep the next visible refresh behind the failure backoff.
+                self.finishAttempt()
+                throw cancellation
             } catch {
                 let safe = error as? ClaudeCurrentUsageError ?? .requestFailed
                 self.recordFailure(safe)
@@ -314,7 +327,8 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         // Serialize only numeric observations and identity digest, never the raw HTTP response/token.
         var normalized: [String: Any] = [:]
         for (key, window) in [("five_hour", snapshot.fiveHour), ("seven_day", snapshot.sevenDay),
-                              ("seven_day_sonnet", snapshot.modelWeekly)] {
+                              ("seven_day_sonnet", snapshot.modelWeekly),
+                              ("seven_day_overage_included", snapshot.fable)] {
             if let window {
                 var value: [String: Any] = ["utilization": window.usedPercentage]
                 if let reset = window.resetsAt { value["resets_at"] = ISO8601DateFormatter().string(from: reset) }
@@ -373,7 +387,9 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         }
         let five = window("five_hour"), seven = window("seven_day")
         guard five != nil || seven != nil else { throw ClaudeCurrentUsageError.invalidResponse }
-        return ClaudeUsageSnapshot(fiveHour: five, sevenDay: seven, modelWeekly: window("seven_day_sonnet"),
+        return ClaudeUsageSnapshot(fiveHour: five, sevenDay: seven,
+                                   modelWeekly: window("seven_day_sonnet") ?? window("seven_day_opus"),
+                                   fable: window("seven_day_overage_included"),
                                    observedAt: observedAt, source: .oauthUsage,
                                    isStale: now.timeIntervalSince(observedAt) > Self.cacheFreshness, accountVerified: true,
                                    resets: ClaudeLimitReset.parse(usage["cedar_ember"]))

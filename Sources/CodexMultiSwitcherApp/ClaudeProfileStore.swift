@@ -1,6 +1,7 @@
 import AppKit
 import CodexProfileCore
 import Combine
+import Darwin
 import Foundation
 
 /// Independent from Codex profiles: selecting here affects only the next NEW Claude process.
@@ -14,6 +15,9 @@ final class ClaudeProfileStore: ObservableObject {
     @Published private(set) var isAuthorizingCredential = false
     @Published private(set) var nextUsageRefresh: [String: Date] = [:]
     var onChange: (() -> Void)?
+    /// Injected by the app so background refreshes honor provider visibility.
+    /// Defaults to true so standalone tests keep their existing behavior.
+    var isVisible: () -> Bool = { true }
 
     private let registry: ClaudeProfileRegistry
     private let cli: ClaudeCLIService
@@ -24,6 +28,7 @@ final class ClaudeProfileStore: ObservableObject {
     private let priorQuotaURL: URL
     private let claudeUserHome: URL
     private var refreshTask: Task<Void, Never>?
+    private var refreshEpoch = 0
     private var pendingBridgeOperations: Set<String> = []
     private var pendingConnectID: String?
     private var pendingForcedRefresh = false
@@ -56,7 +61,10 @@ final class ClaudeProfileStore: ObservableObject {
 
     /// `force` is for an explicit Refresh click or a finished Connect: it asks Claude Code and
     /// the helper again right away instead of reusing a recent (possibly failed) observation.
-    func refresh(force: Bool = false) {
+    /// Automatic/background callers pass `respectingVisibility` so a hidden provider never
+    /// launches helpers, CLIs or network reads. Explicit per-provider actions leave it false.
+    func refresh(force: Bool = false, respectingVisibility: Bool = false) {
+        if respectingVisibility && !self.isVisible() { return }
         guard !self.isRefreshing, !self.isAuthorizingCredential else {
             if force { self.pendingForcedRefresh = true }
             return
@@ -90,6 +98,8 @@ final class ClaudeProfileStore: ObservableObject {
                 self.lastCodeUsageRefresh[profile.id] = now
             }
         }
+        self.refreshEpoch += 1
+        let epoch = self.refreshEpoch
         self.refreshTask = Task { [weak self] in
             // Bound concurrent metadata and usage reads for large profile registries.
             await withTaskGroup(of: (String, ClaudeProfileStatus, Date?).self) { group in
@@ -168,7 +178,7 @@ final class ClaudeProfileStore: ObservableObject {
                 }
                 for _ in 0..<3 { if let profile = pending.next() { enqueue(profile) } }
                 for await (id, var status, nextRefresh) in group {
-                    guard let self else { group.cancelAll(); return }
+                    guard let self, self.refreshEpoch == epoch else { group.cancelAll(); return }
                     if let profile = self.profiles.first(where: { $0.id == id }) {
                         status.bridgeInstalled = self.installer.isInstalled(profile: profile)
                         self.statuses[id] = status
@@ -178,7 +188,7 @@ final class ClaudeProfileStore: ObservableObject {
                     if let profile = pending.next() { enqueue(profile) }
                 }
             }
-            guard let self else { return }
+            guard let self, self.refreshEpoch == epoch else { return }
             self.isRefreshing = false
             self.refreshTask = nil
             self.installMissingRecorders()
@@ -192,6 +202,22 @@ final class ClaudeProfileStore: ObservableObject {
                 self.refresh(force: true)
             }
         }
+        self.onChange?()
+    }
+
+    /// Stops background work when the provider is hidden. Results already in flight are
+    /// discarded via the epoch check, and no blocked-access notification survives hiding.
+    func cancelRefresh() {
+        self.refreshEpoch += 1
+        self.refreshTask?.cancel()
+        self.refreshTask = nil
+        self.pendingForcedRefresh = false
+        self.pendingConnectID = nil
+        self.isRefreshing = false
+        for id in Array(self.statuses.keys) where self.statuses[id]?.busy == true {
+            self.statuses[id]?.busy = false
+        }
+        ClaudeAccessNotifier.update(blocked: false)
         self.onChange?()
     }
 
@@ -262,7 +288,14 @@ final class ClaudeProfileStore: ObservableObject {
                 self.isAuthorizingCredential = false
                 self.statuses[id]?.busy = false
                 self.statuses[id]?.error = nil
-                self.refresh(force: true)
+                if self.isVisible() {
+                    self.refresh(force: true)
+                } else {
+                    // Connect was explicit, but its asynchronous completion is not
+                    // consent to resume background polling after the provider was hidden.
+                    self.pendingForcedRefresh = false
+                    self.onChange?()
+                }
             } catch {
                 guard let self else { return }
                 let category = (error as? ClaudeCurrentUsageError).map { String(describing: $0) } ?? "other"
@@ -272,7 +305,13 @@ final class ClaudeProfileStore: ObservableObject {
                 self.statuses[id]?.error = error.localizedDescription
                 self.error = error.localizedDescription
                 self.onChange?()
-                if self.pendingForcedRefresh { self.refresh(force: true) }
+                if self.pendingForcedRefresh {
+                    if self.isVisible() {
+                        self.refresh(force: true)
+                    } else {
+                        self.pendingForcedRefresh = false
+                    }
+                }
             }
         }
         self.onChange?()
@@ -438,7 +477,9 @@ enum ClaudeCodeUsageCache {
         let seven = Self.window(utilization["seven_day"])
         guard five != nil || seven != nil else { return nil }
         return ClaudeUsageSnapshot(
-            fiveHour: five, sevenDay: seven, modelWeekly: Self.window(utilization["seven_day_opus"]),
+            fiveHour: five, sevenDay: seven,
+            modelWeekly: Self.window(utilization["seven_day_sonnet"]) ?? Self.window(utilization["seven_day_opus"]),
+            fable: Self.window(utilization["seven_day_overage_included"]),
             observedAt: observedAt, source: .oauthUsage,
             isStale: age > Self.staleAfter, accountVerified: true,
             resets: ClaudeLimitReset.parse(utilization["cedar_ember"]))
@@ -477,7 +518,17 @@ enum ClaudeCodeUsageRefresher {
     private static let disabledKey = "claudeCodeUsageRefreshDisabled"
     static var isEnabled: Bool { !UserDefaults.standard.bool(forKey: Self.disabledKey) }
 
+    /// SIGTERM first keeps normal exits clean; the bounded SIGKILL fallback prevents
+    /// a cancelled or timed-out child from outliving the refresh that started it.
+    private static func terminate(_ process: Process, done: DispatchSemaphore, grace: TimeInterval) {
+        process.terminate()
+        guard done.wait(timeout: .now() + grace) == .timedOut else { return }
+        kill(process.processIdentifier, SIGKILL)
+        _ = done.wait(timeout: .now() + 2)
+    }
+
     static func run(executable: URL, environment: [String: String], timeout: TimeInterval = 45) -> Bool {
+        guard !Task.isCancelled else { return false }
         let fileManager = FileManager.default
         let directory = fileManager.temporaryDirectory.appendingPathComponent("claude-usage-refresh-" + UUID().uuidString)
         guard (try? fileManager.createDirectory(at: directory, withIntermediateDirectories: false,
@@ -501,12 +552,19 @@ enum ClaudeCodeUsageRefresher {
             CoreLogger.warning("Claude usage refresh could not start", metadata: [:])
             return false
         }
-        if done.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = done.wait(timeout: .now() + 5)
-            try? handle.close()
-            CoreLogger.warning("Claude usage refresh timed out", metadata: [:])
-            return false
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while done.wait(timeout: .now() + 0.05) == .timedOut {
+            if Task.isCancelled {
+                Self.terminate(process, done: done, grace: 2)
+                try? handle.close()
+                return false
+            }
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                Self.terminate(process, done: done, grace: 5)
+                try? handle.close()
+                CoreLogger.warning("Claude usage refresh timed out", metadata: [:])
+                return false
+            }
         }
         try? handle.close()
         guard process.terminationStatus == 0,

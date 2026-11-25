@@ -62,6 +62,7 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
             self.lock.lock(); self.last = (identity, snapshot); self.lock.unlock()
             return snapshot
         } catch {
+            if error is CancellationError { throw error }
             let safe = error as? ClaudeCurrentUsageError ?? .requestFailed
             // Renewal-unavailable is transient: the user can renew the sign-in
             // in Claude Code at any time, so the next poll must retry rather
@@ -77,7 +78,8 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
         self.lock.lock(); defer { self.lock.unlock() }
         guard let (captured, snapshot) = self.last, captured == identity else { return nil }
         return ClaudeUsageSnapshot(fiveHour: snapshot.fiveHour, sevenDay: snapshot.sevenDay,
-            modelWeekly: snapshot.modelWeekly, observedAt: snapshot.observedAt, source: snapshot.source,
+            modelWeekly: snapshot.modelWeekly, fable: snapshot.fable,
+            observedAt: snapshot.observedAt, source: snapshot.source,
             isStale: true,
             accountVerified: snapshot.accountVerified, resets: snapshot.resets)
     }
@@ -123,10 +125,24 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
         guard snapshot.observedAt.timeIntervalSinceNow <= 60,
               snapshot.observedAt.timeIntervalSince1970.isFinite,
               snapshot.fiveHour != nil || snapshot.sevenDay != nil else { return false }
-        return [snapshot.fiveHour, snapshot.sevenDay, snapshot.modelWeekly].compactMap { $0 }.allSatisfy {
+        return [snapshot.fiveHour, snapshot.sevenDay, snapshot.modelWeekly, snapshot.fable].compactMap { $0 }.allSatisfy {
             $0.usedPercentage.isFinite && (0...100).contains($0.usedPercentage)
                 && ($0.resetsAt?.timeIntervalSince1970.isFinite ?? true)
         }
+    }
+
+    /// Cancellation uses SIGTERM first because the helper normally exits immediately;
+    /// the bounded SIGKILL fallback keeps a wedged child from outliving its caller.
+    private static func terminateForCancellation(_ process: Process) {
+        process.terminate()
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while process.isRunning, ProcessInfo.processInfo.systemUptime < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
     }
 
     /// Only numeric quota output is written to this private, short-lived file. Secrets never cross IPC.
@@ -134,6 +150,7 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
         guard ["read", "authorize", "verify"].contains(command), try self.executableDigest() == digest else {
             throw ClaudeCurrentUsageError.credentialUnavailable
         }
+        guard !Task.isCancelled else { throw CancellationError() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("claude-usage-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                attributes: [.posixPermissions: 0o700])
@@ -155,6 +172,10 @@ public final class ClaudeUsageHelperClient: @unchecked Sendable {
         do { try process.run() } catch { throw ClaudeCurrentUsageError.requestFailed }
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         while process.isRunning {
+            if Task.isCancelled {
+                Self.terminateForCancellation(process)
+                throw CancellationError()
+            }
             let size = (try? output.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if ProcessInfo.processInfo.systemUptime >= deadline || size > Self.maximumOutput {
                 kill(process.processIdentifier, SIGKILL)
