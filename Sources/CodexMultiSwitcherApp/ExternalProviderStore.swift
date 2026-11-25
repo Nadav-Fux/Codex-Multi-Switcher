@@ -8,10 +8,14 @@ final class ExternalProviderStore: ObservableObject {
     @Published private(set) var snapshots: [ProviderID: ProviderUsageSnapshot] = [:]
     @Published private(set) var refreshing: Set<ProviderID> = []
     var onChange: (() -> Void)?
+    /// Injected by the app so automatic refreshes honor provider visibility.
+    /// Defaults to true so direct uses (tests, explicit settings actions) keep their behavior.
+    var isVisible: (ProviderID) -> Bool = { _ in true }
 
     private let adapters: [ProviderID: any UsageProviderAdapter]
     private let now: () -> Date
     private var tasks: [ProviderID: Task<Void, Never>] = [:]
+    private var taskGenerations: [ProviderID: UInt64] = [:]
     private var credentialGeneration: [ProviderID: UInt64] = [:]
     private var pendingForced: Set<ProviderID> = []
     private var lastAttempt: [ProviderID: Date] = [:]
@@ -21,8 +25,18 @@ final class ExternalProviderStore: ObservableObject {
         self.now = now
     }
 
-    func refresh(_ provider: ProviderID? = nil, force: Bool = false) {
+    @discardableResult
+    private func advanceTaskGeneration(_ provider: ProviderID) -> UInt64 {
+        let next = self.taskGenerations[provider, default: 0] &+ 1
+        self.taskGenerations[provider] = next
+        return next
+    }
+
+    /// Automatic/background callers pass `respectingVisibility` so a hidden provider is
+    /// never polled. Explicit per-provider settings actions leave it false.
+    func refresh(_ provider: ProviderID? = nil, force: Bool = false, respectingVisibility: Bool = false) {
         for id in provider.map({ [$0] }) ?? [.antigravity, .glm] {
+            if respectingVisibility && !self.isVisible(id) { continue }
             guard let adapter = adapters[id] else { continue }
             if refreshing.contains(id) {
                 if force { pendingForced.insert(id) }
@@ -36,15 +50,24 @@ final class ExternalProviderStore: ObservableObject {
             // A server request to wait is honoured even by a forced refresh.
             guard elapsed >= cooldown || (force && !rateLimited) else { continue }
             let generation = credentialGeneration[id, default: 0]
+            let taskGeneration = self.advanceTaskGeneration(id)
             lastAttempt[id] = now
             refreshing.insert(id)
             tasks[id] = Task { [weak self] in
                 let snapshot = await adapter.readUsageSnapshot()
-                guard let self, !Task.isCancelled else { return }
+                guard let self else { return }
                 defer {
-                    self.refreshing.remove(id); self.tasks[id] = nil; self.onChange?()
-                    if self.pendingForced.remove(id) != nil { self.refresh(id, force: true) }
+                    // A task that finishes after cancellation may share the provider
+                    // with a newer task. Only the task that still owns this generation
+                    // may clear the current bookkeeping or consume a queued force.
+                    if self.taskGenerations[id] == taskGeneration {
+                        self.refreshing.remove(id)
+                        self.tasks[id] = nil
+                        self.onChange?()
+                        if self.pendingForced.remove(id) != nil { self.refresh(id, force: true) }
+                    }
                 }
+                guard !Task.isCancelled else { return }
                 guard snapshot.provider == id, self.credentialGeneration[id, default: 0] == generation else { return }
                 if snapshot.state == .error(.rateLimited) { self.lastAttempt[id] = self.now() }
                 // Failed reads replace the observation. Old-account numbers never
@@ -62,11 +85,23 @@ final class ExternalProviderStore: ObservableObject {
         refresh(provider, force: true)
     }
 
-    func cancel() {
-        tasks.values.forEach { $0.cancel() }
-        tasks.removeAll()
-        pendingForced.removeAll()
-        refreshing.removeAll()
+    /// Cancels in-flight work so a hidden provider stops publishing; the task's
+    /// cancellation and generation guards discard any late adapter result.
+    func cancel(_ provider: ProviderID? = nil) {
+        if let provider {
+            self.advanceTaskGeneration(provider)
+            tasks[provider]?.cancel()
+            tasks[provider] = nil
+            pendingForced.remove(provider)
+            refreshing.remove(provider)
+        } else {
+            for provider in Array(tasks.keys) { self.advanceTaskGeneration(provider) }
+            tasks.values.forEach { $0.cancel() }
+            tasks.removeAll()
+            pendingForced.removeAll()
+            refreshing.removeAll()
+        }
+        onChange?()
     }
 }
 

@@ -131,6 +131,7 @@ public struct ClaudeUsageSnapshot: Codable, Equatable, Sendable {
     public let fiveHour: ClaudeUsageWindow?
     public let sevenDay: ClaudeUsageWindow?
     public let modelWeekly: ClaudeUsageWindow?
+    public let fable: ClaudeUsageWindow?
     public let observedAt: Date
     public let source: ClaudeUsageSource
     public let isStale: Bool
@@ -142,13 +143,15 @@ public struct ClaudeUsageSnapshot: Codable, Equatable, Sendable {
     public var accountMatched: Bool { self.accountVerified }
 
     public init(fiveHour: ClaudeUsageWindow?, sevenDay: ClaudeUsageWindow?,
-                modelWeekly: ClaudeUsageWindow? = nil, observedAt: Date,
+                modelWeekly: ClaudeUsageWindow? = nil, fable: ClaudeUsageWindow? = nil,
+                observedAt: Date,
                 source: ClaudeUsageSource, isStale: Bool, accountVerified: Bool = false,
                 resets: [ClaudeLimitReset]? = nil) {
         self.resets = resets
         self.fiveHour = fiveHour
         self.sevenDay = sevenDay
         self.modelWeekly = modelWeekly
+        self.fable = fable
         self.observedAt = observedAt
         self.source = source
         self.isStale = isStale

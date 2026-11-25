@@ -29,6 +29,9 @@ final class UsageProvider {
     var onRefreshComplete: (() -> Void)?
     /// Fired after a profile's guarded status update, before slower profiles finish.
     var onProfileRefresh: ((String) -> Void)?
+    /// Injected by the app: when the Codex provider is hidden, no usage refresh may
+    /// start at all — refresh queries read credentials and hit the network.
+    var isVisible: () -> Bool = { true }
 
     init(store: ProfileStore) {
         self.store = store
@@ -64,6 +67,7 @@ final class UsageProvider {
     }
 
     func refreshAll(force: Bool = false) {
+        guard self.isVisible() else { return }
         guard !self.isRefreshing else { return }
         guard force || Date().timeIntervalSince(self.lastRefreshAll) > 60 else { return }
 
@@ -101,6 +105,7 @@ final class UsageProvider {
     /// Cheap timer/menu refresh of only the current profile. Shares the full refresh's
     /// lifecycle so cancellation, renewal coordination and leases remain serialized.
     func refreshActive(force: Bool = false) {
+        guard self.isVisible() else { return }
         guard !self.isRefreshing, !self.store.isAuthMutationInProgress(),
               let id = self.store.liveProfileId,
               self.store.config.profiles.contains(where: { $0.id == id }) else { return }

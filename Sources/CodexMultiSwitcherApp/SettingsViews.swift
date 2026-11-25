@@ -694,7 +694,7 @@ struct GeneralTab: View {
                         .font(.system(size: 11))
                         .foregroundStyle(self.lastRenewalRunIsHealthy ? Color.secondary : Palette.warning)
                 }
-                Text("Renewal refreshes credentials before they're 3 days old. A Mac that stays powered off long enough to miss that window can come back needing a manual sign-in, and nothing local prevents that.")
+                Text("Renewal refreshes credentials before they're 3 days old. Hiding Codex turns off this daily renewal. A Mac that stays powered off long enough to miss that window can come back needing a manual sign-in, and nothing local prevents that.")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             }
@@ -840,6 +840,12 @@ struct GeneralTab: View {
             self.refreshRenewalAgentState()
             self.refreshLastRenewalRun()
             self.canUndoLegacyImport = self.store.canUndoLatestLegacyProfileImport
+        }
+        .onChange(of: self.menuBarProviders) { _, _ in
+            self.refreshRenewalAgentState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .renewalAgentRegistrationDidChange)) { _ in
+            self.refreshRenewalAgentState()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             self.refreshLaunchAtLoginState()

@@ -36,6 +36,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var canHandleRecoveryNotices = false
     private let refreshPreferences = RefreshPreferences()
     private let sparkleUpdater = SparkleUpdater()
+    /// Last provider selection observed by the app, used to cancel in-flight
+    /// background work the moment a provider is hidden and to refresh on re-enable.
+    private var lastVisibleProviders: [ProviderID] = []
+    /// SMAppService unregisters asynchronously. A visible-provider registration
+    /// must never be issued until that completion has run, so remember any
+    /// visibility sync request that arrives while removal is still in flight.
+    private var renewalAgentUnregisterInFlight = false
+    private var renewalAgentSyncAfterUnregister = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         CoreLogger.configure { level, message, metadata in
@@ -67,15 +75,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func continueStartup(decision: StartupIdentityGate.Decision) {
         self.canHandleRecoveryNotices = StartupIdentityGate.canHandleRecoveryNotice(
             decision: decision)
+        self.lastVisibleProviders = ProviderVisibility.selection()
         if decision == .production {
             guard !self.terminateIfInstalledInstanceIsRunning() else { return }
             LaunchAtLogin.migrateLegacyLaunchAgentIfNeeded()
-            do {
-                try RenewalAgent.register()
-            } catch {
-                AppLogger.warning("Failed to register renewal agent",
-                                  metadata: ["error": error.localizedDescription])
-            }
+            self.syncRenewalAgentRegistration()
         }
 
         if AppInfo.isLocalBuild {
@@ -91,23 +95,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.store = ProfileStore(environment: environment)
         }
         self.claudeStore = ClaudeProfileStore(environment: environment)
+        self.claudeStore.isVisible = { ProviderVisibility.isVisible(.claude) }
         self.claudeStore.onChange = { [weak self] in
             self?.updateClaudeIcon()
             if self?.isMenuOpen == true { self?.rebuildMenu() }
         }
         self.externalStore = ExternalProviderStore(adapters: [AntigravityProviderAdapter(), GLMProviderAdapter()])
+        self.externalStore.isVisible = { ProviderVisibility.isVisible($0) }
         self.externalStore.onChange = { [weak self] in
             self?.updateCombinedIcon()
             if self?.isMenuOpen == true { self?.rebuildMenu() }
         }
         self.usageProvider = UsageProvider(store: self.store)
+        self.usageProvider.isVisible = { ProviderVisibility.isVisible(.codex) }
         self.resetScheduler = BankedResetScheduler(store: self.store)
         self.resetScheduler.canRun = { [weak self] in
             guard let self else { return false }
-            return !self.usageProvider.isRefreshing && !self.isRenewing
+            return ProviderVisibility.isVisible(.codex)
+                && !self.usageProvider.isRefreshing && !self.isRenewing
         }
         self.resetScheduler.diagnosticBlockReason = { [weak self] in
             guard let self else { return "app_unavailable" }
+            if !ProviderVisibility.isVisible(.codex) { return "provider_hidden" }
             if self.isRenewing { return "renewal" }
             return self.usageProvider.isRefreshing ? "usage_refresh" : nil
         }
@@ -140,18 +149,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.menu.delegate = self
         self.statusItem.menu = self.menu
         self.updateClaudeIcon()
-        self.claudeStore.refresh()
+        self.claudeStore.refresh(respectingVisibility: true)
         let claudeTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.claudeStore.refresh()
+                self?.claudeStore.refresh(respectingVisibility: true)
                 self?.updateIcon()
             }
         }
         RunLoop.main.add(claudeTimer, forMode: .common)
         self.claudeRefreshTimer = claudeTimer
-        self.externalStore.refresh()
+        self.externalStore.refresh(respectingVisibility: true)
         let externalTimer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.externalStore.refresh(); self?.updateIcon() }
+            MainActor.assumeIsolated { self?.externalStore.refresh(respectingVisibility: true); self?.updateIcon() }
         }
         RunLoop.main.add(externalTimer, forMode: .common)
         self.externalRefreshTimer = externalTimer
@@ -268,8 +277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         guard self.store != nil, self.usageProvider != nil else { return }
         self.isMenuOpen = true
-        self.claudeStore.refresh()
-        if self.refreshPreferences.refreshWhenMenuOpens { self.externalStore.refresh() }
+        self.claudeStore.refresh(respectingVisibility: true)
+        if self.refreshPreferences.refreshWhenMenuOpens { self.externalStore.refresh(respectingVisibility: true) }
         self.syncActiveProfile()
         self.rebuildMenu()
         if self.refreshPreferences.refreshWhenMenuOpens {
@@ -337,6 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let renewalOkExitStatuses: Set<Int32> = [0, 3]
 
     private func startRenewal() {
+        // Renewal spawns the helper CLI and touches credentials: never run it
+        // for a hidden provider. The first usage refresh is unnecessary then too.
+        guard ProviderVisibility.isVisible(.codex) else { return }
         guard let path = CodexBridge.codexProfilePath() else {
             AppLogger.warning("Skipping renewal; codex-profile helper not found")
             self.requestRefresh()
@@ -423,8 +435,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard self.store != nil, self.usageProvider != nil else { return }
         AppLogger.info("System woke; forcing usage refresh")
         self.resetScheduler.checkDueSchedules(reason: "system_wake")
-        self.externalStore.refresh(force: true)
-        self.claudeStore.refresh()
+        self.externalStore.refresh(force: true, respectingVisibility: true)
+        self.claudeStore.refresh(respectingVisibility: true)
         self.syncActiveProfile(force: true)
         self.updateIcon()
         self.requestRefresh(force: true)
@@ -523,8 +535,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quotaDisplayChanged() {
+        self.handleProviderVisibilityChange()
         self.updateIcon()
         self.updateClaudeIcon()
+        if self.isMenuOpen { self.rebuildMenu() }
+    }
+
+    /// Registers or removes the daily renewal LaunchAgent with the Codex provider's
+    /// visibility. Both directions are no-ops for builds that cannot host the agent.
+    /// Registration is serialized behind any in-flight removal: SMAppService only
+    /// makes re-registration safe once the unregister completion has run.
+    private func syncRenewalAgentRegistration() {
+        let codexVisible = ProviderVisibility.isVisible(.codex)
+        if self.renewalAgentUnregisterInFlight {
+            self.renewalAgentSyncAfterUnregister = true
+            return
+        }
+
+        if codexVisible {
+            do {
+                try RenewalAgent.register()
+            } catch {
+                AppLogger.warning("Failed to register renewal agent",
+                                  metadata: ["error": error.localizedDescription])
+            }
+        } else {
+            let started = RenewalAgent.unregister { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.renewalAgentUnregisterInFlight = false
+                    let syncAfterUnregister = self.renewalAgentSyncAfterUnregister
+                    self.renewalAgentSyncAfterUnregister = false
+                    if syncAfterUnregister {
+                        // Re-read visibility here rather than replaying the old request:
+                        // an off→on→off sequence must end unregistered, while off→on
+                        // must register only now that removal has completed.
+                        self.syncRenewalAgentRegistration()
+                    }
+                    NotificationCenter.default.post(name: .renewalAgentRegistrationDidChange, object: nil)
+                }
+            }
+            self.renewalAgentUnregisterInFlight = started
+        }
+    }
+
+    /// Visibility is an opt-in switch for refresh and polling, not just a display
+    /// filter: hiding a provider cancels its in-flight work, and re-enabling it
+    /// starts a fresh read. Startup profile discovery may still read existing local
+    /// profile state, but hidden providers do not gain new background work here.
+    private func handleProviderVisibilityChange() {
+        guard self.usageProvider != nil else { return }
+        let current = ProviderVisibility.selection()
+        let previous = self.lastVisibleProviders
+        guard current != previous else { return }
+        self.lastVisibleProviders = current
+
+        for provider in ProviderID.allCases where previous.contains(provider) && !current.contains(provider) {
+            AppLogger.info("Provider hidden; stopping its background work", metadata: ["provider": provider.rawValue])
+            switch provider {
+            case .codex:
+                self.usageProvider.cancelRefreshes()
+                self.liveAuthWarning = nil
+                self.syncRenewalAgentRegistration()
+            case .claude:
+                self.claudeStore.cancelRefresh()
+            case .antigravity, .glm:
+                self.externalStore.cancel(provider)
+            }
+        }
+        for provider in ProviderID.allCases where !previous.contains(provider) && current.contains(provider) {
+            AppLogger.info("Provider enabled; refreshing its quota", metadata: ["provider": provider.rawValue])
+            switch provider {
+            case .codex:
+                self.syncRenewalAgentRegistration()
+                self.syncActiveProfile(force: true)
+                self.requestRefresh(force: true)
+            case .claude:
+                self.claudeStore.refresh(force: true)
+            case .antigravity, .glm:
+                self.externalStore.refresh(provider, force: true)
+            }
+        }
     }
 
     private func updateClaudeIcon() {
@@ -628,74 +719,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.menu.addItem(.separator())
         }
 
-        let codexCollapsed = UserDefaults.standard.bool(forKey: "codexMenuSectionCollapsed")
-        self.addProviderSectionHeader(title: "Codex", collapsed: codexCollapsed) { [weak self] in
-            self?.toggleMenuSection("codexMenuSectionCollapsed")
-        }
-        if !codexCollapsed {
-            self.addUsageHeader()
-            self.menu.addItem(.separator())
-
-            let healthRecords = ProfileHealth.build(
-                profiles: self.store.config.profiles,
-                statuses: self.store.statuses,
-                activeProfileId: self.store.liveProfileId,
-                canActivateAuth: { id in self.store.authCanBeActivated(for: id) })
-            var addedProfileSection = false
-            var addedRecommendation = false
-
-            if let activeHealth = healthRecords.first(where: \.isActive) {
-                self.addProfileCard(for: activeHealth)
-                addedProfileSection = true
+        let providers = ProviderVisibility.selection()
+        if providers.contains(.codex) {
+            let codexCollapsed = UserDefaults.standard.bool(forKey: "codexMenuSectionCollapsed")
+            self.addProviderSectionHeader(title: "Codex", collapsed: codexCollapsed) { [weak self] in
+                self?.toggleMenuSection("codexMenuSectionCollapsed")
             }
+            if !codexCollapsed {
+                self.addUsageHeader()
+                self.menu.addItem(.separator())
 
-            if let recommendation = ProfileHealth.recommendation(from: healthRecords) {
-                if addedProfileSection { self.menu.addItem(.separator()) }
-                self.addRecommendationItem(for: recommendation)
-                addedProfileSection = true
-                addedRecommendation = true
-            }
+                let healthRecords = ProfileHealth.build(
+                    profiles: self.store.config.profiles,
+                    statuses: self.store.statuses,
+                    activeProfileId: self.store.liveProfileId,
+                    canActivateAuth: { id in self.store.authCanBeActivated(for: id) })
+                var addedProfileSection = false
+                var addedRecommendation = false
 
-            let inactiveProfiles = ProfileHealth.menuOrderedInactive(healthRecords)
-            if !inactiveProfiles.isEmpty {
+                if let activeHealth = healthRecords.first(where: \.isActive) {
+                    self.addProfileCard(for: activeHealth)
+                    addedProfileSection = true
+                }
+
+                if let recommendation = ProfileHealth.recommendation(from: healthRecords) {
+                    if addedProfileSection { self.menu.addItem(.separator()) }
+                    self.addRecommendationItem(for: recommendation)
+                    addedProfileSection = true
+                    addedRecommendation = true
+                }
+
+                let inactiveProfiles = ProfileHealth.menuOrderedInactive(healthRecords)
+                if !inactiveProfiles.isEmpty {
+                    if addedProfileSection {
+                        if addedRecommendation {
+                            self.menu.addItem(.separator())
+                        } else {
+                            self.addProfileDivider()
+                        }
+                    }
+                    for (index, health) in inactiveProfiles.enumerated() {
+                        self.addProfileCard(for: health)
+                        if index != inactiveProfiles.indices.last {
+                            self.addProfileDivider()
+                        }
+                    }
+                    addedProfileSection = true
+                }
+
                 if addedProfileSection {
-                    if addedRecommendation {
-                        self.menu.addItem(.separator())
-                    } else {
-                        self.addProfileDivider()
-                    }
+                    self.menu.addItem(.separator())
                 }
-                for (index, health) in inactiveProfiles.enumerated() {
-                    self.addProfileCard(for: health)
-                    if index != inactiveProfiles.indices.last {
-                        self.addProfileDivider()
-                    }
-                }
-                addedProfileSection = true
-            }
-
-            if addedProfileSection {
+            } else {
                 self.menu.addItem(.separator())
             }
-        } else {
+        }
+
+        if providers.contains(.claude) {
+            let claudeCollapsed = UserDefaults.standard.bool(forKey: "claudeMenuSectionCollapsed")
+            let claudeView = ClaudeMenuSectionView(store: self.claudeStore,
+                isCollapsed: claudeCollapsed,
+                onToggle: { [weak self] in self?.toggleMenuSection("claudeMenuSectionCollapsed") },
+                onSettings: { [weak self] in self?.openClaudeSettings() },
+                onOpen: { [weak self] id in self?.claudeStore.openSession(id: id) })
+            let claudeHost = NSHostingView(rootView: claudeView)
+            claudeHost.frame = NSRect(x: 0, y: 0, width: 290,
+                height: ClaudeMenuSectionView.height(for: self.claudeStore, isCollapsed: claudeCollapsed))
+            let claudeItem = NSMenuItem()
+            claudeItem.view = claudeHost
+            self.menu.addItem(claudeItem)
             self.menu.addItem(.separator())
         }
 
-        let claudeCollapsed = UserDefaults.standard.bool(forKey: "claudeMenuSectionCollapsed")
-        let claudeView = ClaudeMenuSectionView(store: self.claudeStore,
-            isCollapsed: claudeCollapsed,
-            onToggle: { [weak self] in self?.toggleMenuSection("claudeMenuSectionCollapsed") },
-            onSettings: { [weak self] in self?.openClaudeSettings() },
-            onOpen: { [weak self] id in self?.claudeStore.openSession(id: id) })
-        let claudeHost = NSHostingView(rootView: claudeView)
-        claudeHost.frame = NSRect(x: 0, y: 0, width: 290,
-            height: ClaudeMenuSectionView.height(for: self.claudeStore, isCollapsed: claudeCollapsed))
-        let claudeItem = NSMenuItem()
-        claudeItem.view = claudeHost
-        self.menu.addItem(claudeItem)
-        self.menu.addItem(.separator())
-
-        for provider in [ProviderID.antigravity, .glm] {
+        for provider in [ProviderID.antigravity, .glm] where providers.contains(provider) {
             let key = "\(provider.rawValue)MenuSectionCollapsed"
             let collapsed = UserDefaults.standard.bool(forKey: key)
             let view = ExternalProviderMenuSection(store: self.externalStore, provider: provider,
@@ -916,6 +1012,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Profile Sync
 
     private func syncActiveProfile(force: Bool = false) {
+        // Reads the live auth file as part of background polling; a hidden
+        // provider stays untouched. Re-enabling forces a sync.
+        guard ProviderVisibility.isVisible(.codex) else { return }
         guard !self.store.isAuthMutationInProgress() else { return }
 
         if !force {
@@ -1058,13 +1157,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshAll() {
-        self.externalStore.refresh(force: true)
-        self.claudeStore.refresh(force: true)
+        // The global Refresh is explicitly covered by the visibility rule: a
+        // hidden provider is not polled even when the user clicks Refresh.
+        self.externalStore.refresh(force: true, respectingVisibility: true)
+        self.claudeStore.refresh(force: true, respectingVisibility: true)
         self.syncActiveProfile(force: true)
         self.requestRefresh(force: true)
     }
 
     private func requestRefresh(force: Bool = false, activeOnly: Bool = false) {
+        // Usage queries read credentials and hit the network, so a hidden Codex
+        // provider never starts one. Re-enabling the provider forces a refresh.
+        guard ProviderVisibility.isVisible(.codex) else {
+            self.refreshMenuItem?.setEnabled(true)
+            return
+        }
         if self.resetScheduler?.isRunning == true || self.isRenewing || self.store.isAuthMutationInProgress() {
             if force { self.hasPendingForcedRefresh = true }
             if activeOnly { self.hasPendingActiveRefresh = true }

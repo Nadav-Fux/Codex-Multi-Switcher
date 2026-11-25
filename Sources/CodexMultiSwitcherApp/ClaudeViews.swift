@@ -6,13 +6,16 @@ private enum ClaudeQuotaPreferences {
     static let fiveHourKey = "claudePrimaryQuotaShowsUsed"
     static let weekKey = "claudeSecondaryQuotaShowsUsed"
     static let modelWeekKey = "claudeModelWeeklyQuotaShowsUsed"
+    static let fableKey = "claudeFableQuotaShowsUsed"
 }
 
 private struct ClaudeQuotaControls: View {
     var showsModelWeek = false
+    var showsFable = false
     @AppStorage(ClaudeQuotaPreferences.fiveHourKey) private var fiveHourShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.weekKey) private var weekShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.modelWeekKey) private var modelWeekShowsUsed = false
+    @AppStorage(ClaudeQuotaPreferences.fableKey) private var fableShowsUsed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -21,6 +24,7 @@ private struct ClaudeQuotaControls: View {
                 control("week", value: $weekShowsUsed)
             }
             if showsModelWeek { control("model week", value: $modelWeekShowsUsed) }
+            if showsFable { control("Fable", value: $fableShowsUsed) }
         }
         .font(.system(size: 10, weight: .medium))
         .help("Claude display preferences. Colors indicate remaining quota for fresh observations matching the current account; cached or unverified values are gray.")
@@ -167,7 +171,8 @@ struct ClaudeProfilesTab: View {
                     }
                 }
                 Divider()
-                ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil)
+                ClaudeQuotaControls(showsModelWeek: status?.usage?.modelWeekly != nil,
+                                    showsFable: status?.usage?.fable != nil)
                 ClaudeUsageDetail(snapshot: status?.usage)
                 if let resets = status?.usage?.resets {
                     ClaudeLimitResetsView(resets: resets)
@@ -451,6 +456,7 @@ private struct ClaudeUsageDetail: View {
     @AppStorage(ClaudeQuotaPreferences.fiveHourKey) private var fiveHourShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.weekKey) private var weekShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.modelWeekKey) private var modelWeekShowsUsed = false
+    @AppStorage(ClaudeQuotaPreferences.fableKey) private var fableShowsUsed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -458,6 +464,9 @@ private struct ClaudeUsageDetail: View {
             window("Weekly", value: snapshot?.sevenDay, showsUsed: weekShowsUsed)
             if let modelWeekly = snapshot?.modelWeekly {
                 window("Model weekly", value: modelWeekly, showsUsed: modelWeekShowsUsed)
+            }
+            if let fable = snapshot?.fable {
+                window("Fable weekly", value: fable, showsUsed: fableShowsUsed)
             }
             if let snapshot {
                 Text(claudeFreshnessLabel(snapshot)).font(.system(size: 11))
@@ -533,8 +542,8 @@ struct ClaudeMenuSectionView: View {
 
     static func height(for store: ClaudeProfileStore, isCollapsed: Bool = false) -> CGFloat {
         guard !isCollapsed else { return headerHeight }
-        return headerHeight + detailsHeight + (hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18) + visibleProfiles(in: store).reduce(CGFloat(0)) { height, profile in
-            height + rowHeight + (store.statuses[profile.id]?.usage?.modelWeekly == nil ? 0 : 16)
+        return headerHeight + detailsHeight + (hasModelWeek(in: store) ? 24 : 0) + (hasFable(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18) + visibleProfiles(in: store).reduce(CGFloat(0)) { height, profile in
+            height + rowHeight + Self.extraRowHeight(for: store.statuses[profile.id]?.usage)
         } + footerHeight
     }
 
@@ -546,6 +555,14 @@ struct ClaudeMenuSectionView: View {
 
     private static func hasModelWeek(in store: ClaudeProfileStore) -> Bool {
         visibleProfiles(in: store).contains { store.statuses[$0.id]?.usage?.modelWeekly != nil }
+    }
+
+    private static func hasFable(in store: ClaudeProfileStore) -> Bool {
+        visibleProfiles(in: store).contains { store.statuses[$0.id]?.usage?.fable != nil }
+    }
+
+    private static func extraRowHeight(for usage: ClaudeUsageSnapshot?) -> CGFloat {
+        (usage?.modelWeekly == nil ? 0 : 16) + (usage?.fable == nil ? 0 : 16)
     }
 
     private var visibleProfiles: [ClaudeProfile] { Self.visibleProfiles(in: store) }
@@ -571,7 +588,9 @@ struct ClaudeMenuSectionView: View {
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                     }
-                    ClaudeQuotaControls(showsModelWeek: visibleProfiles.contains { store.statuses[$0.id]?.usage?.modelWeekly != nil })
+                    ClaudeQuotaControls(
+                        showsModelWeek: visibleProfiles.contains { store.statuses[$0.id]?.usage?.modelWeekly != nil },
+                        showsFable: visibleProfiles.contains { store.statuses[$0.id]?.usage?.fable != nil })
                     if let error = store.error {
                         Label(error, systemImage: "exclamationmark.triangle")
                             .font(.system(size: 10)).foregroundStyle(Palette.warning)
@@ -579,13 +598,13 @@ struct ClaudeMenuSectionView: View {
                     }
                 }
                 .padding(.horizontal, 10)
-                .frame(height: Self.detailsHeight + (Self.hasModelWeek(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18))
+                .frame(height: Self.detailsHeight + (Self.hasModelWeek(in: store) ? 24 : 0) + (Self.hasFable(in: store) ? 24 : 0) + (store.error == nil ? 0 : 18))
                 ForEach(visibleProfiles) { profile in
                     ClaudeMenuProfileRow(profile: profile, status: store.statuses[profile.id],
                                          selected: profile.id == store.selectedID,
                                          onChoose: { store.select(id: profile.id) },
                                          onOpen: { onOpen(profile.id) })
-                        .frame(height: Self.rowHeight + (store.statuses[profile.id]?.usage?.modelWeekly == nil ? 0 : 16))
+                        .frame(height: Self.rowHeight + Self.extraRowHeight(for: store.statuses[profile.id]?.usage))
                 }
                 Button(action: onSettings) {
                     HStack {
@@ -612,6 +631,7 @@ private struct ClaudeMenuProfileRow: View {
     @AppStorage(ClaudeQuotaPreferences.fiveHourKey) private var fiveHourShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.weekKey) private var weekShowsUsed = false
     @AppStorage(ClaudeQuotaPreferences.modelWeekKey) private var modelWeekShowsUsed = false
+    @AppStorage(ClaudeQuotaPreferences.fableKey) private var fableShowsUsed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -636,6 +656,10 @@ private struct ClaudeMenuProfileRow: View {
             if let modelWeekly = status?.usage?.modelWeekly {
                 quota("Mwk", window: modelWeekly, showsUsed: modelWeekShowsUsed)
                     .help("Model weekly quota")
+            }
+            if let fable = status?.usage?.fable {
+                quota("Fab", window: fable, showsUsed: fableShowsUsed)
+                    .help("Fable weekly quota")
             }
             Text(status?.usage.map { claudeFreshnessLabel($0) } ?? "Usage unavailable")
                 .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)

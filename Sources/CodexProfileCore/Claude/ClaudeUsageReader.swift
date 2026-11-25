@@ -46,6 +46,7 @@ public enum ClaudeUsageReader {
             return ClaudeUsageReadResult(snapshot: ClaudeUsageSnapshot(
                 fiveHour: five, sevenDay: seven,
                 modelWeekly: self.window(payload["modelWeekly"], native: true),
+                fable: self.window(payload["fable"], native: true),
                 observedAt: fetchedAt, source: .nativeBridge,
                 isStale: now.timeIntervalSince(fetchedAt) > Self.staleAfter,
                 accountVerified: verified))
@@ -62,7 +63,11 @@ public enum ClaudeUsageReader {
         let seven = self.window(usage["seven_day"], native: false)
         guard five != nil || seven != nil else { return ClaudeUsageReadResult() }
         return ClaudeUsageReadResult(snapshot: ClaudeUsageSnapshot(
-            fiveHour: five, sevenDay: seven, observedAt: modified,
+            fiveHour: five, sevenDay: seven,
+            modelWeekly: self.window(usage["seven_day_sonnet"], native: false)
+                ?? self.window(usage["seven_day_opus"], native: false),
+            fable: self.window(usage["seven_day_overage_included"], native: false),
+            observedAt: modified,
             source: .legacyStatusline, isStale: true, accountVerified: false))
     }
 

@@ -58,6 +58,8 @@ class ClaudeStatuslineBridgeTests(unittest.TestCase):
             "rate_limits": {
                 "five_hour": {"used_percentage": 12.5, "resets_at": 1790985600},
                 "seven_day": {"used_percentage": 30, "resets_at": 1791417600},
+                "seven_day_overage_included": {"used_percentage": 55, "resets_at": 1791417600},
+                "seven_day_sonnet": {"used_percentage": 61},
                 "spend_limit": {"used_percentage": 77},
             },
         }).encode()
@@ -70,12 +72,23 @@ class ClaudeStatuslineBridgeTests(unittest.TestCase):
         self.assertEqual(snapshot["authIdentityDigest"], "a" * 64)
         self.assertEqual(snapshot["fiveHour"]["usedPercent"], 12.5)
         self.assertEqual(snapshot["sevenDay"]["usedPercent"], 30.0)
+        self.assertEqual(snapshot["fable"]["usedPercent"], 55.0)
+        self.assertRegex(snapshot["fable"]["resetAt"], r"^20\d\d-\d\d-\d\dT.*Z$")
+        self.assertEqual(snapshot["modelWeekly"]["usedPercent"], 61.0)
         self.assertRegex(snapshot["fiveHour"]["resetAt"], r"^20\d\d-\d\d-\d\dT.*Z$")
         self.assertNotIn("secret-session-id", self.snapshot_path.read_text())
         self.assertNotIn("transcript_path", snapshot)
         self.assertNotIn("cwd", snapshot)
         self.assertNotIn("spend_limit", snapshot)
         self.assertEqual(os.stat(self.snapshot_path).st_mode & 0o777, 0o600)
+
+    def test_model_weekly_prefers_sonnet_and_falls_back_to_opus(self):
+        self.run_bridge(json.dumps({"rate_limits": {
+            "seven_day_sonnet": {"used_percentage": 61}, "seven_day_opus": {"used_percentage": 44},
+        }}).encode())
+        self.assertEqual(self.read_snapshot()["modelWeekly"]["usedPercent"], 61.0)
+        self.run_bridge(json.dumps({"rate_limits": {"seven_day_opus": {"used_percentage": 44}}}).encode())
+        self.assertEqual(self.read_snapshot()["modelWeekly"]["usedPercent"], 44.0)
 
     def test_missing_or_null_rate_limits_does_not_replace_recent_valid_snapshot(self):
         self.run_bridge(json.dumps({"rate_limits": {"five_hour": {"used_percentage": 40}}}).encode())

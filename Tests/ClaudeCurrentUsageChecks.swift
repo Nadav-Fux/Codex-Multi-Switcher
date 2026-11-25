@@ -51,6 +51,7 @@ enum ClaudeCurrentUsageChecks {
             let validUsage: [String: Any] = [
                 "five_hour": ["utilization": 21.5, "resets_at": "2027-01-01T12:00:00.000Z"],
                 "seven_day": ["utilization": 43, "resets_at": "2027-01-03T12:00:00Z"],
+                "seven_day_overage_included": ["utilization": 57, "resets_at": "2027-01-04T12:00:00Z"],
                 "seven_day_sonnet": NSNull(), "unknown_secret": "fake-access-secret-never-cache"]
             return try JSONSerialization.data(withJSONObject: self.invalid ? invalidUsage : validUsage)
         }
@@ -145,11 +146,18 @@ enum ClaudeCurrentUsageChecks {
         let historicalURL = root.appendingPathComponent("historical-helper-observation.json")
         let historical: [String: Any] = ["schemaVersion": 1, "profileID": profile.id,
             "configDirectory": profile.configDirectory, "authIdentityDigest": "account-a",
-            "fetchedAt": fixed.timeIntervalSince1970, "usage": ["seven_day": ["utilization": 32]]]
+            "fetchedAt": fixed.timeIntervalSince1970, "usage": [
+                "seven_day": ["utilization": 32],
+                "seven_day_opus": ["utilization": 48],
+                "seven_day_overage_included": ["utilization": 66]]]
         try AtomicFileWriter.write(JSONSerialization.data(withJSONObject: historical), to: historicalURL)
         let imported = ClaudeQuotaRefreshPolicy.priorObservation(at: historicalURL, profile: profile, identity: "account-a", now: fixed)
         try check(imported?.isStale == true && imported?.sevenDay?.usedPercentage == 32,
             "Private prior observations survive app restarts only as explicitly historical quota")
+        try check(imported?.fable?.usedPercentage == 66,
+            "Prior observations import the Fable window")
+        try check(imported?.modelWeekly?.usedPercentage == 48,
+            "The model-weekly window falls back to seven_day_opus consistently")
         try check(ClaudeQuotaRefreshPolicy.priorObservation(at: historicalURL, profile: profile, identity: "account-b", now: fixed) == nil,
             "A prior observation cannot be imported for another account")
         let corruptRoot = root.appendingPathComponent("corrupt-polling")
@@ -174,13 +182,19 @@ enum ClaudeCurrentUsageChecks {
                   "Fresh response binds API account to CLI")
         try check(observation.fiveHour?.usedPercentage == 21.5 && observation.sevenDay?.resetsAt != nil
                   && observation.modelWeekly == nil, "Fractional/ordinary dates and null optional window")
+        try check(observation.fable?.usedPercentage == 57 && observation.fable?.resetsAt != nil,
+                  "The Fable weekly window parses from seven_day_overage_included")
         let cache = root.appendingPathComponent("oauth-success/usage-observations/claude-default.json")
         let bytes = try Data(contentsOf: cache)
         try check(!String(decoding: bytes, as: UTF8.self).contains("fake-access-secret"), "Cache contains no credentials or extra server fields")
+        try check(String(decoding: bytes, as: UTF8.self).contains("seven_day_overage_included"),
+                  "The serialized cache preserves the Fable window")
         let permissions = try FileManager.default.attributesOfItem(atPath: cache.path)[.posixPermissions] as! NSNumber
         try check(permissions.intValue & 0o777 == 0o600, "Observation cache created privately")
         _ = try await current.fetch(profile: profile, authBefore: auth, authAfter: { auth }, now: fixed.addingTimeInterval(20))
         try check(transport.calls == 2 && loader.calls == 4, "Fresh cache verifies credential before/after CLI without repeated network reads")
+        try check(current.cached(profile: profile, auth: auth, now: fixed)?.fable?.usedPercentage == 57,
+                  "The cached observation round-trips the Fable window")
         try check(current.cached(profile: profile, auth: auth, now: fixed.addingTimeInterval(ClaudeCurrentUsageService.cacheFreshness + 1))?.isStale == true,
                   "Cache becomes historical after the configured freshness window")
         let other = ClaudeAuthInfo(loggedIn: true, email: "other@example.test", organizationID: "org-fixture")
