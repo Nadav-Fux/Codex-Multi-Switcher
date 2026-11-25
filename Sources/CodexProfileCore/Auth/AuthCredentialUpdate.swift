@@ -60,15 +60,15 @@ public enum AuthCredentialUpdate {
             if let liveAuthURL,
                let currentData = try? Data(contentsOf: liveAuthURL),
                currentData != updatedData,
-               Self.canWriteBackToLive(currentData, captured: original, replacementData: updatedData) {
+               Self.canWriteBackToLive(currentData, captured: original, originalData: originalData,
+                                       replacementData: updatedData) {
                 if let backupDirectory {
                     try StaleAuthHealer.writeBackup(
                         currentData, label: "codex-auth-json", backupDirectory: backupDirectory)
                 }
                 // Codex Desktop does not take our vault lock: the temp file is
                 // prepared first, then the live file is re-read and the rename
-                // happens only when it still holds `currentData` — a login it
-                // saved meanwhile always wins over this write-back.
+                // is attempted only if the final check still sees `currentData`.
                 if try AtomicFileWriter.writeIfUnchanged(
                     updatedData, to: liveAuthURL, expected: currentData,
                     beforeCommit: beforeLiveWrite) {
@@ -82,22 +82,23 @@ public enum AuthCredentialUpdate {
         }
     }
 
-    /// Live `auth.json` may be overwritten only when it is the same account
-    /// and the same person (a shared user-level claim — `account_id` alone is
-    /// a workspace id on Team plans), still holds the refresh token the
-    /// rotation consumed (so it is now dead), and the replacement is not older
-    /// than it.
+    /// Live auth must still hold the consumed token and match the account and
+    /// user. For legacy logins with no user claims, the exact input bytes prove
+    /// continuity. The replacement must be at least as recent.
     static func canWriteBackToLive(
         _ liveData: Data,
         captured: AuthCredentials,
+        originalData: Data,
         replacementData: Data
     ) -> Bool {
+        let exactLegacyInput = liveData == originalData && !AuthBlob.hasUserIdentity(liveData)
+            && !AuthBlob.hasUserIdentity(replacementData)
         guard let live = try? AuthBlob.load(from: liveData),
               let replacement = try? AuthBlob.load(from: replacementData),
               let accountID = live.accountId, !accountID.isEmpty,
               replacement.accountId == accountID,
               captured.accountId == accountID,
-              AuthBlob.identityMatchesUser(liveData, replacementData),
+              exactLegacyInput || AuthBlob.identityMatchesUser(liveData, replacementData),
               live.refreshToken == captured.refreshToken,
               replacement.refreshToken != live.refreshToken || replacement.accessToken != live.accessToken else {
             return false

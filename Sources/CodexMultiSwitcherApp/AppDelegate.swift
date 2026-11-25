@@ -1059,7 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func refreshAll() {
         self.externalStore.refresh(force: true)
-        self.claudeStore.refresh()
+        self.claudeStore.refresh(force: true)
         self.syncActiveProfile(force: true)
         self.requestRefresh(force: true)
     }
@@ -1224,7 +1224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let store = self.store!
         store.beginAuthMutation()
-        CodexBridge.startLogin(profileId: profileId) { [weak self] result in
+        store.startLogin(for: profileId, launch: CodexBridge.startLogin) { [weak self] result, start in
             guard let self else {
                 store.endAuthMutation()
                 return
@@ -1235,30 +1235,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch result {
             case .success:
                 AppLogger.info("Login succeeded", metadata: ["profile": profileId])
-                self.store.clearRenewalState(for: profileId)
-                if self.store.liveProfileId == profileId {
-                    do {
-                        try self.store.syncSavedAuthToLive(for: profileId)
-                    } catch {
-                        AppLogger.error("Failed to update live auth after login",
-                                        metadata: ["profile": profileId, "error": error.localizedDescription])
-                        store.endAuthMutation()
-                        let failure = CodexBridgeError.stateUpdateFailed(
-                            "Login succeeded but the active profile could not update live auth: \(error.localizedDescription)")
-                        if presentFailureAlert {
-                            self.presentBridgeError(title: "Login failed", message: failure.localizedDescription)
-                        }
-                        completion?(.failure(failure))
-                        return
+                // An in-flight refresh may still hold the old quota or a stale fallback.
+                self.usageProvider.cancelRefreshes()
+                store.clearRenewalState(for: profileId)
+                store.discardUsageIfAccountChanged(for: profileId, previousFingerprint: start.fingerprint)
+                var liveUpdateFailure: CodexBridgeError?
+                do {
+                    if try store.syncSavedAuthAfterLogin(start) == false {
+                        AppLogger.info("Live auth does not match the sign-in's starting profile or bytes",
+                                       metadata: ["profile": profileId])
                     }
+                } catch {
+                    AppLogger.error("Failed to update live auth after login",
+                                    metadata: ["profile": profileId, "error": error.localizedDescription])
+                    liveUpdateFailure = .stateUpdateFailed(
+                        "Login succeeded but the active profile could not update live auth: \(error.localizedDescription)")
                 }
                 store.endAuthMutation()
                 self.syncActiveProfile(force: true)
                 self.requestRefresh(force: true)
                 self.updateIcon()
-                finalResult = .success(())
+                if let failure = liveUpdateFailure {
+                    if presentFailureAlert {
+                        self.presentBridgeError(title: "Login failed", message: failure.localizedDescription)
+                    }
+                    finalResult = .failure(failure)
+                } else {
+                    finalResult = .success(())
+                }
             case .failure(let error):
                 store.endAuthMutation()
+                if self.hasPendingForcedRefresh, !store.isAuthMutationInProgress() {
+                    self.syncActiveProfile(force: true)
+                    self.requestRefresh(force: true)
+                }
                 if presentFailureAlert && !error.isUserCancelled {
                     self.presentBridgeError(title: "Login failed", message: error.localizedDescription)
                 }

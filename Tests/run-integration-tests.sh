@@ -114,7 +114,9 @@ chmod +x "$FAKE_CODEX"
 
 reset_home() {
   rm -rf "$TEST_HOME" "$AUTH_STORE"
-  mkdir -p "$TEST_HOME/.codex" "$AUTH_STORE"
+  mkdir -p "$TEST_HOME/.codex" "$AUTH_STORE" "$TEST_HOME/.codex-multi-switcher/glm"
+  # The app fixtures exercise usage without consulting the legacy GLM Keychain item.
+  touch "$TEST_HOME/.codex-multi-switcher/glm/coding-plan-key.no-legacy-migration"
 }
 
 make_api_auth() {
@@ -149,6 +151,12 @@ make_oauth_auth_with_refresh_date() {
     "$last_refresh" "$access_token" "$refresh_token" "$account_id" > "$path"
 }
 
+add_user_to_oauth_auth() {
+  local path="$1" user="$2" payload
+  payload="$(printf '{"sub":"%s"}' "$user" | base64 | tr '+/' '-_' | tr -d '=\n')"
+  plutil -insert tokens.id_token -string "e30.$payload.sig" "$path"
+}
+
 save_auth() {
   local profile="$1"
   local path="$2"
@@ -178,6 +186,7 @@ start_token_stub() {
   local access_token="${2:-access-refreshed}"
   local refresh_token="${3:-refresh-refreshed}"
   local account_id="${4:-acct-renewal}"
+  local id_token="${5:-}"
   local release_file="$WORK_DIR/token-stub-release"
   local endpoint_file="$WORK_DIR/token-stub-endpoint"
   TOKEN_STUB_COUNT="$WORK_DIR/token-stub-count"
@@ -190,7 +199,7 @@ import os
 import sys
 import time
 
-mode, access_token, refresh_token, account_id, endpoint_file, count_file, release_file, auth_store = sys.argv[1:]
+mode, access_token, refresh_token, account_id, id_token, endpoint_file, count_file, release_file, auth_store = sys.argv[1:]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -209,11 +218,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.dumps({"error": "invalid_grant"}).encode()
             self.send_response(401)
         else:
-            body = json.dumps({
+            tokens = {
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "account_id": account_id,
-            }).encode()
+            }
+            if id_token:
+                tokens["id_token"] = id_token
+            body = json.dumps(tokens).encode()
             self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -231,7 +243,7 @@ with open(endpoint_file, "w") as endpoint:
 server.serve_forever()
 PYTHON
   python3 -u "$WORK_DIR/token-stub.py" "$mode" "$access_token" "$refresh_token" \
-    "$account_id" "$endpoint_file" "$TOKEN_STUB_COUNT" "$release_file" "$AUTH_STORE" &
+    "$account_id" "$id_token" "$endpoint_file" "$TOKEN_STUB_COUNT" "$release_file" "$AUTH_STORE" &
   TOKEN_STUB_PID=$!
   # Wait on the stub's own liveness rather than a fixed number of ticks. A
   # cold python3 interpreter start is well over a second on a loaded CI
@@ -269,7 +281,9 @@ make_usage_codex() {
 #!/usr/bin/env python3
 import json
 import os
+import shutil
 import sys
+import time
 
 count_file = os.environ["USAGE_RPC_COUNT"]
 for line in sys.stdin:
@@ -281,6 +295,16 @@ for line in sys.stdin:
     if method == "account/rateLimits/read":
         with open(count_file, "a") as count:
             count.write("1\n")
+        release_file = os.environ.get("USAGE_RPC_RELEASE")
+        while release_file and not os.path.exists(release_file):
+            time.sleep(0.01)
+        rotation = os.environ.get("USAGE_RPC_ROTATION")
+        if rotation:
+            shutil.copyfile(rotation, os.path.join(os.environ["CODEX_HOME"], "auth.json"))
+        if os.environ.get("USAGE_RPC_FAIL") == "1":
+            error = {"code": -32603, "message": "fixture quota error"}
+            print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": error}), flush=True)
+            continue
     if "id" not in message:
         continue
     if method == "account/rateLimits/read":
@@ -1724,23 +1748,114 @@ test_renew_reconciles_live_auth_forward() {
   write_profiles_config Live Live
   mkdir -p "$TEST_HOME/.codex"
   cp "$saved" "$live"
-  start_token_stub rotate access-live-new refresh-live-new acct-live
+  local id_token="e30.eyJzdWIiOiJ1c2VyLWxpdmUifQ.sig"
+  start_token_stub rotate access-live-new refresh-live-new acct-live "$id_token"
 
   run_helper renew --profile Live --json > "$WORK_DIR/live-report.json"
   [[ "$(plutil -extract tokens.refresh_token raw -o - "$live")" == refresh-live-new ]] \
     || fail "renew did not reconcile the live auth forward"
+  [[ "$(plutil -extract tokens.id_token raw -o - "$live")" == "$id_token" ]] \
+    || fail "renew did not write newly added user claims to live auth"
   [[ "$(plutil -extract last_refresh raw -o - "$live")" != "2026-01-01T00:00:00Z" ]] \
     || fail "live auth retained its older last_refresh"
-  make_oauth_auth_with_refresh_date "$live" access-live-stale refresh-live-stale acct-live "2026-01-01T00:00:00Z"
+  stop_token_stub
+}
+
+test_renew_does_not_replace_a_new_desktop_chain_for_the_same_user() {
+  reset_home
+  local saved="$WORK_DIR/live-race-saved.json" desktop="$WORK_DIR/live-race-desktop.json"
+  local live="$TEST_HOME/.codex/auth.json"
+  make_oauth_auth_with_refresh_date "$saved" access-old refresh-old acct-live "2026-01-01T00:00:00Z"
+  make_oauth_auth_with_refresh_date "$desktop" access-desktop refresh-desktop acct-live "2026-01-02T00:00:00Z"
+  add_user_to_oauth_auth "$saved" user-live
+  add_user_to_oauth_auth "$desktop" user-live
+  save_auth Live "$saved"
+  write_profiles_config Live Live
+  cp "$saved" "$live"
+  start_token_stub wait access-live-new refresh-live-new acct-live
+  (run_helper renew --profile Live --json > "$WORK_DIR/live-race-report.json") &
+  local renewal_pid=$!
+  for _ in {1..200}; do [[ "$(request_count)" == 1 ]] && break; sleep 0.02; done
+  [[ "$(request_count)" == 1 ]] || fail "Desktop race renewal request did not start"
+  cp "$desktop" "$live"
+  : > "$WORK_DIR/token-stub-release"
+  wait "$renewal_pid" || fail "Desktop race renewal did not succeed"
+  [[ "$(auth_refresh Live)" == refresh-live-new ]] || fail "Desktop race did not rotate saved auth"
+  assert_same_file "$live" "$desktop" "renew overwrote an independent Desktop login for the same user"
+  stop_token_stub
+}
+
+test_renew_recovery_reconciles_legacy_live_auth_with_new_user_claims() {
+  reset_home
+  local original="$WORK_DIR/live-recovery-original.json" rotated="$WORK_DIR/live-recovery-rotated.json"
+  local live="$TEST_HOME/.codex/auth.json" blob digest
+  make_oauth_auth_with_refresh_date "$original" access-old refresh-predecessor acct-live "2026-01-01T00:00:00Z"
+  make_oauth_auth_with_refresh_date "$rotated" access-new refresh-successor acct-live "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  add_user_to_oauth_auth "$rotated" user-live
+  save_auth Live "$original"
+  write_profiles_config Live Live
+  cp "$original" "$live"
+  mkdir -p "$TEST_HOME/.codex-multi-switcher/renew-stash"
+  blob="$(base64 < "$rotated" | tr -d '\n')"
+  digest="$(printf refresh-predecessor | shasum -a 256 | awk '{print $1}')"
+  printf '{"blob":"%s","predecessor_digest":"%s"}\n' "$blob" "$digest" \
+    > "$TEST_HOME/.codex-multi-switcher/renew-stash/Live.json"
+
+  local report="$WORK_DIR/live-recovery-report.json"
+  run_helper renew --profile Live --json > "$report"
+  grep -Fq '"reason":"recovered_stash"' "$report" || fail "renew did not recover the rotated credential"
+  grep -Fq '"requests":0' "$report" || fail "stash recovery made a token request"
+  assert_same_file "$live" "$rotated" "stash recovery did not advance the live predecessor chain"
+}
+
+test_renew_reconciles_only_matching_live_auth_when_not_due() {
+  reset_home
+  local saved="$WORK_DIR/live-saved.json" independent="$WORK_DIR/live-independent.json"
+  local live="$TEST_HOME/.codex/auth.json"
+  make_oauth_auth_with_refresh_date "$saved" access-live-new refresh-live-new acct-live "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  save_auth Live "$saved"
+  write_profiles_config Live Live
+  make_oauth_auth_with_refresh_date "$live" access-live-stale refresh-live-new acct-live "2026-01-01T00:00:00Z"
   local second_report="$WORK_DIR/live-not-due-report.json"
   run_helper renew --profile Live --json > "$second_report"
   grep -Fq '"reason":"not_due"' "$second_report" \
     || fail "not-due renewal did not report not_due"
   grep -Fq '"requests":0' "$second_report" \
     || fail "not-due renewal made a token request"
-  [[ "$(plutil -extract tokens.refresh_token raw -o - "$live")" == refresh-live-new ]] \
+  [[ "$(plutil -extract tokens.access_token raw -o - "$live")" == access-live-new ]] \
     || fail "not-due renewal did not reconcile the live auth forward"
-  stop_token_stub
+
+  # A shared workspace ID cannot tie two independent legacy refresh chains together.
+  make_oauth_auth_with_refresh_date "$live" access-other refresh-other acct-live "2026-01-01T00:00:00Z"
+  run_helper renew --profile Live --json >/dev/null
+  [[ "$(plutil -extract tokens.refresh_token raw -o - "$live")" == refresh-other ]] \
+    || fail "renew overwrote a different legacy refresh chain"
+
+  add_user_to_oauth_auth "$live" user-other
+  run_helper renew --profile Live --json >/dev/null
+  [[ "$(plutil -extract tokens.refresh_token raw -o - "$live")" == refresh-other ]] \
+    || fail "renew overwrote an identified live login from a workspace-only profile"
+
+  export_auth Live "$saved"
+  add_user_to_oauth_auth "$saved" user-saved
+  save_auth Live "$saved"
+  run_helper renew --profile Live --json >/dev/null
+  [[ "$(plutil -extract tokens.refresh_token raw -o - "$live")" == refresh-other ]] \
+    || fail "renew overwrote a different Team member's live login"
+  plutil -replace tokens.refresh_token -string refresh-live-new "$live"
+  cp "$live" "$independent"
+  run_helper renew --profile Live --json >/dev/null
+  assert_same_file "$live" "$independent" "not-due renew ignored conflicting user claims on the same chain"
+
+  plutil -replace tokens.refresh_token -string refresh-other "$live"
+  plutil -replace tokens.id_token -string "$(plutil -extract tokens.id_token raw -o - "$saved")" "$live"
+  cp "$live" "$independent"
+  run_helper renew --profile Live --json >/dev/null
+  assert_same_file "$live" "$independent" "not-due renew overwrote a different chain for the same user"
+
+  plutil -replace tokens.refresh_token -string refresh-live-new "$live"
+  run_helper renew --profile Live --json >/dev/null
+  assert_same_file "$live" "$saved" "not-due renew did not reconcile the same user and chain"
 }
 
 test_import_refreshed_auth_obeys_last_refresh_order() {
@@ -1798,6 +1913,70 @@ test_self_fetch_usage_groups_shared_credentials() {
     run_helper best-auth --dir "$WORK_DIR/self-usage-out" >/dev/null
   [[ "$(wc -l < "$usage_count" | tr -d ' ')" == 1 ]] \
     || fail "selfFetchUsage made more than one RPC for one credential"
+}
+
+test_self_fetch_usage_writes_rotated_credentials_to_live() {
+  local fail_rpc
+  for fail_rpc in 0 1; do
+    reset_home
+    local original="$WORK_DIR/self-usage-original.json" rotated="$WORK_DIR/self-usage-rotated.json"
+    local usage_count="$WORK_DIR/self-usage-rotation-count"
+    make_oauth_auth "$original" access-old refresh-old acct-usage
+    make_oauth_auth "$rotated" access-new refresh-new acct-usage
+    add_user_to_oauth_auth "$original" user-usage
+    add_user_to_oauth_auth "$rotated" user-usage
+    save_auth UsageRotation "$original"
+    write_profiles_config UsageRotation UsageRotation
+    cp "$original" "$TEST_HOME/.codex/auth.json"
+    make_usage_codex "$FAKE_USAGE_CODEX" "$usage_count"
+    local status=0
+    USAGE_RPC_COUNT="$usage_count" USAGE_RPC_ROTATION="$rotated" USAGE_RPC_FAIL="$fail_rpc" \
+      TEST_CODEX_CLI="$FAKE_USAGE_CODEX" run_helper best-auth --dir "$WORK_DIR/self-usage-rotation-out" \
+      > /dev/null 2>"$WORK_DIR/self-usage-rotation.err" || status=$?
+    if [[ "$fail_rpc" == 0 ]]; then
+      [[ "$status" == 0 ]] || fail "self-fetch with rotated credentials did not return usage"
+    else
+      [[ "$status" == 4 ]] || fail "the failed usage RPC did not report usage unavailable"
+    fi
+    assert_same_file "$AUTH_STORE/UsageRotation.json" "$rotated" "self-fetch did not persist the rotated credential"
+    assert_same_file "$TEST_HOME/.codex/auth.json" "$rotated" "self-fetch left a consumed refresh token in live auth"
+  done
+}
+
+test_best_auth_does_not_restore_usage_discarded_during_fetch() {
+  reset_home
+  local original="$WORK_DIR/best-race-original.json" replacement="$WORK_DIR/best-race-replacement.json"
+  local count="$WORK_DIR/best-race-count" release="$WORK_DIR/best-race-release"
+  local cache="$TEST_HOME/.codex-multi-switcher/cache.json"
+  make_api_auth "$original" sk-test-old-account best-race-old
+  make_api_auth "$replacement" sk-test-new-account best-race-new
+  save_auth BestRace "$original"
+  write_profiles_config BestRace BestRace
+
+  local fail_rpc
+  for fail_rpc in 1 0; do
+    save_auth BestRace "$original"
+    cat > "$cache" <<'JSON'
+{"snapshots":{"BestRace":{"planType":"team","primaryUsedPercent":10,"secondaryUsedPercent":20,"fetchedAt":"2026-01-01T00:00:00Z"}}}
+JSON
+    rm -f "$release"
+    make_usage_codex "$FAKE_USAGE_CODEX" "$count"
+    (USAGE_RPC_COUNT="$count" USAGE_RPC_RELEASE="$release" USAGE_RPC_FAIL="$fail_rpc" \
+      TEST_CODEX_CLI="$FAKE_USAGE_CODEX" run_helper best-auth --dir "$WORK_DIR/best-race-out" \
+      > "$WORK_DIR/best-race.out" 2> "$WORK_DIR/best-race.err") &
+    local best_pid=$!
+    for _ in {1..200}; do [[ -s "$count" ]] && break; sleep 0.02; done
+    [[ -s "$count" ]] || fail "best-auth did not start reading usage"
+    save_auth BestRace "$replacement"
+    plutil -remove snapshots.BestRace "$cache"
+    : > "$release"
+    local status=0
+    wait "$best_pid" || status=$?
+    [[ "$status" == 4 ]] || fail "best-auth did not report discarded usage unavailable (status $status)"
+    if plutil -extract snapshots.BestRace json -o - "$cache" >/dev/null 2>&1; then
+      fail "best-auth restored usage for the previous account"
+    fi
+  done
 }
 
 test_usage_provider_groups_shared_credentials() {
@@ -2022,9 +2201,14 @@ test_shared_refresh_token_renews_once
 test_renew_save_failure_leaves_stash_and_next_run_recovers
 test_stale_renewal_stash_is_discarded
 test_renew_reconciles_live_auth_forward
+test_renew_does_not_replace_a_new_desktop_chain_for_the_same_user
+test_renew_recovery_reconciles_legacy_live_auth_with_new_user_claims
+test_renew_reconciles_only_matching_live_auth_when_not_due
 test_import_refreshed_auth_obeys_last_refresh_order
 test_exec_export_is_skipped_by_renew_while_live
 test_self_fetch_usage_groups_shared_credentials
+test_self_fetch_usage_writes_rotated_credentials_to_live
+test_best_auth_does_not_restore_usage_discarded_during_fetch
 test_usage_provider_groups_shared_credentials
 test_renewal_and_switch_interleavings_keep_newer_credential
 test_login_between_request_and_commit_survives

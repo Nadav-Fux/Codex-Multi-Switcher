@@ -687,7 +687,7 @@ enum CodexProfileCLI {
             throw CLIError.exitStatus(ExitCode.noProfilesConfigured)
         }
 
-        var cache = self.loadCache()
+        let startingSnapshots = self.loadCache().snapshots
         let eligibleProfiles: [ProfileConfig]
         do {
             eligibleProfiles = try config.profiles.filter { profile in
@@ -709,18 +709,13 @@ enum CodexProfileCLI {
         let fetchResult = self.selfFetchUsage(
             profiles: eligibleProfiles,
             activeProfile: config.activeProfile,
-            cache: cache,
             vault: bestAuthVault,
             readBound: readBound,
             interactive: interactive,
             reservationToken: reservation?.token)
-        cache = fetchResult.cache
-        self.persistCacheMerge(cache)
+        let (cache, fetchedAny) = self.persistCacheMerge(fetchResult.snapshots, startingFrom: startingSnapshots)
 
-        // If no live fetch succeeded and the cache has no snapshot for any
-        // eligible profile, there is no usable usage data at all.
-        let haveAnySnapshot = eligibleProfiles.contains { cache.snapshots[$0.id] != nil }
-        if !fetchResult.fetchedAny, !haveAnySnapshot {
+        if !eligibleProfiles.contains(where: { cache.snapshots[$0.id] != nil }) {
             if let lastError = fetchResult.lastFetchError {
                 fputs("usage data unavailable (last error: \(lastError))\n", stderr)
             } else {
@@ -831,13 +826,12 @@ enum CodexProfileCLI {
             reservationProfileIDs: reservationProfileIDs,
             candidates: candidates,
             cache: cache,
-            fetchedAny: fetchResult.fetchedAny,
+            fetchedAny: fetchedAny,
             now: now)
     }
 
     private struct SelfFetchResult {
-        var cache: UsageCache
-        var fetchedAny: Bool
+        var snapshots: [String: UsageSnapshot]
         var credentialGroups: [String: [String]]
         /// Description of the last per-profile fetch error, if any failed.
         var lastFetchError: String?
@@ -848,11 +842,8 @@ enum CodexProfileCLI {
         let authData: Data
     }
 
-    /// Fetches live usage for each eligible profile (bounded concurrency 3) and
-    /// merges fresh snapshots into a copy of `cache`. A per-profile failure
-    /// (fetch error, or a Keychain read that needs interaction) falls back to
-    /// that profile's existing cached snapshot — stale beats none — and never
-    /// escalates to exit 6. Exhaustion overrides are preserved untouched.
+    /// Fetches live usage for each eligible profile (bounded concurrency 3).
+    /// Failures leave the on-disk snapshot available as a fallback.
     ///
     /// In non-interactive mode the vault is probed once: if a Keychain data read
     /// would block on a consent prompt, ALL vault reads are skipped (the live
@@ -861,14 +852,13 @@ enum CodexProfileCLI {
     private static func selfFetchUsage(
         profiles: [ProfileConfig],
         activeProfile: String,
-        cache: UsageCache,
         vault: AuthVault,
         readBound: TimeInterval?,
         interactive: Bool,
         reservationToken: String?
     ) -> SelfFetchResult {
         guard !profiles.isEmpty else {
-            return SelfFetchResult(cache: cache, fetchedAny: false, credentialGroups: [:], lastFetchError: nil)
+            return SelfFetchResult(snapshots: [:], credentialGroups: [:], lastFetchError: nil)
         }
 
         let configURL = self.paths.liveCodexHome.appendingPathComponent("config.toml")
@@ -966,14 +956,16 @@ enum CodexProfileCLI {
                             if let rotated = result.updatedAuthData {
                                 _ = try AuthCredentialUpdate.persistIfUnchanged(
                                     originalData: fetchGroup.authData, updatedData: rotated,
-                                    profileIDs: fetchGroup.profileIDs, vault: vault)
+                                    profileIDs: fetchGroup.profileIDs, vault: vault,
+                                    liveAuthURL: liveAuthURL)
                             }
                             return (fetchGroup.profileIDs, result.snapshot, nil)
                         } catch {
                             if let operationError = error as? CLIUsageOperationError {
                                 _ = try? AuthCredentialUpdate.persistIfUnchanged(
                                     originalData: fetchGroup.authData, updatedData: operationError.updatedAuthData,
-                                    profileIDs: fetchGroup.profileIDs, vault: vault)
+                                    profileIDs: fetchGroup.profileIDs, vault: vault,
+                                    liveAuthURL: liveAuthURL)
                             }
                             return (fetchGroup.profileIDs, nil, error.localizedDescription)
                         }
@@ -995,13 +987,8 @@ enum CodexProfileCLI {
             }
         }
 
-        var merged = cache
-        for (id, snapshot) in fetchOutcome.snapshots {
-            merged.snapshots[id] = snapshot
-        }
         return SelfFetchResult(
-            cache: merged,
-            fetchedAny: !fetchOutcome.snapshots.isEmpty,
+            snapshots: fetchOutcome.snapshots,
             credentialGroups: fetchOutcome.credentialGroups,
             lastFetchError: fetchOutcome.lastError)
     }
@@ -1040,21 +1027,25 @@ enum CodexProfileCLI {
         var value: T?
     }
 
-    /// Writes the merged cache using the same atomic-write + override-preserving
-    /// semantics the app and `mark-exhausted` use. Best-effort: a write failure
-    /// must not fail the command (the selection is still valid).
-    private static func persistCacheMerge(_ cache: UsageCache) {
-        // Hold the cache lock across the disk re-read and the write so a lease
-        // (or override) a concurrent process commits in this window is not
-        // dropped by this whole-cache replace. Best-effort: a lock/write failure
-        // must not fail the command (the selection is still valid).
-        try? self.withCacheLock {
-            // Preserve any overrides already on disk that aren't in our copy.
-            let toWrite = cache.mergingDiskOverrides(
-                fromCacheAt: self.paths.cacheURL,
-                decoder: JSONDecoder.iso8601Decoder())
-            try self.saveCache(toWrite)
+    private static func persistCacheMerge(
+        _ snapshots: [String: UsageSnapshot], startingFrom startingSnapshots: [String: UsageSnapshot]
+    ) -> (UsageCache, Bool) {
+        func merge() -> (cache: UsageCache, fetchedAny: Bool) {
+            // Disk supplies the fallback. A re-authentication can delete the
+            // starting snapshot while a fetch is still using the old login.
+            var cache = self.loadCache()
+            var fetchedAny = false
+            for (id, snapshot) in snapshots where cache.snapshots[id] == startingSnapshots[id] {
+                cache.snapshots[id] = snapshot
+                fetchedAny = true
+            }
+            return (cache, fetchedAny)
         }
+        return (try? self.withCacheLock {
+            let result = merge()
+            if result.fetchedAny { try? self.saveCache(result.cache) }
+            return result
+        }) ?? merge()
     }
 
     private static func makeBestAuthReport(
@@ -2175,6 +2166,21 @@ enum CodexProfileCLI {
                 for entry in approved {
                     try self.vault._saveAuthBlobUnlocked(entry.replacement, profileID: entry.profileID)
                 }
+                if let active = self.configStore.loadConfig()?.activeProfile,
+                   let replacement = updatedData[active],
+                   let liveData = try? Data(contentsOf: self.paths.liveAuthURL) {
+                    do {
+                        if try self.vault.loadAuthBlob(profileID: active) == replacement {
+                            try self.reconcileLiveAuth(liveData: liveData, storedData: replacement,
+                                                       consumedRefreshToken: expectedRefreshToken)
+                        }
+                    } catch {
+                        // A live-file error cannot undo the already saved rotation.
+                        FileHandle.standardError.write(Data(
+                            ("reconcile live auth failed after rotation: "
+                                + TokenRenewal.sanitizedExternalMessage(error.localizedDescription) + "\n").utf8))
+                    }
+                }
             }
 
             // A pending keychain-migration checkpoint records the exact bytes
@@ -2209,35 +2215,35 @@ enum CodexProfileCLI {
     private static func reconcileLiveAuth() throws {
         try self.vault.transact {
             guard let liveData = try? Data(contentsOf: self.paths.liveAuthURL),
-                  let liveCredentials = try? AuthBlob.load(from: liveData) else {
-                return
-            }
-
-            // Reconcile from the ACTIVE profile only, never a scan over every
-            // profile. A scan needs a tolerant match (identityMatches) to
-            // avoid missing a refresh response that merely adds an identity
-            // field, but a tolerant match plus newest-wins would let two
-            // profiles for the same account on different credential chains
-            // both match, silently swapping the user onto the wrong chain.
-            // The active profile is the only one this command has any
-            // business writing back to live auth.json.
-            guard let activeProfile = self.configStore.loadConfig()?.activeProfile,
+                  let activeProfile = self.configStore.loadConfig()?.activeProfile,
                   ProfileValidator.isValid(activeProfile),
-                  let storedData = try self.vault.loadAuthBlob(profileID: activeProfile),
-                  let storedCredentials = try? AuthBlob.load(from: storedData) else {
+                  let storedData = try self.vault.loadAuthBlob(profileID: activeProfile) else {
                 return
             }
-            guard AuthBlob.identityMatches(liveData, storedData) else { return }
+            try self.reconcileLiveAuth(liveData: liveData, storedData: storedData)
+        }
+    }
 
-            let liveIsOlder: Bool
-            switch (liveCredentials.lastRefresh, storedCredentials.lastRefresh) {
-            case (nil, .some): liveIsOlder = true
-            case let (.some(live), .some(stored)): liveIsOlder = live < stored
-            default: liveIsOlder = false
-            }
-            if liveIsOlder {
-                try AtomicFileWriter.write(storedData, to: self.paths.liveAuthURL)
-            }
+    // Callers hold the vault transaction and supply only the active profile's data.
+    private static func reconcileLiveAuth(
+        liveData: Data, storedData: Data, consumedRefreshToken: String? = nil
+    ) throws {
+        guard let live = try? AuthBlob.load(from: liveData),
+              let stored = try? AuthBlob.load(from: storedData),
+              let storedRefreshDate = stored.lastRefresh,
+              live.lastRefresh.map({ storedRefreshDate > $0 }) ?? true else { return }
+
+        let consumedLiveToken = live.refreshToken == consumedRefreshToken
+        guard !live.refreshToken.isEmpty,
+              consumedLiveToken || live.refreshToken == stored.refreshToken else { return }
+
+        // A consumed token proves continuity even when the response adds user claims.
+        let bothLegacy = !AuthBlob.hasUserIdentity(liveData) && !AuthBlob.hasUserIdentity(storedData)
+        let sameUser = AuthBlob.identityMatchesUser(liveData, storedData)
+        let sameLegacyIdentity = bothLegacy && AuthBlob.identityMatches(liveData, storedData)
+        let compatibleRotation = consumedLiveToken && AuthBlob.identityMatchesOnConsumedChain(liveData, storedData)
+        if sameUser || sameLegacyIdentity || compatibleRotation {
+            try AtomicFileWriter.writeIfUnchanged(storedData, to: self.paths.liveAuthURL, expected: liveData)
         }
     }
 

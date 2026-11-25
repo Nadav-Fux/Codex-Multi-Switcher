@@ -30,7 +30,7 @@ final class ProfileStore: ObservableObject {
     private let codexAuthPath: URL
     private let codexGlobalStateURL: URL
     private let fileManager = FileManager.default
-    private var authMutationInProgress = false
+    private var activeAuthMutations = 0
     private var cacheDirty = false
     private var keychainMigrationCoordinator: KeychainMigrationCoordinator?
     private var keychainMigrationPreview: KeychainMigrationPreview?
@@ -227,11 +227,66 @@ final class ProfileStore: ObservableObject {
         self.authStoreExists(for: profileId) && self.cache.renewalStates[profileId]?.renewalAction != .rejected
     }
 
-    func syncSavedAuthToLive(for profileId: String) throws {
-        guard let data = try self.authVault.loadAuthBlob(profileID: profileId) else {
-            throw AuthError.notFound
+    func liveAuthData() throws -> Data? {
+        do {
+            return try Data(contentsOf: self.codexAuthPath)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return nil
         }
-        try self.replaceFile(at: self.codexAuthPath, with: data)
+    }
+
+    struct LoginStart {
+        let profileId: String
+        let wasLiveProfile: Bool
+        let liveAuth: Result<Data?, Error>
+        let savedAuth: Data?
+        let fingerprint: String?
+    }
+
+    func startLogin(
+        for profileId: String,
+        launch: (String, @escaping (Result<Void, CodexBridgeError>) -> Void) -> Void,
+        completion: @escaping (Result<Void, CodexBridgeError>, LoginStart) -> Void
+    ) {
+        let wasLive = self.liveProfileId == profileId
+        let live = Result { try self.liveAuthData() }
+        let saved = self.savedAuthData(for: profileId)
+        let start = LoginStart(profileId: profileId, wasLiveProfile: wasLive,
+                               liveAuth: live, savedAuth: saved,
+                               fingerprint: saved.flatMap { self.authFingerprint(for: $0) })
+        launch(profileId) { completion($0, start) }
+    }
+
+    /// Returns nil for an inactive profile and false if the final comparison
+    /// finds that Desktop changed the live login since sign-in started.
+    func syncSavedAuthAfterLogin(_ start: LoginStart) throws -> Bool? {
+        let profileId = start.profileId
+        guard start.wasLiveProfile, self.liveProfileId == profileId else { return nil }
+        let expected = try start.liveAuth.get()
+        // The last observed profile can lag behind a Desktop sign-in.
+        if let expected {
+            guard let saved = start.savedAuth,
+                  saved == expected || AuthBlob.identityMatchesUser(saved, expected) else { return false }
+        }
+        return try self.authVault.transact {
+            guard let data = try self.authVault.loadAuthBlob(profileID: profileId) else {
+                throw AuthError.notFound
+            }
+            return try AtomicFileWriter.writeIfUnchanged(data, to: self.codexAuthPath, expected: expected)
+        }
+    }
+
+    /// Keep cached usage only when the saved login still identifies the same account.
+    func discardUsageIfAccountChanged(for profileId: String, previousFingerprint: String?) {
+        if let data = self.savedAuthData(for: profileId), let previousFingerprint,
+           AuthBlob.hasUserIdentity(data), self.authFingerprint(for: data) == previousFingerprint {
+            return
+        }
+        self.cache.snapshots.removeValue(forKey: profileId)
+        self.cache.exhaustionOverrides.removeValue(forKey: profileId)
+        self.refreshDiagnostics.removeValue(forKey: profileId)
+        self.statuses[profileId] = .loading
+        self.saveCache(excludingOverridesFor: profileId)
     }
 
     func prepareProfileSwitch(
@@ -999,15 +1054,15 @@ final class ProfileStore: ObservableObject {
     }
 
     func beginAuthMutation() {
-        self.authMutationInProgress = true
+        self.activeAuthMutations += 1
     }
 
     func endAuthMutation() {
-        self.authMutationInProgress = false
+        self.activeAuthMutations -= 1
     }
 
     func isAuthMutationInProgress() -> Bool {
-        self.authMutationInProgress
+        self.activeAuthMutations > 0
     }
 
     func authFingerprint(for url: URL) -> String? {
@@ -1019,9 +1074,12 @@ final class ProfileStore: ObservableObject {
         AuthBlob.identityFingerprint(from: data)
     }
 
+    func savedAuthData(for profileId: String) -> Data? {
+        try? self.authVault.loadAuthBlob(profileID: profileId)
+    }
+
     func savedAuthFingerprint(for profileId: String) -> String? {
-        guard let data = try? self.authVault.loadAuthBlob(profileID: profileId) else { return nil }
-        return self.authFingerprint(for: data)
+        self.savedAuthData(for: profileId).flatMap { self.authFingerprint(for: $0) }
     }
 
     func liveAuthFingerprint() -> String? {
@@ -1374,12 +1432,6 @@ final class ProfileStore: ObservableObject {
             AppLogger.error("Failed to remove legacy disk auth store",
                             metadata: ["error": error.localizedDescription])
         }
-    }
-
-    private func replaceFile(at destination: URL, with data: Data) throws {
-        let dir = destination.deletingLastPathComponent()
-        try self.fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
-        try AtomicFileWriter.write(data, to: destination)
     }
 
     private static func isValidProfileId(_ id: String) -> Bool {

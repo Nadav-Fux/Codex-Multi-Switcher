@@ -82,6 +82,7 @@ struct GLMProviderAdapter: UsageProviderAdapter {
             case .invalidResponse: state = .error(.malformedResponse)
             case .quotaUnavailable: state = .unavailable
             case .accountChanged: state = .error(.authenticationRequired)
+            case .rateLimited: state = .error(.rateLimited)
             default: state = error is GLMCredentialStore.Failure ? .error(.credentialAccessUnsupported) : .error(.networkUnavailable)
             }
             return ProviderUsageSnapshot(provider: providerID, source: "Z.ai Coding Plan quota", state: state, glmAccountBenefits: await GLMAccountBenefitsCache.shared.validate(await accountBenefits))

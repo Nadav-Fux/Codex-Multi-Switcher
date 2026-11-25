@@ -14,20 +14,17 @@ public enum AtomicFileWriter {
         let temp = destination.deletingLastPathComponent()
             .appendingPathComponent(".\(destination.lastPathComponent).tmp-\(UUID().uuidString)")
         try self.createFilePrivately(at: temp, contents: data)
-        do {
-            if fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: temp)
-            } else {
-                try fileManager.moveItem(at: temp, to: destination)
-            }
-        } catch {
-            try? fileManager.removeItem(at: temp)
-            throw error
+        defer { try? fileManager.removeItem(at: temp) }
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: temp)
+        } else {
+            try fileManager.moveItem(at: temp, to: destination)
         }
     }
 
     /// Same write as `write`, but committed only when the destination still
-    /// holds `expected`. The temp file is created and fsynced FIRST, then the
+    /// holds `expected`. With nil, publish only if the path is absent.
+    /// The temp file is created and fsynced FIRST, then the
     /// destination is re-read and compared, then the rename happens
     /// immediately — nothing else runs between the compare and the rename, so
     /// a concurrent external write is caught everywhere except the rename
@@ -38,7 +35,7 @@ public enum AtomicFileWriter {
     public static func writeIfUnchanged(
         _ data: Data,
         to destination: URL,
-        expected: Data,
+        expected: Data?,
         beforeCommit: (() -> Void)? = nil,
         fileManager: FileManager = .default
     ) throws -> Bool {
@@ -46,20 +43,26 @@ public enum AtomicFileWriter {
         let temp = destination.deletingLastPathComponent()
             .appendingPathComponent(".\(destination.lastPathComponent).tmp-\(UUID().uuidString)")
         try self.createFilePrivately(at: temp, contents: data)
+        defer { try? fileManager.removeItem(at: temp) }
         beforeCommit?()
+        guard let expected else {
+            // A hard link publishes the prepared file without replacing any
+            // entry that Desktop creates concurrently, even if it is unreadable.
+            let result = temp.path.withCString { source in
+                destination.path.withCString { link(source, $0) }
+            }
+            if result == 0 { return true }
+            let code = POSIXError.Code(rawValue: errno) ?? .EIO
+            if code == .EEXIST { return false }
+            throw POSIXError(code)
+        }
         guard (try? Data(contentsOf: destination)) == expected else {
-            try? fileManager.removeItem(at: temp)
             return false
         }
-        do {
-            if fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: temp)
-            } else {
-                try fileManager.moveItem(at: temp, to: destination)
-            }
-        } catch {
-            try? fileManager.removeItem(at: temp)
-            throw error
+        if fileManager.fileExists(atPath: destination.path) {
+            _ = try fileManager.replaceItemAt(destination, withItemAt: temp)
+        } else {
+            try fileManager.moveItem(at: temp, to: destination)
         }
         return true
     }
@@ -76,16 +79,17 @@ public enum AtomicFileWriter {
             throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
         }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        try handle.write(contentsOf: contents)
-        // Force the written bytes to stable storage before the rename that
-        // publishes this temp file over the destination. `replaceItemAt` makes
-        // the RENAME atomic, but without this the data itself can still be
-        // sitting in a page cache: a power loss between the write and the
-        // rename could publish a zero-length or truncated file over a live
-        // credential.
-        guard fsync(fd) == 0 else {
-            throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
+        do {
+            try handle.write(contentsOf: contents)
+            // Flush the bytes before publishing the file so a power loss cannot
+            // replace a live credential with a zero-length or truncated file.
+            guard fsync(fd) == 0 else {
+                throw POSIXError(POSIXError.Code(rawValue: errno) ?? .EIO)
+            }
+            try handle.close()
+        } catch {
+            _ = url.path.withCString { unlink($0) }
+            throw error
         }
-        try handle.close()
     }
 }

@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+- `codex-profile renew` checks both the refresh chain and login identity before reconciling live Desktop credentials, including when a refresh adds user claims to a legacy login.
+- Re-authenticating an active profile compares live auth with the bytes captured at sign-in start before replacing an existing file. Desktop can still write between the final comparison and the rename. When live auth was absent, the new file is published only if the path is still absent.
+- CLI usage polling saves rotated credentials to Codex Desktop when it still holds the consumed refresh token and the login has a shared user claim or is the exact legacy input. This also applies when the quota read fails after rotation.
+- Re-authenticating as a different account clears the previous account's cached usage and exhaustion override.
+- Refresh All forces a Claude refresh and queues it if Claude is already busy, while respecting Claude's server rate-limit wait.
+- GLM quota reads wait five minutes after HTTP 429, including when a manual refresh is requested.
 - Antigravity quota no longer shows `?` when a window is unused: the quota service omits `resetTime` on a full window, and that used to discard the whole response. A partly used window without a reset time still fails closed.
-- Stale sign-in healing now requires a shared user-level identity claim, not only `account_id` — on ChatGPT Team workspaces `account_id` is shared by every member, so a saved profile without an `id_token` can no longer adopt a teammate's newer login. The same check guards writing rotated credentials back to `~/.codex/auth.json`.
+- Stale sign-in healing now requires a shared user-level identity claim. On ChatGPT Team workspaces every member shares the same `account_id`, so the workspace ID alone cannot identify the user.
 - The `~/.codex/auth.json` write-back prepares its temp file first, then re-reads the destination immediately before the rename and commits only when it is unchanged — narrowing the window where a login Codex Desktop saves concurrently could be overwritten to the final compare-and-rename.
 - The GLM key stdin import in Local and Preview builds now writes to the same profile home the GUI reads it from.
 - Saving or removing the GLM key writes a "no legacy migration" marker next to the key file, so a leftover Keychain item can never bring a removed key back — even when the legacy Keychain delete fails. The one-time legacy read also runs outside the store's lock, so a Keychain prompt can no longer freeze Save/Remove in Settings while it waits.

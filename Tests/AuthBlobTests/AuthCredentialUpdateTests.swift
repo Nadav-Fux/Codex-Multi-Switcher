@@ -139,18 +139,30 @@ struct AuthCredentialUpdateTests {
     }
 
     @Test
-    func liveWriteBackRequiresASharedUserClaim() throws {
+    func legacyLiveWriteBackRequiresExactInputBytesAndNoUserClaims() throws {
         try self.withScratch { root in
-            // Workspace-only blobs carry just the shared account_id: they
-            // cannot prove the rotated credential is the same member.
             let original = self.auth(user: nil, token: "old", timestamp: "2026-01-01T00:00:00Z")
             let rotated = self.auth(user: nil, token: "new", timestamp: "2026-01-02T00:00:00Z")
+            let identified = self.auth(token: "new", timestamp: "2026-01-02T00:00:00Z")
             let liveAuth = root.appendingPathComponent("fake-live-auth.json")
             try original.write(to: liveAuth)
             let vault = CredentialUpdateTestVault(root: root, blobs: [:])
             let outcome = try AuthCredentialUpdate.persistIfUnchanged(
                 originalData: original, updatedData: rotated, profileIDs: [], vault: vault, liveAuthURL: liveAuth)
-            #expect(!outcome.liveAuthUpdated)
+            #expect(outcome.liveAuthUpdated)
+            #expect(try Data(contentsOf: liveAuth) == rotated)
+
+            let equivalentLive = original + Data("\n".utf8)
+            try equivalentLive.write(to: liveAuth)
+            let mismatched = try AuthCredentialUpdate.persistIfUnchanged(
+                originalData: original, updatedData: rotated, profileIDs: [], vault: vault, liveAuthURL: liveAuth)
+            #expect(!mismatched.liveAuthUpdated)
+            #expect(try Data(contentsOf: liveAuth) == equivalentLive)
+
+            try original.write(to: liveAuth)
+            let withUser = try AuthCredentialUpdate.persistIfUnchanged(
+                originalData: original, updatedData: identified, profileIDs: [], vault: vault, liveAuthURL: liveAuth)
+            #expect(!withUser.liveAuthUpdated)
             #expect(try Data(contentsOf: liveAuth) == original)
         }
     }

@@ -348,6 +348,7 @@ private final class BoundedGLMQuotaResponse: NSObject, URLSessionDataDelegate, @
             return
         }
         if http.statusCode == 401 || http.statusCode == 403 { self.failure = .credentialRejected }
+        if http.statusCode == 429 { self.failure = .rateLimited }
         self.valid = http.statusCode == 200
             && (response.expectedContentLength < 0 || response.expectedContentLength <= 1_048_576)
         completionHandler(self.valid ? .allow : .cancel)

@@ -57,6 +57,7 @@ public enum GLMQuotaError: LocalizedError, Equatable {
     case invalidResponse
     case quotaUnavailable
     case requestFailed
+    case rateLimited
 
     public var errorDescription: String? {
         switch self {
@@ -76,6 +77,8 @@ public enum GLMQuotaError: LocalizedError, Equatable {
             return "Z.ai returned no Coding Plan quota windows for this key. Check the plan and key, or try refreshing later."
         case .requestFailed:
             return "Current GLM Coding Plan quota could not be fetched. Try refreshing again in a few minutes."
+        case .rateLimited:
+            return "Z.ai asked us to wait before reading quota again."
         }
     }
 }
