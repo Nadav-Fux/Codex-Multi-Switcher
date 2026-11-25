@@ -234,7 +234,11 @@ struct ClaudeIntegrationSmoke {
 
         try ClaudeUsageHelperChecks.run(root: root)
         try await ClaudeCurrentUsageChecks.run(root: root, home: dedicatedHome, environment: environment, bridge: bridge)
-        let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge)
+        let retryTransport = ClaudeCurrentUsageChecks.FakeTransport(fail: true)
+        let store = ClaudeProfileStore(environment: environment, bridgeURL: bridge,
+            currentUsageService: ClaudeCurrentUsageService(root: root.appendingPathComponent("queued-refresh"),
+                nativeHome: dedicatedHome, credentialLoader: ClaudeCurrentUsageChecks.FakeLoader(), transport: retryTransport),
+            quotaRefreshPolicy: ClaudeQuotaRefreshPolicy(root: root.appendingPathComponent("queued-refresh-policy")))
         var callbackCount = 0
         store.onChange = { callbackCount += 1 }
         store.select(id: managed.id)
@@ -244,6 +248,24 @@ struct ClaudeIntegrationSmoke {
         try require(!store.isRefreshing && store.statuses[managed.id]?.auth?.email == auth.email,
                     "Observable store asynchronously refreshes fake profile auth")
         try require(callbackCount > 0 && store.selectedID == managed.id, "Store selection and menu callback")
+        try require(retryTransport.calls == 1, "The initial quota failure starts a retry cooldown")
+
+        var completedRefreshes = 0
+        var wasRefreshing = false
+        store.onChange = {
+            if wasRefreshing && !store.isRefreshing { completedRefreshes += 1 }
+            wasRefreshing = store.isRefreshing
+        }
+        store.refresh()
+        store.refresh(force: true)
+        store.refresh(force: true)
+        let forcedDeadline = Date().addingTimeInterval(10)
+        while store.isRefreshing && Date() < forcedDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        try require(!store.isRefreshing && completedRefreshes == 2,
+                    "Forced Claude refreshes during a busy cycle are coalesced and run after it")
+        try require(retryTransport.calls == 2, "The queued cycle retries the quota read inside the cooldown")
+        store.onChange = nil
+
         let managedBytesBeforePendingInstall = try Data(contentsOf: managedSettings)
         let delayedAuth = "#!/bin/sh\n/bin/sleep 0.2\nprintf '{\"loggedIn\":true,\"email\":\"fixture@example.test\",\"orgId\":\"org-fixture\"}'\n"
         try AtomicFileWriter.write(Data(delayedAuth.utf8), to: executable)

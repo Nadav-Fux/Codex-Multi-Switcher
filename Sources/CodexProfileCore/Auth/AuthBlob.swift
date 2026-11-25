@@ -169,6 +169,19 @@ public enum AuthBlob {
     /// user's newer `email`+`sub` token. The strict path collects EVERY
     /// user-level claim an id_token carries.
     public static func identityMatchesUser(_ current: Data, _ replacement: Data) -> Bool {
+        self.userClaimsMatch(current, replacement, requireSharedUserClaim: true)
+    }
+
+    /// Once the consumed token proves continuity, user claims may be added or
+    /// missing, as long as the shared identity claims agree.
+    public static func identityMatchesOnConsumedChain(_ current: Data, _ replacement: Data) -> Bool {
+        self.identityMatches(current, replacement)
+            && self.userClaimsMatch(current, replacement, requireSharedUserClaim: false)
+    }
+
+    private static func userClaimsMatch(
+        _ current: Data, _ replacement: Data, requireSharedUserClaim: Bool
+    ) -> Bool {
         guard let currentJSON = try? parseTopLevelObject(from: current),
               let replacementJSON = try? parseTopLevelObject(from: replacement),
               let currentIdentity = strictIdentityClaims(from: currentJSON),
@@ -183,7 +196,14 @@ public enum AuthBlob {
                 matchedUserClaims += 1
             }
         }
-        return matchedUserClaims > 0
+        return !requireSharedUserClaim || matchedUserClaims > 0
+    }
+
+    /// True when a user claim or API key identifies the login independently of its workspace ID.
+    public static func hasUserIdentity(_ data: Data) -> Bool {
+        guard let json = try? parseTopLevelObject(from: data),
+              let identity = strictIdentityClaims(from: json) else { return false }
+        return identity.keys.contains { $0 != "kind" && $0 != "accountId" }
     }
 
     private static func parseTopLevelObject(from data: Data) throws -> [String: Any] {
@@ -298,8 +318,7 @@ public enum AuthBlob {
         return nil
     }
 
-    /// Identity extraction for `identityMatchesUser` only. Same shape as
-    /// `authIdentity`, except an id_token contributes EVERY user-level claim
+    /// Same shape as `authIdentity`, except an id_token contributes EVERY user-level claim
     /// it carries — `userId` AND `email` — instead of only the first match.
     private static func strictIdentityClaims(from json: [String: Any]) -> [String: Any]? {
         if let apiKey = nonEmptyString(json["OPENAI_API_KEY"]) {

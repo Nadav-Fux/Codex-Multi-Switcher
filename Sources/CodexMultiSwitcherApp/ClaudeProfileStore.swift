@@ -26,6 +26,7 @@ final class ClaudeProfileStore: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var pendingBridgeOperations: Set<String> = []
     private var pendingConnectID: String?
+    private var pendingForcedRefresh = false
     private var lastCodeUsageRefresh: [String: Date] = [:]
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -56,7 +57,11 @@ final class ClaudeProfileStore: ObservableObject {
     /// `force` is for an explicit Refresh click or a finished Connect: it asks Claude Code and
     /// the helper again right away instead of reusing a recent (possibly failed) observation.
     func refresh(force: Bool = false) {
-        guard !self.isRefreshing, !self.isAuthorizingCredential else { return }
+        guard !self.isRefreshing, !self.isAuthorizingCredential else {
+            if force { self.pendingForcedRefresh = true }
+            return
+        }
+        self.pendingForcedRefresh = false
         self.error = nil
         do { self.apply(try self.registry.load()) }
         catch { self.error = error.localizedDescription; self.onChange?(); return }
@@ -183,6 +188,8 @@ final class ClaudeProfileStore: ObservableObject {
             if let id = self.pendingConnectID {
                 self.pendingConnectID = nil
                 self.connectNativeAccount(id: id)
+            } else if self.pendingForcedRefresh {
+                self.refresh(force: true)
             }
         }
         self.onChange?()
@@ -265,6 +272,7 @@ final class ClaudeProfileStore: ObservableObject {
                 self.statuses[id]?.error = error.localizedDescription
                 self.error = error.localizedDescription
                 self.onChange?()
+                if self.pendingForcedRefresh { self.refresh(force: true) }
             }
         }
         self.onChange?()

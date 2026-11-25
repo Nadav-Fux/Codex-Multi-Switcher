@@ -10,13 +10,15 @@ final class ExternalProviderStore: ObservableObject {
     var onChange: (() -> Void)?
 
     private let adapters: [ProviderID: any UsageProviderAdapter]
+    private let now: () -> Date
     private var tasks: [ProviderID: Task<Void, Never>] = [:]
     private var credentialGeneration: [ProviderID: UInt64] = [:]
     private var pendingForced: Set<ProviderID> = []
     private var lastAttempt: [ProviderID: Date] = [:]
 
-    init(adapters: [any UsageProviderAdapter]) {
+    init(adapters: [any UsageProviderAdapter], now: @escaping () -> Date = Date.init) {
         self.adapters = Dictionary(adapters.map { ($0.providerID, $0) }, uniquingKeysWith: { first, _ in first })
+        self.now = now
     }
 
     func refresh(_ provider: ProviderID? = nil, force: Bool = false) {
@@ -26,11 +28,15 @@ final class ExternalProviderStore: ObservableObject {
                 if force { pendingForced.insert(id) }
                 continue
             }
-            let failedAuth = snapshots[id]?.state == .error(.authenticationRequired)
-            let cooldown: TimeInterval = failedAuth ? 120 : 29
-            guard force || Date().timeIntervalSince(lastAttempt[id] ?? .distantPast) >= cooldown else { continue }
+            let state = snapshots[id]?.state
+            let rateLimited = state == .error(.rateLimited)
+            let cooldown: TimeInterval = rateLimited ? 300 : state == .error(.authenticationRequired) ? 120 : 29
+            let now = self.now()
+            let elapsed = now.timeIntervalSince(lastAttempt[id] ?? .distantPast)
+            // A server request to wait is honoured even by a forced refresh.
+            guard elapsed >= cooldown || (force && !rateLimited) else { continue }
             let generation = credentialGeneration[id, default: 0]
-            lastAttempt[id] = Date()
+            lastAttempt[id] = now
             refreshing.insert(id)
             tasks[id] = Task { [weak self] in
                 let snapshot = await adapter.readUsageSnapshot()
@@ -40,6 +46,7 @@ final class ExternalProviderStore: ObservableObject {
                     if self.pendingForced.remove(id) != nil { self.refresh(id, force: true) }
                 }
                 guard snapshot.provider == id, self.credentialGeneration[id, default: 0] == generation else { return }
+                if snapshot.state == .error(.rateLimited) { self.lastAttempt[id] = self.now() }
                 // Failed reads replace the observation. Old-account numbers never
                 // survive a sign-out or a failed account verification as current quota.
                 self.snapshots[id] = snapshot
