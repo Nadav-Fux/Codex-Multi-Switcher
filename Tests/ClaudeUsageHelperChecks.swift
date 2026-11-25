@@ -53,6 +53,13 @@ enum ClaudeUsageHelperChecks {
         try check(try String(contentsOf: calls, encoding: .utf8) == "read\nauthorize\nverify\nread\n", "Connect requires separate authorization and silent verification processes")
         try check(client.cached(identity: "other", now: Date()) == nil, "Cache cannot cross accounts")
         try check(client.cached(identity: "fixture", now: Date())?.isStale == true, "Failure fallback is explicitly historical")
+        // Renewal-unavailable is transient: the next poll retries without Connect.
+        try JSONEncoder().encode(ClaudeUsageHelperResponse(error: .credentialRenewalUnavailable)).write(to: readResponse)
+        do { _ = try client.read(identity: "fixture"); throw ClaudeCurrentUsageChecks.Failure(message: "Renewal-unavailable read must fail") }
+        catch ClaudeCurrentUsageError.credentialRenewalUnavailable {}
+        try JSONEncoder().encode(ClaudeUsageHelperResponse(identity: "fixture", snapshot: snapshot)).write(to: readResponse)
+        let afterRenewal = try client.read(identity: "fixture")
+        try check(afterRenewal.fiveHour?.usedPercentage == 21, "A renewal failure never latches the permission block")
         try JSONEncoder().encode(denied).write(to: verifyResponse)
         do { try client.authorize(); throw ClaudeCurrentUsageChecks.Failure(message: "Allow-once cannot confirm Connect") }
         catch ClaudeCurrentUsageError.credentialInteractionRequired {}

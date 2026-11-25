@@ -17,6 +17,10 @@ public enum AuthCredentialUpdate {
         }
     }
 
+    /// `beforeLiveWrite` is a test seam: it runs inside the vault transaction
+    /// after the live-file check and backup, once the replacement temp file is
+    /// prepared and right before the live file is re-read and renamed into
+    /// place, simulating Codex Desktop saving a login in between.
     @discardableResult
     public static func persistIfUnchanged(
         originalData: Data,
@@ -24,7 +28,8 @@ public enum AuthCredentialUpdate {
         profileIDs: [String],
         vault: AuthVault,
         liveAuthURL: URL? = nil,
-        backupDirectory: URL? = nil
+        backupDirectory: URL? = nil,
+        beforeLiveWrite: (() -> Void)? = nil
     ) throws -> Outcome {
         guard AuthBlob.isPlausibleAuthBlob(updatedData),
               AuthBlob.identityMatches(originalData, updatedData),
@@ -60,17 +65,28 @@ public enum AuthCredentialUpdate {
                     try StaleAuthHealer.writeBackup(
                         currentData, label: "codex-auth-json", backupDirectory: backupDirectory)
                 }
-                try AtomicFileWriter.write(updatedData, to: liveAuthURL)
-                liveAuthUpdated = true
-                CoreLogger.info("Wrote rotated credential back to Codex auth.json")
+                // Codex Desktop does not take our vault lock: the temp file is
+                // prepared first, then the live file is re-read and the rename
+                // happens only when it still holds `currentData` — a login it
+                // saved meanwhile always wins over this write-back.
+                if try AtomicFileWriter.writeIfUnchanged(
+                    updatedData, to: liveAuthURL, expected: currentData,
+                    beforeCommit: beforeLiveWrite) {
+                    liveAuthUpdated = true
+                    CoreLogger.info("Wrote rotated credential back to Codex auth.json")
+                } else {
+                    CoreLogger.info("Skipped the Codex auth.json write-back: the file changed after the check")
+                }
             }
             return Outcome(savedProfileIDs: savedProfileIDs, liveAuthUpdated: liveAuthUpdated)
         }
     }
 
     /// Live `auth.json` may be overwritten only when it is the same account
-    /// and still holds the refresh token the rotation consumed (so it is now
-    /// dead), and the replacement is not older than it.
+    /// and the same person (a shared user-level claim — `account_id` alone is
+    /// a workspace id on Team plans), still holds the refresh token the
+    /// rotation consumed (so it is now dead), and the replacement is not older
+    /// than it.
     static func canWriteBackToLive(
         _ liveData: Data,
         captured: AuthCredentials,
@@ -81,7 +97,7 @@ public enum AuthCredentialUpdate {
               let accountID = live.accountId, !accountID.isEmpty,
               replacement.accountId == accountID,
               captured.accountId == accountID,
-              AuthBlob.identityMatches(liveData, replacementData),
+              AuthBlob.identityMatchesUser(liveData, replacementData),
               live.refreshToken == captured.refreshToken,
               replacement.refreshToken != live.refreshToken || replacement.accessToken != live.accessToken else {
             return false

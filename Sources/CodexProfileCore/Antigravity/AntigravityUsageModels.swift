@@ -24,12 +24,13 @@ public struct AntigravityQuotaBucket: Codable, Equatable, Identifiable, Sendable
     public let remainingFraction: Double
     /// Percent is only a unit conversion of the reported fraction.
     public var remainingPercent: Double { self.remainingFraction * 100 }
-    /// Reset instant returned by Antigravity.
-    public let resetsAt: Date
+    /// Reset instant returned by Antigravity. Nil for an unused window: the service
+    /// omits `resetTime` while a window is still full, because no reset is pending.
+    public let resetsAt: Date?
 
     public init(id: String, familyLabel: String, family: AntigravityQuotaFamily,
                 modelDescription: String? = nil, windowLabel: String,
-                window: String, remainingFraction: Double, resetsAt: Date) {
+                window: String, remainingFraction: Double, resetsAt: Date?) {
         self.id = id
         self.familyLabel = familyLabel
         self.family = family

@@ -33,6 +33,20 @@ struct AppFeatureSmoke {
                 throw Failure(message: "Malformed IDE fractions must fail closed")
             } catch AntigravityUsageError.invalidResponse {}
         }
+        // Antigravity 2.34 omits resetTime on an unused (full) window. That must not
+        // discard the whole response; a partly used window without one still fails closed.
+        let unusedPartner = Data(#"{"groups":[{"buckets":[{"bucketId":"gemini-weekly","remainingFraction":0.99,"resetTime":"2027-01-02T12:00:00Z"},{"bucketId":"3p-weekly","remainingFraction":1},{"bucketId":"3p-5h","remainingFraction":1}]}]}"#.utf8)
+        let unusedSnapshot = try AntigravityIDEQuotaReader.snapshot(quota: unusedPartner, before: ideAccount, after: ideAccount)
+        try Self.require(unusedSnapshot.buckets.count == 3
+            && unusedSnapshot.buckets.first { $0.id == "3p-5h" }?.resetAt == nil
+            && ProviderQuotaPresentation.remaining(unusedSnapshot.buckets.first { $0.id == "3p-5h" }!, snapshot: unusedSnapshot) == 100,
+            "An unused window without a reset time reads as 100 percent remaining")
+        do {
+            let partlyUsed = Data(String(decoding: unusedPartner, as: UTF8.self)
+                .replacingOccurrences(of: #""bucketId":"3p-5h","remainingFraction":1"#, with: #""bucketId":"3p-5h","remainingFraction":0.5"#).utf8)
+            _ = try AntigravityIDEQuotaReader.snapshot(quota: partlyUsed, before: ideAccount, after: ideAccount)
+            throw Failure(message: "A partly used window without a reset time must fail closed")
+        } catch AntigravityUsageError.invalidResponse {}
         let partnerOnly = ProviderUsageSnapshot(provider: .antigravity,
             buckets: ideSnapshot.buckets.filter { $0.group == .other }, observedAt: Date(),
             source: "fixture", accountVerified: true)

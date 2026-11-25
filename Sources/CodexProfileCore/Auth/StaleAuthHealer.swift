@@ -7,10 +7,11 @@ import Foundation
 /// fails with `401 token_expired` / `refresh_token_reused`.
 ///
 /// The healer only ever ADOPTS a copy that is strictly better: the same account
-/// (`tokens.account_id` AND the id-token identity, because `account_id` alone is
-/// a shared workspace id on Team plans), a newer `last_refresh`, and an access
-/// token whose JWT `exp` is still in the future. It never invents credentials,
-/// never touches the network, and never logs token values.
+/// (`tokens.account_id` AND a shared user-level identity claim — `account_id`
+/// alone is the shared workspace id on Team plans and can never prove a copy
+/// belongs to the same member), a newer `last_refresh`, and an access token
+/// whose JWT `exp` is still in the future. It never invents credentials, never
+/// touches the network, and never logs token values.
 public enum StaleAuthHealer {
     public enum Source: Equatable, Sendable {
         case liveAuth
@@ -88,7 +89,9 @@ public enum StaleAuthHealer {
 
     /// Returns the best candidate to adopt for `current`, or nil when none is
     /// strictly better. Rules:
-    /// - same `tokens.account_id` (required, non-empty) and same identity claims;
+    /// - same `tokens.account_id` (required, non-empty) and at least one shared
+    ///   user-level claim (anything besides `kind`/`accountId` — a blob without
+    ///   an id-token claim can never adopt a different member's workspace login);
     /// - newer `last_refresh` than `current` (a current copy without a stamp
     ///   loses to any stamped candidate);
     /// - access token JWT `exp` at least `minimumRemainingValidity` after `now`;
@@ -107,7 +110,7 @@ public enum StaleAuthHealer {
         for candidate in candidates {
             guard let credentials = try? AuthBlob.load(from: candidate.data),
                   credentials.accountId == accountID,
-                  AuthBlob.identityMatches(current, candidate.data),
+                  AuthBlob.identityMatchesUser(current, candidate.data),
                   credentials.refreshToken != currentCredentials.refreshToken,
                   let refreshedAt = credentials.lastRefresh,
                   let expiry = ReadOnlyUsageAuth.accessTokenExpiration(credentials.accessToken),

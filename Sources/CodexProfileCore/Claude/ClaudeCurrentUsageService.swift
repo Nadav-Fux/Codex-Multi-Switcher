@@ -208,13 +208,16 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         return try? Self.parseUsage(usage, observedAt: Date(timeIntervalSince1970: timestamp), now: now)
     }
 
+    /// `force` (an explicit Refresh or a just-finished Connect) retries inside
+    /// the cached-failure backoff — except a rate-limit wait, which is always
+    /// honoured like ClaudeQuotaRefreshPolicy does.
     public func fetch(profile: ClaudeProfile, authBefore: ClaudeAuthInfo,
                       authAfter: @Sendable () throws -> ClaudeAuthInfo,
-                      now: Date = Date()) async throws -> ClaudeUsageSnapshot {
+                      now: Date = Date(), force: Bool = false) async throws -> ClaudeUsageSnapshot {
         guard self.supports(profile) else { throw ClaudeCurrentUsageError.unsupportedProfile }
         if let helper {
             guard let identity = ClaudeUsageReader.accountFingerprint(authBefore) else { throw ClaudeCurrentUsageError.accountChanged }
-            try self.beginAttempt(now: now, identity: identity)
+            try self.beginAttempt(now: now, identity: identity, force: force)
             do {
                 let snapshot = try await Task.detached(priority: .utility) { try helper.read(identity: identity) }.value
                 guard ClaudeUsageReader.accountFingerprint(try authAfter()) == identity else {
@@ -241,7 +244,7 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
             throw ClaudeCurrentUsageError.accountChanged
         }
         let token = try self.loader.accessToken()
-        try self.beginAttempt(now: now, identity: identity + Self.credentialDigest(token))
+        try self.beginAttempt(now: now, identity: identity + Self.credentialDigest(token), force: force)
         do {
             let result: ClaudeUsageSnapshot
             do {
@@ -261,10 +264,11 @@ public final class ClaudeCurrentUsageService: @unchecked Sendable {
         }
     }
 
-    private func beginAttempt(now: Date, identity: String) throws {
+    private func beginAttempt(now: Date, identity: String, force: Bool = false) throws {
         self.attemptLock.lock()
         defer { self.attemptLock.unlock() }
-        guard identity != self.attemptIdentity || now >= self.retryAfter else { throw self.lastFailure }
+        let forcedAllowed = force && self.lastFailure != .rateLimited
+        guard identity != self.attemptIdentity || now >= self.retryAfter || forcedAllowed else { throw self.lastFailure }
         self.attemptIdentity = identity
         // Errors retain this backoff, including HTTP429. Success clears it.
         self.retryAfter = now.addingTimeInterval(300)
