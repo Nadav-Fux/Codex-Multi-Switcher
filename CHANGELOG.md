@@ -12,6 +12,7 @@
 - Stale sign-in healing now requires a shared user-level identity claim. On ChatGPT Team workspaces every member shares the same `account_id`, so the workspace ID alone cannot identify the user.
 - The `~/.codex/auth.json` write-back prepares its temp file first, then re-reads the destination immediately before the rename and commits only when it is unchanged — narrowing the window where a login Codex Desktop saves concurrently could be overwritten to the final compare-and-rename.
 - The GLM key stdin import in Local and Preview builds now writes to the same profile home the GUI reads it from.
+- The app and stdin importer share a file lock so legacy Keychain migration cannot overwrite a newly imported GLM key.
 - Saving or removing the GLM key writes a "no legacy migration" marker next to the key file, so a leftover Keychain item can never bring a removed key back — even when the legacy Keychain delete fails. The one-time legacy read also runs outside the store's lock, so a Keychain prompt can no longer freeze Save/Remove in Settings while it waits.
 - A Claude helper reply that only needs a sign-in renewal no longer latches the permission block; polling retries after the sign-in is renewed in Claude Code.
 - Claude's Refresh button now retries inside the in-memory failure backoff instead of rethrowing the last failure for five minutes; a server rate-limit wait is still honoured.

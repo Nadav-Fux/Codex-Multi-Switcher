@@ -23,6 +23,11 @@ public struct GLMKeyFileStore: Sendable {
         case unreadable
     }
 
+    /// Serializes transactions on the key and its migration marker across processes.
+    public func withLock<T>(_ body: () throws -> T) throws -> T {
+        try CacheLock.withLock(at: self.url.appendingPathExtension("lock"), body)
+    }
+
     /// Printable ASCII without spaces, at most 8 KiB.
     public static func isValid(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 8192 && value.utf8.allSatisfy { (33...126).contains($0) }

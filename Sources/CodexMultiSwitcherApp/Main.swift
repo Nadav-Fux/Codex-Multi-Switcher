@@ -47,11 +47,11 @@ enum Main {
                     throw GLMCredentialStore.Failure.invalidKey
                 }
                 try GLMCredentialStore.save(key)
-                print("GLM key saved in this app's Keychain item.")
+                print("GLM key saved in this app's private key file.")
                 exit(0)
             } catch {
                 // Fixed messages only: errors and input must not echo a key.
-                fputs("Could not import the GLM key. Check the key format and Keychain access.\n", stderr)
+                fputs("Could not import the GLM key. Check the key format and access to the app's private key file.\n", stderr)
                 exit(1)
             }
         }
